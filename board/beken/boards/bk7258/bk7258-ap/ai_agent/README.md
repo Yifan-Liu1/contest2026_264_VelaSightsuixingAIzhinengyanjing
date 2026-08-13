@@ -333,9 +333,41 @@ How far this is actually proven, in this repo:
 | Step | Evidence |
 |---|---|
 | scan | `d093016`: "successful on-board Wi-Fi scan" |
-| association + IPv4 | `b96373d`: `net_status` → `Network connected: yes` |
-| TLS / HTTPS | **no record anywhere in this repo.** The agent ships `net_test`, which is a `vela_https_get` to `www.baidu.com:443` -- run it and record the output before trusting anything above it |
-| `ask`, Vision LLM | same: unverified. `camera_capture` hands its JPEG to a Vision LLM, so the camera path's last hop depends on the row above |
+| association | **not proven.** On a freshly flashed board `ifconfig` reports `wlan0 … at DOWN` with the NuttX default static address `10.0.0.2/24` — nothing has joined a network. Provisioning is manual, see `WiFi使用说明.md` |
+| DHCP, DNS, ping | not recorded |
+| TLS / HTTPS | fails at DNS: `net_test` → `[vela_tls] net_connect www.baidu.com:443 ret=0x52` (`MBEDTLS_ERR_NET_UNKNOWN_HOST`), because the step above has not happened. The entropy blocker that used to fail this earlier is fixed -- see below |
+| `ask`, Vision LLM | unverified. `camera_capture` hands its JPEG to a Vision LLM, so the camera path's last hop depends on the rows above |
+
+**Do not read the agent's `net_status` as evidence of association.** It prints
+`Network connected: yes / IP: 10.0.0.2` on a board whose `wlan0` is `DOWN`,
+because `network_is_connected()` only checks that an address is configured.
+This file previously cited that line as proof of association; it is not.
+
+**TLS needs an entropy device, and this config had none.** `agent_secure_random()`
+(`include/agent_compat.h`) reads `/dev/urandom` or `/dev/random`; with neither
+present, mbedTLS refused to seed and every handshake failed before touching the
+network:
+
+```
+[vela_tls] CRITICAL: No secure entropy source available
+[vela_tls] ctr_drbg_seed ret=0x34          (MBEDTLS_ERR_CTR_DRBG_ENTROPY_SOURCE_FAILED)
+FAILED! TLS Error: 0x2                     (VELA_TLS_ERR_HANDSHAKE)
+```
+
+Fixed in the defconfig with `CONFIG_CRYPTO=y` + `CONFIG_CRYPTO_RANDOM_POOL=y` +
+`CONFIG_DEV_URANDOM=y` + `CONFIG_DEV_URANDOM_RANDOM_POOL=y`, i.e. NuttX's
+BLAKE2Xs entropy pool (fed by IRQ timing) behind `/dev/urandom` rather than the
+default xorshift128. `CONFIG_CRYPTO=y` is the part that is easy to miss:
+`CRYPTO_RANDOM_POOL` sits inside `if CRYPTO`, so without it the line is silently
+dropped and the choice falls back to xorshift128 -- the same class of trap as
+`docs/reference/platform.md` §6. Verified on hardware: `/dev/urandom` is present
+in `ls /dev`, and `net_test` now gets as far as a DNS lookup instead of dying at
+seeding. Cost: +3 KB flash, +1 KB RAM.
+
+**This is not a hardware TRNG.** The pool's own Kconfig says it "may not
+actually be cryptographically secure if not enough entropy is made available".
+BK7258 has a TRNG; wiring it up and selecting `ARCH_HAVE_RNG` +
+`DEV_URANDOM_ARCH` is the real fix, and should happen before anything ships.
 
 Until a network is joined the agent degrades cleanly rather than hanging:
 `[agent] Network timeout — net services not started.`
