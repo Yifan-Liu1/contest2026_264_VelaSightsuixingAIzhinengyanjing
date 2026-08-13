@@ -22,6 +22,10 @@
 #include "hardware/bk7258_mbox.h"
 #include "bk7258_wifi.h"
 
+#ifdef CONFIG_BK7258_TRNG
+#  include "bk7258_trng.h"
+#endif
+
 #ifdef CONFIG_BK7258_AUDIO
 #  include "bk7258_audio_bringup.h"
 #endif
@@ -120,6 +124,21 @@ int bk7258_bringup(void)
   else
     {
       printf("PSRAM unavailable; media services must remain disabled\n");
+    }
+#endif
+
+#ifdef CONFIG_BK7258_TRNG
+  /* Seed the kernel entropy pool from the hardware TRNG.  Best-effort: a
+   * probe failure leaves the pool with interrupt timing only, which is
+   * weaker but still functional, and must not stop bring-up.  /dev/random
+   * itself was registered earlier, by drivers_initialize().
+   */
+
+  ret = bk7258_trng_initialize();
+  if (ret < 0)
+    {
+      printf("trng: initialize failed, error=%d "
+             "(entropy pool falls back to IRQ timing)\n", ret);
     }
 #endif
 
