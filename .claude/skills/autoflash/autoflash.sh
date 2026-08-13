@@ -331,10 +331,24 @@ fi
 # Put the line back to the console rate.  bk_loader left it at BAUD, and if
 # that is not CONSOLE_BAUD then anything attaching afterwards -- screen, cat,
 # minicom -- would see garbage and typing would do nothing.
+# A silent 2>/dev/null here used to claim success even when the restore had
+# failed.  stty needs the port to itself, so anything already attached to it --
+# a screen session, a stray cat -- makes this fail with EBUSY, and the line is
+# then left at BAUD while the message says otherwise.  That is worse than not
+# trying: the next person sees a dead console and no reason for it.
 if [ "$BAUD" != "$CONSOLE_BAUD" ]; then
-  stty -F "$PORT" "$CONSOLE_BAUD" cs8 -cstopb -parenb raw -echo -crtscts \
-    2>/dev/null
-  echo "  串口已从 ${BAUD} 恢复为控制台的 ${CONSOLE_BAUD} baud"
+  if stty_err=$(stty -F "$PORT" "$CONSOLE_BAUD" cs8 -cstopb -parenb raw \
+                  -echo -crtscts 2>&1); then
+    echo "  串口已从 ${BAUD} 恢复为控制台的 ${CONSOLE_BAUD} baud"
+  else
+    echo
+    echo "  !! 串口波特率没能恢复：${stty_err}"
+    echo "     串口仍停在 ${BAUD}，此时接上去会看到乱码、打字也没反应。"
+    echo "     通常是有程序正占着串口（screen / minicom / cat）。"
+    echo "     处理：先退出那个程序，再执行"
+    echo "       stty -F ${PORT} ${CONSOLE_BAUD} cs8 -cstopb -parenb raw -echo -crtscts"
+    echo "     或者重新打开 screen ${PORT} ${CONSOLE_BAUD}（screen 自己会设速率）。"
+  fi
 fi
 
 if [ "$ATTACH_SERIAL" -eq 1 ]; then
