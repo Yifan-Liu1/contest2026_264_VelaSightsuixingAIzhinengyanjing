@@ -30,6 +30,10 @@ set(SRCS
     bk7258_cpuindex.c
     bk7258_idle.c)
 
+if(CONFIG_BK7258_TRNG)
+  list(APPEND SRCS bk7258_trng.c)
+endif()
+
 add_library(bk7258_chip OBJECT ${SRCS})
 add_dependencies(bk7258_chip nuttx_context)
 nuttx_add_library_internal(bk7258_chip)

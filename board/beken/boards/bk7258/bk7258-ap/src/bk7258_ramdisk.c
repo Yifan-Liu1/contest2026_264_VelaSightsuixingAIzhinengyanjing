@@ -45,6 +45,7 @@
 #include <errno.h>
 
 #include <nuttx/drivers/ramdisk.h>
+#include <nuttx/fs/fs.h>
 
 #include "bk7258_psram.h"
 #include "bk7258_ramdisk.h"
@@ -55,6 +56,14 @@
 
 #define BK7258_RAMDISK_MINOR      0
 #define BK7258_RAMDISK_SECTOR     512u
+
+/* Where it gets mounted.  Keep this in step with
+ * CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR in configs/ai_agent/defconfig, whose
+ * value is "/mnt/ai_agent": the agent creates the ai_agent/ subtree itself,
+ * but only if the mount point below is a real filesystem.
+ */
+
+#define BK7258_RAMDISK_MOUNTPT    "/mnt"
 
 /* 2MB: enough for three 640x480 YUYV frames plus FAT overhead, out of the
  * 2.9MB AP PSRAM heap (BK7258_AP_PSRAM_HEAP_*, bk7258_psram.c).  The V4L2
@@ -101,9 +110,51 @@ int bk7258_ramdisk_initialize(void)
       return ret;
     }
 
-  printf("ramdisk: /dev/ram0 registered, %u KB at %p (PSRAM); format with "
-         "\"mkfatfs /dev/ram0\" then \"mount -t vfat /dev/ram0 /mnt\"\n",
+  printf("ramdisk: /dev/ram0 registered, %u KB at %p (PSRAM)\n",
          (unsigned int)(BK7258_RAMDISK_BYTES / 1024u), buffer);
+
+  /* Mount it, rather than leaving the mount to whoever remembers to type it.
+   *
+   * Applications that keep state ask for a path, not for a block device:
+   * ai_agent's config store, memory store and skill loader all write under
+   * CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR ("/mnt/ai_agent").  They do build
+   * their directory tree themselves -- config_store.c's mkdirs() and
+   * memory_store.c's ensure_dir() both walk the path -- but no amount of
+   * mkdir() helps while /mnt is still pseudo-filesystem, so without this the
+   * agent starts and then loses every skill and its whole config:
+   *
+   *   [skills] Cannot write skill: /mnt/ai_agent/skills/weather.md
+   *
+   * littlefs with -o autoformat is what makes this a one-liner: it formats
+   * the device when the mount finds no valid superblock, which is exactly
+   * right for a RAM disk whose contents are gone after every reset anyway.
+   * FAT would need mkfatfs(), which lives in apps/fsutils and is not
+   * reachable from board bring-up.
+   *
+   * This is not persistence.  The backing store is PSRAM, so the tree is
+   * rebuilt from scratch on each boot; what it buys is that the agent's
+   * paths are writable at all.  Real persistence needs a flash partition,
+   * and when it arrives only the device name below has to change.
+   */
+
+#ifdef CONFIG_FS_LITTLEFS
+  ret = nx_mount("/dev/ram0", BK7258_RAMDISK_MOUNTPT, "littlefs", 0,
+                 "autoformat");
+  if (ret < 0)
+    {
+      printf("ramdisk: mount %s failed, error=%d; format with "
+             "\"mkfatfs /dev/ram0\" then \"mount -t vfat /dev/ram0 %s\"\n",
+             BK7258_RAMDISK_MOUNTPT, ret, BK7258_RAMDISK_MOUNTPT);
+      return OK;
+    }
+
+  printf("ramdisk: %s mounted (littlefs on /dev/ram0)\n",
+         BK7258_RAMDISK_MOUNTPT);
+#else
+  printf("ramdisk: CONFIG_FS_LITTLEFS not set; format with "
+         "\"mkfatfs /dev/ram0\" then \"mount -t vfat /dev/ram0 %s\"\n",
+         BK7258_RAMDISK_MOUNTPT);
+#endif
 
   return OK;
 #else

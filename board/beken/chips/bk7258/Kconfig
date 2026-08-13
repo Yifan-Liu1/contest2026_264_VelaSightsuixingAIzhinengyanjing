@@ -33,6 +33,25 @@ config BK7258_MBOX_V2
 	bool
 	default y
 
+config BK7258_TRNG
+	bool "BK7258 hardware TRNG"
+	default n
+	select ARCH_HAVE_RNG
+	help
+		Drive the chip's true random number generator: register /dev/random
+		from it, and seed the kernel entropy pool with hardware randomness
+		at bring-up.
+
+		This is what makes TLS work honestly.  mbedTLS cannot seed its
+		CTR_DRBG without an entropy source, and ai_agent reads /dev/urandom
+		or /dev/random; the software fallback (CONFIG_CRYPTO_RANDOM_POOL fed
+		by interrupt timing alone) is documented by its own Kconfig as
+		possibly not cryptographically secure.
+
+		Enable CONFIG_DEV_RANDOM as well to get /dev/random, and keep
+		CONFIG_DEV_URANDOM_RANDOM_POOL so that /dev/urandom is the pool --
+		which this driver then seeds from hardware.
+
 config BK7258_WIFI
 	bool "BK7258 AP Wi-Fi IPC driver"
 	default y

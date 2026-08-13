@@ -235,22 +235,39 @@ slower -- are in `docs/reference/platform.md` §4.
 
 Flash, at 61%, is not the constraint, and since `b96373d` neither is the heap.
 
-Without a mounted `/mnt` the agent still starts; it only loses persistence
-(`[skills] Cannot write skill: /mnt/ai_agent/skills/...`). Be careful about
-what is actually missing there: the agent *does* create its data directory
-tree, recursively -- `mkdirs()` in `src/infra/config_store.c` and
-`ensure_dir()` in `src/core/memory_store.c` both walk the path. What it cannot
-do is create a filesystem, and `bk7258_ramdisk.c` registers `/dev/ram0`
-deliberately unformatted, so
+**`/mnt` is mounted by bring-up now**, so persistence works out of the box:
+`bk7258_ramdisk.c` registers `/dev/ram0` and then mounts it with littlefs and
+`-o autoformat`, which formats the device when it finds no valid superblock --
+exactly right for a RAM disk whose contents are gone after each reset. Measured
+on hardware:
 
-```sh
-mkfatfs /dev/ram0
-mount -t vfat /dev/ram0 /mnt
+```
+ramdisk: /dev/ram0 registered, 2048 KB at 0x60720200 (PSRAM)
+ramdisk: /mnt mounted (littlefs on /dev/ram0)
+...
+[cfgstore] Config store ready at /mnt/ai_agent/config/config.json
+[memory] Created file: /mnt/ai_agent/config/SOUL.md
+[skills] Installed built-in skill: /mnt/ai_agent/skills/weather.md   (x10)
 ```
 
-is the whole prerequisite -- the `ai_agent/` tree underneath appears by itself
-on the next start. (`mkdir /mnt/ai_agent` by hand, which this file used to
-ask for, was never the missing step.)
+No `Cannot write skill` line anywhere, and the agent built the whole tree
+itself -- `mkdirs()` in `src/infra/config_store.c` and `ensure_dir()` in
+`src/core/memory_store.c` were always able to do that; what they could not do
+was create a filesystem. `mkdir /mnt/ai_agent` by hand, which this file used to
+ask for, was never the missing step.
+
+One geometry detail worth keeping: littlefs needs its block size to be a
+multiple of its program size, and NuttX derives both from the block driver --
+program size is `CONFIG_FS_LITTLEFS_PROGRAM_SIZE_FACTOR` (4) x the 512-byte
+sector, so the default block size (1 x 512) is *smaller* than the program size
+and the mount fails with `-28` (`ENOSPC`), which is not an obvious way to say
+"your geometry is inconsistent". `CONFIG_FS_LITTLEFS_BLOCK_SIZE_FACTOR=8` gives
+4096-byte blocks and it mounts.
+
+This is not persistence. The backing store is PSRAM, so the tree is rebuilt
+from scratch on every boot; what it buys is that the agent's paths are writable
+at all. Real persistence needs a flash partition, and when it arrives only the
+device name in `bk7258_ramdisk.c` has to change.
 
 One genuine upstream bug lives next to this: `src/agent_main.c` Phase 0
 hardcodes `/data/agent` and even mounts a tmpfs on `/data`, instead of using
@@ -354,20 +371,38 @@ network:
 FAILED! TLS Error: 0x2                     (VELA_TLS_ERR_HANDSHAKE)
 ```
 
-Fixed in the defconfig with `CONFIG_CRYPTO=y` + `CONFIG_CRYPTO_RANDOM_POOL=y` +
-`CONFIG_DEV_URANDOM=y` + `CONFIG_DEV_URANDOM_RANDOM_POOL=y`, i.e. NuttX's
-BLAKE2Xs entropy pool (fed by IRQ timing) behind `/dev/urandom` rather than the
-default xorshift128. `CONFIG_CRYPTO=y` is the part that is easy to miss:
-`CRYPTO_RANDOM_POOL` sits inside `if CRYPTO`, so without it the line is silently
-dropped and the choice falls back to xorshift128 -- the same class of trap as
-`docs/reference/platform.md` §6. Verified on hardware: `/dev/urandom` is present
-in `ls /dev`, and `net_test` now gets as far as a DNS lookup instead of dying at
-seeding. Cost: +3 KB flash, +1 KB RAM.
+Fixed in two steps. First the software entropy pool (`CONFIG_CRYPTO=y` +
+`CONFIG_CRYPTO_RANDOM_POOL=y` + `CONFIG_DEV_URANDOM=y` +
+`CONFIG_DEV_URANDOM_RANDOM_POOL=y`), then the real thing: `CONFIG_BK7258_TRNG=y`
+drives the chip's hardware TRNG (`board/beken/chips/bk7258/bk7258_trng.c`),
+registers `/dev/random` from it, and seeds that pool with 32 words of hardware
+randomness at bring-up. Measured:
 
-**This is not a hardware TRNG.** The pool's own Kconfig says it "may not
-actually be cryptographically secure if not enough entropy is made available".
-BK7258 has a TRNG; wiring it up and selecting `ARCH_HAVE_RNG` +
-`DEV_URANDOM_ARCH` is the real fix, and should happen before anything ships.
+```
+trng: dev_id=0x54524e47 version=0x00010001, 8/8 reads distinct, 32 words seeded into the entropy pool
+/dev:  random   urandom
+```
+
+`dev_id` reads ASCII `"TRNG"`, so the block answering is the intended one. The
+`8/8 reads distinct` line is a deliberate boot self-test: this block has two
+documented silent failure modes -- a dead register returning a constant, and
+the vendor's own warning that with the clock gate left enabled the first read
+of each session repeats -- and both look identical, "the output is a constant".
+Counting distinct values catches both; it says nothing about statistical
+quality, which a boot test cannot establish anyway.
+
+`CONFIG_CRYPTO=y` is the part that is easy to miss: `CRYPTO_RANDOM_POOL` sits
+inside `if CRYPTO`, so without it the line is silently dropped and the
+`/dev/urandom` choice falls back to xorshift128 -- the same class of trap as
+`docs/reference/platform.md` §6. Verified after each step: `net_test` stopped
+failing at seeding and now reaches a DNS lookup instead.
+
+Cost of both steps together: about 24 KB of flash (most of it littlefs, which
+arrived in the same config change) and 1 KB of RAM.
+
+Still open: the pool is seeded once, at bring-up. Over a long run it is topped
+up only by interrupt timing, so a periodic re-seed from the TRNG is worth
+adding.
 
 Until a network is joined the agent degrades cleanly rather than hanging:
 `[agent] Network timeout — net services not started.`
