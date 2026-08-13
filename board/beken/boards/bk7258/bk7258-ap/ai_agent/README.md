@@ -345,20 +345,38 @@ renewal. `CONFIG_NETINIT_NETLOCAL=y`, so nothing joins a network at boot --
 either `wapi` from NSH, or the agent's own `set_wifi <ssid> <password>`, which
 saves the credentials so that `wifi_reconnect` works after a reboot.
 
-How far this is actually proven, in this repo:
+How far this is proven, all of it measured on hardware on 2026-08-13:
 
 | Step | Evidence |
 |---|---|
-| scan | `d093016`: "successful on-board Wi-Fi scan" |
-| association | **not proven.** On a freshly flashed board `ifconfig` reports `wlan0 … at DOWN` with the NuttX default static address `10.0.0.2/24` — nothing has joined a network. Provisioning is manual, see `WiFi使用说明.md` |
-| DHCP, DNS, ping | not recorded |
-| TLS / HTTPS | fails at DNS: `net_test` → `[vela_tls] net_connect www.baidu.com:443 ret=0x52` (`MBEDTLS_ERR_NET_UNKNOWN_HOST`), because the step above has not happened. The entropy blocker that used to fail this earlier is fixed -- see below |
-| `ask`, Vision LLM | unverified. `camera_capture` hands its JPEG to a Vision LLM, so the camera path's last hop depends on the rows above |
+| scan | `wapi scan wlan0` → 22 BSSes with bssid / frequency / signal / encoding / SSID |
+| association | `wapi essid wlan0 <ssid> 1` → `ifconfig` goes from `UP` to `RUNNING` |
+| DHCP | `renew wlan0` → `inet addr:10.192.105.127 DRaddr:10.192.104.1 Mask:255.255.254.0`. **The first `renew` after association can time out; retry once** |
+| DNS | `ping www.baidu.com` prints `PING 220.181.111.232`, i.e. the query went out and an answer came back |
+| TCP + TLS | `[vela_tls] Handshake OK: TLSv1.2 / TLS-DHE-RSA-WITH-AES-256-CBC-SHA` |
+| HTTPS | `net_test` → `SUCCESS! HTTP Status: 200` |
+| ICMP to the internet | fails, and it is not a defect: `ping 8.8.8.8` loses 100% while DNS and TLS work in the same session, so that network blocks ICMP. Do not use ping as the connectivity test here |
 
 **Do not read the agent's `net_status` as evidence of association.** It prints
 `Network connected: yes / IP: 10.0.0.2` on a board whose `wlan0` is `DOWN`,
-because `network_is_connected()` only checks that an address is configured.
-This file previously cited that line as proof of association; it is not.
+because `network_is_connected()` only checks that an address is configured. Look
+at `ifconfig` for `RUNNING`, or just try DNS.
+
+**The HTTPS above is encrypted but not authenticated.** Two reasons, both
+visible in the handshake log:
+
+```
+[vela_tls] Handshake start: Host=www.baidu.com, UNIX=328
+[vela_tls] Clock too old, forcing to 2026
+```
+
+`UNIX=328` is seconds since boot -- there is no RTC and no SNTP, so upstream
+forces the clock to 2026 or every certificate would look not-yet-valid. On top
+of that `vela_tls.c` sets `MBEDTLS_SSL_VERIFY_OPTIONAL`, so a failed chain check
+is logged and ignored, and no CA bundle is installed anyway. Closing this needs
+SNTP first, then a root certificate for whichever endpoint the product uses,
+then `VERIFY_REQUIRED` -- in that order, because doing the last one first turns
+the network off.
 
 **TLS needs an entropy device, and this config had none.** `agent_secure_random()`
 (`include/agent_compat.h`) reads `/dev/urandom` or `/dev/random`; with neither
