@@ -1,0 +1,7 @@
+############################################################################
+# VelaSight social-cue state machine - Make.defs
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_264_SOCIAL_CUE),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_264_social_cue
+endif

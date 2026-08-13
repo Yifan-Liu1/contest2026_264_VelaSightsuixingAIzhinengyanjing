@@ -1,0 +1,22 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LVX_USE_DEMO_CONTEST2026_264_SOCIAL_CUE
+	bool "VelaSight social-cue state machine (mock closed loop)"
+	default n
+	---help---
+		Enable the social_cue NSH command: runs the表情线索 flow
+		idle -> capturing -> analyzing -> notifying -> cancelled with a real
+		camera frame and a mocked cloud response.
+
+		This is the week-4 deliverable and the documented fallback for a
+		board whose network is not up yet: the Agent state flow and the
+		confidence policy can be demonstrated, and every refusal branch
+		(low confidence, no face, conflicting cues) can be triggered on
+		demand with 'social_cue case <n>' instead of waited for.
+
+		It also carries the skill document: 'social_cue install' writes
+		social-cue-assistant.md into the agent's skills directory, which is
+		the only way to get a file onto this board.
