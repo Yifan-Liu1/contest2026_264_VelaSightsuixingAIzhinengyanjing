@@ -1,0 +1,20 @@
+From: VelaSights BK7258 port
+Subject: [PATCH] bluetooth: fix ACL buffer and connection references
+
+The HCI RX worker releases its ACL buffer after hci_acl() returns, while the
+L2CAP/ATT receive path also owns and releases that buffer.  Give the consumer
+its own reference before dispatching the packet.
+
+bt_conn_lookup_handle() returns a referenced connection.  Release that
+reference after bt_conn_receive() so inbound ACL traffic does not leak the
+only connection slot across disconnect and reconnect cycles.
+
+diff --git a/wireless/bluetooth/bt_hcicore.c b/wireless/bluetooth/bt_hcicore.c
+--- a/wireless/bluetooth/bt_hcicore.c
++++ b/wireless/bluetooth/bt_hcicore.c
+@@ -268,0 +269,1 @@
++  bt_buf_addref(buf);
+@@ -269,0 +271,1 @@
++  bt_conn_release(conn);
+--
+2.43.0

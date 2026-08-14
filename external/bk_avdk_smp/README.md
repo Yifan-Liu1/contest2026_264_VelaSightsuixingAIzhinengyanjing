@@ -156,6 +156,60 @@ done
 `projects/app_ab/cp/config/bk7258/config`输入 fragment 原地展开为完整生成配置，
 因此不得声称构建后该输入仍与权威最小种子逐字节一致。
 
+### 2.1 NuttX Bluetooth Host 最小补丁
+
+BK7258 BLE 重连还依赖比赛仓保存的 NuttX Host 补丁：
+
+```text
+external/nuttx/patches/
+  0001-bluetooth-fix-acl-buffer-and-connection-references.patch
+```
+
+该补丁只修改 `wireless/bluetooth/bt_hcicore.c` 的 `hci_acl()`：
+
+```c
+bt_buf_addref(buf);
+bt_conn_receive(conn, buf, flags);
+bt_conn_release(conn);
+```
+
+- `bt_buf_addref()` 为 L2CAP/ATT consumer 保留独立 ACL buffer 引用，避免 HCI RX
+  worker 返回后形成双重释放或分片 PDU 悬空引用。
+- `bt_conn_release()` 释放 `bt_conn_lookup_handle()` 返回的 connection 引用，避免
+  每个入站 ACL 包泄漏引用并导致 `CONFIG_BLUETOOTH_MAX_CONN=1` 的槽位在断开后
+  无法复用。
+
+这两项是 NuttX Bluetooth Host 的通用引用计数修复，不属于 BK7258 Controller
+兼容逻辑。BK7258 特定的 HCI command 过滤、ACL PB 标准化和 mailbox credit 仍放在
+`board/beken/chips/bk7258/bk7258_bt_transport.c`，不得复制进公共 Host 栈。
+
+在 OpenVela 工作区根目录构建前应用补丁：
+
+```bash
+patch_file="$PWD/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/external/nuttx/patches/0001-bluetooth-fix-acl-buffer-and-connection-references.patch"
+
+git -C nuttx apply --check "$patch_file"
+git -C nuttx apply "$patch_file"
+git -C nuttx diff --check
+```
+
+若 `git apply --check` 报告补丁已应用，先确认以下两行已经位于 `hci_acl()`，不要
+重复应用：
+
+```bash
+grep -n -A3 'bt_buf_addref(buf)' nuttx/wireless/bluetooth/bt_hcicore.c
+```
+
+验证补丁范围只能包含目标文件和两行行为修改：
+
+```bash
+git -C nuttx diff --stat
+git -C nuttx diff -- wireless/bluetooth/bt_hcicore.c
+```
+
+该文件是公共 NuttX 源码的补丁归档，不是 `bk_avdk_smp` 覆盖文件。正式方案仍应
+向对应 NuttX 公共仓库提交独立 PR；在公共修复合入前，本补丁保证比赛固件可复现。
+
 ## 3. 正确构建链条
 
 最终固件链条固定为：
@@ -183,7 +237,8 @@ Armino CP app.bin + Beken bootloader.bin
 `armino/partitions/_build/ram_regions.csv`、生成头和预处理链接脚本仍可能保留旧值。
 这会形成顶层 16 MiB、核内仍 8 MiB 的不一致产物。
 
-先构建 OpenVela AP，并将输入放到 Armino 工作树：
+先按第 2.1 节确认 NuttX Bluetooth Host 补丁已应用，再构建 OpenVela AP，并将
+输入放到 Armino 工作树：
 
 ```bash
 cd ~/vela_competition/contest
