@@ -21,8 +21,8 @@
 #include "bk7258_driver.h"
 #include "hardware/bk7258_mbox.h"
 
-#define MB_CHANNEL_COUNT       5u
-#define MB_RX_CHANNEL_COUNT    4u
+#define MB_CHANNEL_COUNT       6u
+#define MB_RX_CHANNEL_COUNT    5u
 #define MB_ACK_SLOT_COUNT      8u
 #define MB_ACK_HIGH_WATER      3u
 #define MB_TIMEOUT             MSEC2TICK(200)
@@ -106,6 +106,7 @@ static const uint8_t g_channel_ids[MB_CHANNEL_COUNT] =
 {
   BK7258_MB_CHAN_HW_CTRL_TX,
   BK7258_MB_CHAN_PWC_TX,
+  BK7258_MB_CHAN_BT_TX,
   BK7258_MB_CHAN_WIFI_CMD_TX,
   BK7258_MB_CHAN_WIFI_DATA_TX,
   BK7258_MB_CHAN_UART0_TX
@@ -113,6 +114,7 @@ static const uint8_t g_channel_ids[MB_CHANNEL_COUNT] =
 
 static const uint8_t g_rx_channel_ids[MB_RX_CHANNEL_COUNT] =
 {
+  BK7258_MB_CHAN_BT_RX,
   BK7258_MB_CHAN_WIFI_CMD_RX,
   BK7258_MB_CHAN_WIFI_DATA_RX,
   BK7258_MB_CHAN_UART0_RX,
@@ -911,6 +913,7 @@ static int mailbox_tx_worker(int argc, char **argv)
   for (;;)
     {
       struct active_transaction *probe;
+      unsigned int uart_index;
       irqstate_t flags;
       bool request_probe;
 
@@ -950,9 +953,11 @@ static int mailbox_tx_worker(int argc, char **argv)
           g_probe_requested = false;
         }
 
+      uart_index = channel_index(BK7258_MB_CHAN_UART0_TX);
       request_probe = g_probe_requested &&
                       g_link_state == BK7258_MB_LINK_READY &&
-                      !g_channels[4].queued && !g_active.busy;
+                      uart_index < MB_CHANNEL_COUNT &&
+                      !g_channels[uart_index].queued && !g_active.busy;
       if (request_probe)
         {
           g_probe_requested = false;
@@ -1104,6 +1109,21 @@ int bk7258_mailbox_send_wire(uint8_t logical_channel,
 
   nxsem_post(&g_tx_sem);
   return OK;
+}
+
+int bk7258_mailbox_send_raw(uint8_t logical_channel,
+                            const uint8_t frame[BK7258_MB_MESSAGE_SIZE],
+                            bk7258_mb_tx_complete_t callback, void *arg)
+{
+  struct bk7258_mb_wire_message message;
+
+  if (frame == NULL)
+    {
+      return -EINVAL;
+    }
+
+  memcpy(&message, frame, sizeof(message));
+  return bk7258_mailbox_send_wire(logical_channel, &message, callback, arg);
 }
 
 int bk7258_mailbox_register_rx(uint8_t logical_channel,

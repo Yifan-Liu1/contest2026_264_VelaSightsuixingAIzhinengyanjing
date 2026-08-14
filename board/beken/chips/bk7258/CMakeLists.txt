@@ -34,6 +34,14 @@ if(CONFIG_BK7258_TRNG)
   list(APPEND SRCS bk7258_trng.c)
 endif()
 
+if(CONFIG_BK7258_BLUETOOTH)
+  list(APPEND SRCS bk7258_bt_transport.c bk7258_bt_driver.c)
+
+  if(CONFIG_BK7258_BT_RAW_SELFTEST)
+    list(APPEND SRCS bk7258_bt_selftest.c)
+  endif()
+endif()
+
 add_library(bk7258_chip OBJECT ${SRCS})
 add_dependencies(bk7258_chip nuttx_context)
 nuttx_add_library_internal(bk7258_chip)

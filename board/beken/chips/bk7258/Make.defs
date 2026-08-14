@@ -33,6 +33,15 @@ CHIP_CSRCS += bk7258_aud.c
 CHIP_CSRCS += bk7258_cpuindex.c
 CHIP_CSRCS += bk7258_idle.c
 
+ifeq ($(CONFIG_BK7258_BLUETOOTH),y)
+CHIP_CSRCS += bk7258_bt_transport.c
+CHIP_CSRCS += bk7258_bt_driver.c
+
+ifeq ($(CONFIG_BK7258_BT_RAW_SELFTEST),y)
+CHIP_CSRCS += bk7258_bt_selftest.c
+endif
+endif
+
 ARCHCPUFLAGS += -mcpu=cortex-m33+nodsp -mthumb
 ARCHCPUFLAGS += -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mcmse
 ARCHINCLUDES += ${shell $(INCDIR) $(INCDIROPT) "$(CC)" $(CHIP_DIR)}

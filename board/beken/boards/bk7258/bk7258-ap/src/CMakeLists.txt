@@ -31,6 +31,10 @@ if(CONFIG_BK7258_JPEG_ENC)
                              PRIVATE ${NUTTX_APPS_BINDIR}/include/turbojpeg-static)
 endif()
 
+if(CONFIG_BK7258_BT_GATT_TEST)
+  list(APPEND SRCS bk7258_bt_gatt_test.c)
+endif()
+
 target_sources(board PRIVATE ${SRCS})
 target_include_directories(board PRIVATE
   ${NUTTX_BOARD_ABS_DIR}/include

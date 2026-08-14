@@ -29,4 +29,8 @@ ifeq ($(CONFIG_BK7258_JPEG_ENC),y)
 CSRCS += bk7258_jpeg_enc.c
 endif
 
+ifeq ($(CONFIG_BK7258_BT_GATT_TEST),y)
+CSRCS += bk7258_bt_gatt_test.c
+endif
+
 include $(TOPDIR)/boards/Board.mk

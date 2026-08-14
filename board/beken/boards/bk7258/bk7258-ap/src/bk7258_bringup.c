@@ -26,6 +26,14 @@
 #  include "bk7258_trng.h"
 #endif
 
+#ifdef CONFIG_BK7258_BLUETOOTH
+#  include "bk7258_bt.h"
+#endif
+
+#ifdef CONFIG_BK7258_BT_GATT_TEST
+int bk7258_bt_gatt_test_initialize(void);
+#endif
+
 #ifdef CONFIG_BK7258_AUDIO
 #  include "bk7258_audio_bringup.h"
 #endif
@@ -92,6 +100,42 @@ int bk7258_bringup(void)
     {
       return ret;
     }
+
+#ifdef CONFIG_BK7258_BLUETOOTH
+  ret = bk7258_bt_transport_initialize();
+  if (ret < 0)
+    {
+      printf("Bluetooth transport initialization failed, error=%d\n", ret);
+      return ret;
+    }
+
+#  ifdef CONFIG_BK7258_BT_RAW_SELFTEST
+  ret = bk7258_bt_raw_selftest_run();
+  if (ret < 0)
+    {
+      printf("Bluetooth raw self-test failed, error=%d\n", ret);
+      return ret;
+    }
+#  else
+  ret = bk7258_bt_driver_register();
+  if (ret < 0)
+    {
+      printf("Bluetooth Host registration failed, error=%d\n", ret);
+      bk7258_bt_transport_dump_stats();
+      bk7258_mailbox_dump_stats();
+      return ret;
+    }
+
+#  ifdef CONFIG_BK7258_BT_GATT_TEST
+  ret = bk7258_bt_gatt_test_initialize();
+  if (ret < 0)
+    {
+      printf("Bluetooth GATT fixture failed, error=%d\n", ret);
+      return ret;
+    }
+#  endif
+#  endif
+#endif
 
 #ifdef CONFIG_BK7258_WIFI
   ret = bk7258_wifi_initialize();

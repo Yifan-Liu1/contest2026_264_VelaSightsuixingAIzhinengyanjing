@@ -72,10 +72,12 @@ _Static_assert((BK7258_MB_HEADER_STATE_MASK &
 
 #define BK7258_MB_CHAN_HW_CTRL_TX   0x10u
 #define BK7258_MB_CHAN_PWC_TX       0x12u
+#define BK7258_MB_CHAN_BT_TX        0x13u
 #define BK7258_MB_CHAN_WIFI_CMD_TX  0x14u
 #define BK7258_MB_CHAN_WIFI_DATA_TX 0x15u
 #define BK7258_MB_CHAN_UART0_TX     0x19u
 #define BK7258_MB_CHAN_PWC_RX       0x42u
+#define BK7258_MB_CHAN_BT_RX        0x43u
 #define BK7258_MB_CHAN_WIFI_CMD_RX  0x44u
 #define BK7258_MB_CHAN_WIFI_DATA_RX 0x45u
 #define BK7258_MB_CHAN_UART0_RX     0x49u
@@ -247,6 +249,9 @@ int bk7258_mailbox_start(void);
 int bk7258_mailbox_send_wire(uint8_t logical_channel,
                              const struct bk7258_mb_wire_message *message,
                              bk7258_mb_tx_complete_t callback, void *arg);
+int bk7258_mailbox_send_raw(uint8_t logical_channel,
+                            const uint8_t frame[BK7258_MB_MESSAGE_SIZE],
+                            bk7258_mb_tx_complete_t callback, void *arg);
 int bk7258_mailbox_register_rx(uint8_t logical_channel,
                                bk7258_mb_channel_rx_t callback, void *arg);
 int bk7258_mailbox_start_probe(void);

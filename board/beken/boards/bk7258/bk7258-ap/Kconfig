@@ -37,4 +37,12 @@ config BK7258_POWER_KEY_MOTOR
 		debounce timing. Drive the vibration motor at 1 kHz and 70 percent
 		duty while the key is held, and stop it when the key is released.
 
+config BK7258_BT_GATT_TEST
+	bool "BK7258 Bluetooth GATT acceptance fixture"
+	default n
+	depends on BK7258_BLUETOOTH && !BK7258_BT_RAW_SELFTEST
+	help
+		Register a test-only GATT service with read/write and notification
+		characteristics. Keep this disabled in production images.
+
 endif

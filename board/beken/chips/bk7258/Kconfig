@@ -67,6 +67,45 @@ config BK7258_WIFI_TX_SLOTS
 	range 2 16
 	depends on BK7258_WIFI
 
+config BK7258_BLUETOOTH
+	bool "BK7258 CP-backed Bluetooth HCI"
+	default n
+	depends on ARCH_CHIP_BK7258
+	depends on BK7258_MBOX_V2
+	depends on ALLOW_BSD_COMPONENTS
+	depends on NET && NET_BLUETOOTH
+	depends on WIRELESS && WIRELESS_BLUETOOTH
+	depends on WIRELESS_BLUETOOTH_HOST
+	help
+		Enable the native NuttX Bluetooth Host using the BLE controller
+		running on CPU0/CP over Mailbox V2.
+
+if BK7258_BLUETOOTH
+
+config BK7258_BT_TX_BUFFERS
+	int "Bluetooth AP HCI TX buffers"
+	default 8
+	range 4 32
+
+config BK7258_BT_TX_QUEUE
+	int "Bluetooth transport TX queue entries"
+	default 16
+	range 8 64
+
+config BK7258_BT_RX_QUEUE
+	int "Bluetooth transport RX queue entries"
+	default 16
+	range 8 64
+
+config BK7258_BT_RAW_SELFTEST
+	bool "Run raw BK7258 Bluetooth HCI self-test"
+	default n
+	help
+		Initialize only the raw transport and run HCI transport diagnostics.
+		Do not register the NuttX Bluetooth Host in this mode.
+
+endif # BK7258_BLUETOOTH
+
 config BK7258_MB_UART0_TXBUFSIZE
 	int "Mailbox UART0 transport TX ring size"
 	default 8192
