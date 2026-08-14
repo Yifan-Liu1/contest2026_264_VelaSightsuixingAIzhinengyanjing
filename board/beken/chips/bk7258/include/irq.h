@@ -30,6 +30,7 @@
 #define BK7258_EXTIRQ_I2C1        14
 #define BK7258_EXTIRQ_UART1       15
 #define BK7258_EXTIRQ_UART2       16
+#define BK7258_EXTIRQ_SDIO        10
 
 /* Analog audio (AUD) FIFO interrupt.  bk_avdk_smp release/v3.1.1
  * ap/middleware/soc/bk7258_ap/soc/icu_map.h:53 maps INT_SRC_AUDIO to
@@ -56,6 +57,7 @@
 #define BK7258_IRQ_I2C1            (BK7258_IRQ_FIRST + BK7258_EXTIRQ_I2C1)
 #define BK7258_IRQ_UART1           (BK7258_IRQ_FIRST + BK7258_EXTIRQ_UART1)
 #define BK7258_IRQ_UART2           (BK7258_IRQ_FIRST + BK7258_EXTIRQ_UART2)
+#define BK7258_IRQ_SDIO            (BK7258_IRQ_FIRST + BK7258_EXTIRQ_SDIO)
 #define BK7258_IRQ_AUDIO           (BK7258_IRQ_FIRST + BK7258_EXTIRQ_AUDIO)
 #define BK7258_IRQ_JPEG_ENC        (BK7258_IRQ_FIRST + \
                                     BK7258_EXTIRQ_JPEG_ENC)

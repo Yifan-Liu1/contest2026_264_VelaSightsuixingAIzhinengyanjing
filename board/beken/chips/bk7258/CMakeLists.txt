@@ -17,6 +17,7 @@ set(SRCS
     bk7258_wifi.c
     bk7258_mb_uart.c
     bk7258_pm_pwc.c
+    bk7258_sdio.c
     bk7258_psram.c
     bk7258_allocateheap.c
     bk7258_qspi.c

@@ -107,6 +107,10 @@ static void bk7258_bt_bringup(void)
 }
 #endif
 
+#ifdef CONFIG_BK7258_SDIO
+int bk7258_mmcsd_initialize(void);
+#endif
+
 int bk7258_bringup(void)
 {
   uint32_t button_count;
@@ -158,6 +162,13 @@ int bk7258_bringup(void)
       return ret;
     }
 
+#ifdef CONFIG_BK7258_SDIO
+  ret = bk7258_mmcsd_initialize();
+  if (ret < 0)
+    {
+      printf("SD-NAND bring-up failed, error=%d\n", ret);
+    }
+#endif
 #ifdef CONFIG_BK7258_WIFI
   ret = bk7258_wifi_initialize();
   if (ret < 0)

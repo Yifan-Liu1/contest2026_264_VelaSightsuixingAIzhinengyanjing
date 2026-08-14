@@ -6,14 +6,20 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <net/if.h>
 
 #include <nuttx/clock.h>
+#include <nuttx/fs/fs.h>
+#include <nuttx/fs/ioctl.h>
 #include <arch/chip/bk7258_psram.h>
 
 static unsigned int test_proc_file(const char *path)
@@ -119,6 +125,101 @@ static unsigned int test_uart(void)
   return 0;
 }
 
+static unsigned int test_storage(void)
+{
+  uint8_t sector[512];
+  struct geometry geo;
+  struct inode *inode;
+  DIR *dir;
+  struct dirent *entry;
+  const char *mountdev = "/dev/mmcsd0p0";
+  int ret;
+  ssize_t nsectors;
+  bool mounted = false;
+  char first_name[NAME_MAX + 1];
+
+  ret = open_blockdriver("/dev/mmcsd0", MS_RDONLY, &inode);
+  if (ret < 0)
+    {
+      printf("FAIL storage open /dev/mmcsd0 error=%d\n", ret);
+      return 1;
+    }
+
+  ret = inode->u.i_bops->geometry(inode, &geo);
+  if (ret < 0 || geo.geo_sectorsize != sizeof(sector) ||
+      geo.geo_nsectors == 0)
+    {
+      printf("FAIL storage geometry ret=%d sector=%u count=%lu\n", ret,
+             (unsigned)geo.geo_sectorsize,
+             (unsigned long)geo.geo_nsectors);
+      close_blockdriver(inode);
+      return 1;
+    }
+
+  nsectors = inode->u.i_bops->read(inode, sector, 0, 1);
+  close_blockdriver(inode);
+  if (nsectors != 1)
+    {
+      printf("FAIL storage sector0 read=%ld\n", (long)nsectors);
+      return 1;
+    }
+
+  if (sector[510] != 0x55 || sector[511] != 0xaa)
+    {
+      printf("FAIL storage sector0 signature=%02x%02x\n",
+             sector[510], sector[511]);
+      return 1;
+    }
+
+  printf("PASS storage geometry sector=%u count=%lu signature=55aa\n",
+         (unsigned)geo.geo_sectorsize, (unsigned long)geo.geo_nsectors);
+
+  (void)mkdir("/mnt", 0777);
+  (void)mkdir("/mnt/sd", 0777);
+  ret = nx_mount(mountdev, "/mnt/sd", "vfat", MS_RDONLY, NULL);
+  if (ret < 0)
+    {
+      mountdev = "/dev/mmcsd0";
+      ret = nx_mount(mountdev, "/mnt/sd", "vfat", MS_RDONLY, NULL);
+    }
+
+  if (ret < 0)
+    {
+      printf("FAIL storage vfat mount dev=%s error=%d\n", mountdev, ret);
+      return 1;
+    }
+
+  mounted = true;
+  dir = opendir("/mnt/sd");
+  if (dir == NULL)
+    {
+      printf("FAIL storage directory errno=%d\n", errno);
+      (void)nx_umount2("/mnt/sd", 0);
+      return 1;
+    }
+
+  entry = readdir(dir);
+  if (entry != NULL)
+    {
+      strlcpy(first_name, entry->d_name, sizeof(first_name));
+    }
+  else
+    {
+      first_name[0] = '\0';
+    }
+  closedir(dir);
+  ret = entry == NULL ? -EIO : 0;
+  printf("%s storage vfat mount dev=%s first=%s\n",
+         ret == 0 ? "PASS" : "FAIL", mountdev,
+         first_name[0] == '\0' ? "<empty>" : first_name);
+  if (mounted)
+    {
+      (void)nx_umount2("/mnt/sd", 0);
+    }
+
+  return ret == 0 ? 0 : 1;
+}
+
 int periph_selftest_main(int argc, char *argv[])
 {
   clock_t before;
@@ -141,6 +242,7 @@ int periph_selftest_main(int argc, char *argv[])
 
   failures += test_uart();
   failures += test_psram();
+  failures += test_storage();
   failures += test_proc_file("/proc/version");
   failures += test_proc_file("/proc/uptime");
   failures += test_proc_file("/proc/meminfo");

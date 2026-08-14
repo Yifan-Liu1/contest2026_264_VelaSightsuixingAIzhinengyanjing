@@ -33,6 +33,16 @@ config BK7258_MBOX_V2
 	bool
 	default y
 
+config BK7258_SDIO
+	bool "BK7258 SDIO host for onboard SD-NAND"
+	default n
+	select ARCH_HAVE_SDIO
+	depends on ARCH_CHIP_BK7258
+	depends on MMCSD
+	help
+		Enable the GPIO14..GPIO19 SDIO host used by the board's fixed
+		SD-NAND. The first implementation is one-bit polling PIO only.
+
 config BK7258_TRNG
 	bool "BK7258 hardware TRNG"
 	default n

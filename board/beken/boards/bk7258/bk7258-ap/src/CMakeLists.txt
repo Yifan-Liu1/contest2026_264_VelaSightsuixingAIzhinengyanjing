@@ -10,6 +10,10 @@ set(SRCS
     bk7258_camera_imgsensor.c
     bk7258_camera_bringup.c)
 
+if(CONFIG_BK7258_SDIO)
+  list(APPEND SRCS bk7258_mmcsd.c)
+endif()
+
 if(CONFIG_BK7258_AUDIO)
   list(APPEND SRCS bk7258_audio_bringup.c bk7258_audio_dev.c)
 endif()

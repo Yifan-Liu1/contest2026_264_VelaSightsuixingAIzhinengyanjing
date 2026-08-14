@@ -24,6 +24,9 @@
 #define PM_CP1_DUMP_PSRAM_MALLOC_INFO_CMD 0x9u
 #define PM_CP1_RECOVERY_CMD 0xau
 #define PM_POWER_PSRAM_MODULE_CPU1 11u
+#define PM_POWER_SUBMODULE_SDIO 91u
+#define PM_CLOCK_SDIO 22u
+#define PM_CLOCK_POWER_UP 1u
 #define PM_POWER_MODULE_STATE_ON 0u
 #define PM_POWER_MODULE_STATE_OFF 1u
 #define PM_RECOVERY_STATE_INIT 0u
@@ -134,6 +137,37 @@ static int psram_power_set(uint32_t state)
 
   nxmutex_unlock(&g_psram_power_lock);
   return ret;
+}
+
+int bk7258_sdio_clock_request(bool enable)
+{
+  int ret;
+
+  if (!enable)
+    {
+      ret = pwc_send_wait(0x2u, PM_CLOCK_SDIO, 0u, 0u);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      return pwc_send_wait(0x1u, PM_POWER_SUBMODULE_SDIO, 1u, 0u);
+    }
+
+  ret = pwc_send_wait(0x1u, PM_POWER_SUBMODULE_SDIO, 0u, 0u);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = pwc_send_wait(0x2u, PM_CLOCK_SDIO, PM_CLOCK_POWER_UP, 0u);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  nxsig_usleep(30000);
+  return OK;
 }
 #endif
 
