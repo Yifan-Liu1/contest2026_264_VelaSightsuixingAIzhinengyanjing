@@ -41,6 +41,10 @@
  *
  * Usage:
  *   camera_preview [N] [options]        live preview, N frames (0 = forever)
+ *   camera_preview live+face [N] [expr=<name>] [cycle=<sec>]
+ *                                       fb0 live at the camera's full rate,
+ *                                       fb1 an expression, repainted only
+ *                                       when it changes
  *   camera_preview fill <hex> [options] static patterns, no camera involved
  *   camera_preview pattern|bars|grid [options]
  *   camera_preview face [name] [frames] [fps=N]
@@ -48,12 +52,22 @@
  *
  * Options:
  *   fb=0 | fb=1 | fb=both   which panel(s) to drive (default both)
+ *   jpeg | jpeg=N           also encode one frame in N through the hardware
+ *                           JPEG encoder (/dev/video1); default N=60, about
+ *                           two seconds at the measured rate
+ *   jpegout=<path>          save the first encoded frame (needs a filesystem)
+ *   q=N                     JPEG quality, default 80
  *   sat=N                   chroma gain in percent (default 100)
  *   gain=N                  luma gain in percent (default 100)
  *   full                    treat Y as full-range instead of 16..235
  *   uvswap                  exchange the Cb and Cr byte positions
  *   vyuy | uyvy | yuyv      YUV byte order (default vyuy, the hardware's)
  *   swap                    pre-byte-swap pattern pixels (see below)
+ *
+ * Why live+face and the encoder live in this one application: /dev/video0 has
+ * a single owner, so while a preview streams nothing else can open the camera.
+ * The process holding it is therefore the only one that can both drive the
+ * panels and produce the JPEG an upload needs.
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
@@ -77,12 +91,28 @@
 #include <sys/videoio.h>
 
 #include "preview_face.h"
+#include "preview_jpeg.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
 #define CAM_DEV        "/dev/video0"
+
+/* One JPEG every 60 displayed frames, i.e. about every two seconds at the
+ * measured 29 fps -- the cadence the project plan specifies for the vision
+ * request ("按固定/自适应周期（默认 2s）抓取一帧").
+ */
+
+#define JPEG_DEFAULT_EVERY  60
+
+/* How often live+face re-reads its expression source file.  Every 15 displayed
+ * frames is about twice a second at the measured rate -- far more often than a
+ * verdict can arrive (recognition measured at 3.6s for 240x240, 14.4s for
+ * 480x480), and the read costs one open/read/close of a one-word file.
+ */
+
+#define SRC_POLL_FRAMES     15
 
 #define CAM_WIDTH      640
 #define CAM_HEIGHT     480
@@ -146,6 +176,18 @@ struct preview_s
   FAR uint8_t *fbmem[MAX_FB];
   int fbidx[MAX_FB];            /* display number behind each slot */
   int nfb;
+
+  /* How many of those panels the live loop writes and pushes.  Normally all
+   * of them; the live+face mode sets it to 1 so that panel 0 shows the camera
+   * while panel 1 keeps an expression that is only repainted when it changes.
+   *
+   * Why it matters, measured: one panel push is 25 ms, so driving both with
+   * camera frames halves the preview rate -- 28.7 fps on one panel against
+   * 16.8 fps on two, with the camera delivering 29 fps either way.  Keeping
+   * the second panel out of the per-frame path is what buys the full rate.
+   */
+
+  int npreview;
 
   struct fb_videoinfo_s vinfo;
   struct fb_planeinfo_s pinfo;
@@ -463,6 +505,12 @@ static int preview_open_fb(FAR struct preview_s *p, int want)
       printf("preview: no framebuffer could be opened\n");
       return -ENODEV;
     }
+
+  /* Default: the live loop owns every panel it opened.  live+face narrows it
+   * afterwards.
+   */
+
+  p->npreview = p->nfb;
 
   printf("preview: %d panel(s), %ux%u fmt=%u bpp=%u stride=%u fblen=%u\n",
          p->nfb, p->vinfo.xres, p->vinfo.yres, p->vinfo.fmt,
@@ -1288,7 +1336,7 @@ static int preview_convert(FAR struct preview_s *p, int index)
        * variable per experiment.
        */
 
-      FAR uint16_t *drow1 = (p->nfb > 1) ?
+      FAR uint16_t *drow1 = (p->npreview > 1) ?
         (FAR uint16_t *)(p->fbmem[1] + (size_t)ty * p->pinfo.stride) : NULL;
 
       /* Read the source quads straight out of PSRAM.  Staging the row in
@@ -1430,13 +1478,53 @@ static int preview_convert(FAR struct preview_s *p, int index)
   return OK;
 }
 
+/****************************************************************************
+ * Name: preview_paint_face_on
+ *
+ * Description:
+ *   Render expression idx onto one panel and push it.  Used by the live+face
+ *   mode for the panel the camera does not own, so it is repainted only when
+ *   the expression changes rather than once per frame -- which is the whole
+ *   reason that mode can hold the camera's full rate.
+ *
+ ****************************************************************************/
+
+static int preview_paint_face_on(FAR struct preview_s *p, int slot, int idx,
+                                 uint32_t phase_ms)
+{
+  struct fb_area_s area;
+
+  if (slot < 0 || slot >= p->nfb)
+    {
+      return -EINVAL;
+    }
+
+  preview_face_render(p->fbmem[slot], p->pinfo.stride,
+                      (int)p->vinfo.xres, (int)p->vinfo.yres,
+                      idx, phase_ms);
+
+  area.x = 0;
+  area.y = 0;
+  area.w = p->vinfo.xres;
+  area.h = p->vinfo.yres;
+
+  if (ioctl(p->fbfd[slot], FBIO_UPDATE, (uintptr_t)&area) < 0)
+    {
+      printf("preview: fb%d FBIO_UPDATE failed: %d\n", p->fbidx[slot],
+             errno);
+      return -errno;
+    }
+
+  return OK;
+}
+
 static int preview_push_all(FAR struct preview_s *p,
                             FAR struct fb_area_s *area)
 {
   int ret = OK;
   int i;
 
-  for (i = 0; i < p->nfb; i++)
+  for (i = 0; i < p->npreview; i++)
     {
       if (ioctl(p->fbfd[i], FBIO_UPDATE, (uintptr_t)area) < 0)
         {
@@ -1699,18 +1787,50 @@ int main(int argc, FAR char *argv[])
   bool face_mode = false;
   bool bench_mode = false;
   bool stats_mode = false;
+  bool live_face = false;
+  FAR const char *face_name = NULL;
+  FAR const char *face_src = NULL;
+  FAR const char *jpeg_out = NULL;
+  FAR struct preview_jpeg_s *enc = NULL;
+  int jpeg_every = 0;
+  int jpeg_quality = 80;
+  int cycle_s = 0;
+  int face_idx = 0;
+  uint32_t jpeg_frames = 0;
+  uint32_t next_cycle_ms = 0;
   int want_fb = -1;               /* -1 = every registered panel */
   int i;
   int ret;
 
   /* NuttX's flat build keeps a builtin application's static storage across
-   * invocations, so g_stop survives from one 'camera_preview' to the next.
-   * Leaving it set is what made every animated expression report
-   * "1 frame(s)" after the first Ctrl-C of the boot: the render loop broke
-   * on a stop flag left over from a previous run.
+   * invocations, so every one of these survives from one 'camera_preview' to
+   * the next.  Leaving g_stop set is what made every animated expression
+   * report "1 frame(s)" after the first Ctrl-C of the boot: the render loop
+   * broke on a stop flag left over from a previous run.
+   *
+   * The decode and colour options have exactly the same problem, and it is
+   * worse because it is silent: 'camera_preview 30 yuyv' followed by
+   * 'camera_preview 30 sat=200' ran the second one in YUYV as well, and
+   * printed so in its own banner without anybody asking for it.  Any A/B
+   * comparison done that way compares two things that both changed.  So the
+   * whole option set is returned to its default here, and the defaults live
+   * in one place rather than being repeated.
    */
 
-  g_stop = 0;
+  g_stop       = 0;
+  g_yuv_order  = PREVIEW_HW;
+  g_full_range = false;
+  g_uv_swap    = false;
+  g_sat        = 100;
+  g_gain       = 100;
+  g_gamma      = 100;
+  g_xoff       = 0;
+  g_yoff       = 0;
+  g_mirror_x   = false;
+  g_mirror_y   = false;
+  g_rgain      = 100;
+  g_ggain      = 100;
+  g_bgain      = 100;
 
   for (i = 1; i < argc; i++)
     {
@@ -1787,6 +1907,38 @@ int main(int argc, FAR char *argv[])
         {
           want_fb = atoi(argv[i] + 3);
         }
+      else if (strncmp(argv[i], "expr=", 5) == 0)
+        {
+          face_name = argv[i] + 5;
+        }
+      else if (strncmp(argv[i], "src=", 4) == 0)
+        {
+          face_src = argv[i] + 4;
+        }
+      else if (strncmp(argv[i], "cycle=", 6) == 0)
+        {
+          cycle_s = atoi(argv[i] + 6);
+        }
+      else if (strcmp(argv[i], "jpeg") == 0)
+        {
+          jpeg_every = JPEG_DEFAULT_EVERY;
+        }
+      else if (strncmp(argv[i], "jpeg=", 5) == 0)
+        {
+          jpeg_every = atoi(argv[i] + 5);
+        }
+      else if (strncmp(argv[i], "jpegout=", 8) == 0)
+        {
+          jpeg_out = argv[i] + 8;
+          if (jpeg_every == 0)
+            {
+              jpeg_every = JPEG_DEFAULT_EVERY;
+            }
+        }
+      else if (strncmp(argv[i], "q=", 2) == 0)
+        {
+          jpeg_quality = atoi(argv[i] + 2);
+        }
     }
 
   if (argc > 1)
@@ -1800,6 +1952,18 @@ int main(int argc, FAR char *argv[])
       else if (strcmp(argv[1], "face") == 0)
         {
           face_mode = true;
+        }
+      else if (strcmp(argv[1], "live+face") == 0 ||
+               strcmp(argv[1], "liveface") == 0)
+        {
+          live_face = true;
+
+          /* "live+face 200" -- same meaning as the bare frame count. */
+
+          if (argc > 2 && argv[2][0] >= '0' && argv[2][0] <= '9')
+            {
+              max_frames = (uint32_t)atoi(argv[2]);
+            }
         }
       else if (strcmp(argv[1], "bench") == 0)
         {
@@ -1853,10 +2017,10 @@ int main(int argc, FAR char *argv[])
 
   preview_build_tone();
 
-  printf("preview: starting (%s -> fb%s), frames=%s, decode=%s, "
+  printf("preview: starting (%s -> fb%s), frames=%u, decode=%s, "
          "sat=%d%% gain=%d%% gamma=%d%% range=%s%s\n",
          CAM_DEV, want_fb < 0 ? "*" : (want_fb ? "1" : "0"),
-         max_frames ? argv[1] : "unlimited",
+         (unsigned int)max_frames,
          g_orders[g_yuv_order].name,
          g_sat, g_gain, g_gamma, g_full_range ? "full" : "limited",
          g_uv_swap ? " uvswap" : "");
@@ -1875,6 +2039,55 @@ int main(int argc, FAR char *argv[])
   if (ret < 0)
     {
       goto out;
+    }
+
+  if (live_face)
+    {
+      /* Panel 0 gets the camera, panel 1 gets the expression.  Both are
+       * opened; only the first is in the per-frame path.
+       */
+
+      if (p.nfb < 2)
+        {
+          printf("preview: live+face needs two panels, found %d\n", p.nfb);
+          ret = -ENODEV;
+          goto out;
+        }
+
+      p.npreview = 1;
+
+      if (face_name != NULL)
+        {
+          face_idx = preview_face_lookup(face_name);
+          if (face_idx < 0)
+            {
+              printf("preview: no expression named '%s'; run "
+                     "'camera_preview face' for the list\n", face_name);
+              ret = -EINVAL;
+              goto out;
+            }
+        }
+
+      (void)preview_paint_face_on(&p, 1, face_idx, 0);
+
+      printf("preview: live+face -- fb%d live, fb%d expression '%s'%s%s%s\n",
+             p.fbidx[0], p.fbidx[1], preview_face_name(face_idx),
+             cycle_s > 0 ? ", cycling" : "",
+             face_src ? ", source " : "", face_src ? face_src : "");
+    }
+
+  if (jpeg_every > 0)
+    {
+      enc = preview_jpeg_open(CAM_WIDTH, CAM_HEIGHT, jpeg_quality);
+      if (enc == NULL)
+        {
+          printf("preview: continuing without JPEG\n");
+        }
+      else
+        {
+          printf("preview: encoding one frame every %d displayed\n",
+                 jpeg_every);
+        }
     }
 
   /* From here on the hardware is streaming, so an exit must go through
@@ -2003,6 +2216,138 @@ int main(int argc, FAR char *argv[])
               (void)preview_push_all(&p, &area);
               push_ms += now_ms() - t0;
               frames++;
+
+              /* One frame in every jpeg_every goes through the hardware
+               * encoder as well.  This is the eyeglasses' upload path: the
+               * process that owns the camera is the only one that can produce
+               * a JPEG while a preview is running, so it produces both.
+               */
+
+              if (enc != NULL && (frames % (uint32_t)jpeg_every) == 0)
+                {
+                  FAR const uint8_t *jpg;
+                  size_t jlen;
+
+                  if (preview_jpeg_encode(enc, p.bufs[buf.index],
+                                          p.buf_sizes[buf.index],
+                                          &jpg, &jlen) == OK)
+                    {
+                      uint32_t cp_ms = 0;
+                      uint32_t cd_ms = 0;
+
+                      preview_jpeg_last_ms(enc, &cp_ms, &cd_ms);
+                      jpeg_frames++;
+
+                      printf("preview: jpeg #%u %zu bytes "
+                             "(copy %ums + codec %ums), SOI=%02x%02x "
+                             "EOI=%02x%02x\n",
+                             (unsigned int)jpeg_frames, jlen,
+                             (unsigned int)cp_ms, (unsigned int)cd_ms,
+                             jpg[0], jpg[1],
+                             jlen >= 2 ? jpg[jlen - 2] : 0,
+                             jlen >= 1 ? jpg[jlen - 1] : 0);
+
+                      if (jpeg_out != NULL)
+                        {
+                          FILE *f = fopen(jpeg_out, "w");
+
+                          if (f == NULL)
+                            {
+                              printf("preview: cannot write %s (errno=%d); "
+                                     "is /mnt mounted?\n",
+                                     jpeg_out, errno);
+                              jpeg_out = NULL;
+                            }
+                          else
+                            {
+                              size_t n = fwrite(jpg, 1, jlen, f);
+
+                              fclose(f);
+                              printf("preview: wrote %zu bytes to %s\n",
+                                     n, jpeg_out);
+                              jpeg_out = NULL;   /* first frame only */
+                            }
+                        }
+                    }
+                }
+
+              /* Expression rotation, for demonstrating the second panel
+               * without a model behind it yet.  It repaints only when the
+               * expression actually changes.
+               */
+
+              /* Expression source.  Two ways to drive the second panel:
+               *
+               *   cycle=<sec>   rotate through the table, for showing the
+               *                 panel works without a model behind it
+               *   src=<path>    read the expression name from a file, which
+               *                 is how a real verdict gets in: whoever does
+               *                 the recognition (the agent's write_file tool,
+               *                 social_cue, or a host script) writes one word
+               *                 there and this loop picks it up.
+               *
+               * A file is used rather than an IPC channel because /dev/video0
+               * has one owner: the recogniser cannot open the camera while
+               * this preview holds it, so the two halves have to meet
+               * somewhere, and a one-word file is the cheapest meeting point
+               * that both the agent's tool sandbox and a shell can write.
+               */
+
+              if (live_face && face_src != NULL &&
+                  (frames % SRC_POLL_FRAMES) == 0)
+                {
+                  FILE *sf = fopen(face_src, "r");
+
+                  if (sf != NULL)
+                    {
+                      char word[32];
+
+                      if (fgets(word, sizeof(word), sf) != NULL)
+                        {
+                          char *nl = strchr(word, '\n');
+                          int idx;
+
+                          if (nl != NULL)
+                            {
+                              *nl = '\0';
+                            }
+
+                          idx = preview_face_lookup(word);
+                          if (idx >= 0 && idx != face_idx)
+                            {
+                              face_idx = idx;
+                              (void)preview_paint_face_on(&p, 1, face_idx, 0);
+                              printf("preview: expression <- %s (%s)\n",
+                                     word, face_src);
+                            }
+                          else if (idx < 0)
+                            {
+                              printf("preview: %s names '%s', which is not an "
+                                     "expression\n", face_src, word);
+                            }
+                        }
+
+                      fclose(sf);
+                    }
+                }
+
+              if (live_face && cycle_s > 0)
+                {
+                  uint32_t nowms = now_ms();
+
+                  if (next_cycle_ms == 0)
+                    {
+                      next_cycle_ms = nowms + (uint32_t)cycle_s * 1000;
+                    }
+                  else if (nowms >= next_cycle_ms)
+                    {
+                      face_idx = (face_idx + 1) % preview_face_count();
+                      (void)preview_paint_face_on(&p, 1, face_idx, 0);
+                      printf("preview: expression -> %s\n",
+                             preview_face_name(face_idx));
+                      next_cycle_ms = nowms + (uint32_t)cycle_s * 1000;
+                    }
+                }
             }
           else
             {
@@ -2047,6 +2392,11 @@ int main(int argc, FAR char *argv[])
   ret = OK;
 
 out:
+  if (enc != NULL)
+    {
+      preview_jpeg_close(enc);
+    }
+
   preview_cleanup(&p);
   return ret < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
