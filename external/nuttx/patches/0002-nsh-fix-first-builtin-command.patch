@@ -1,0 +1,16 @@
+From: VelaSights BK7258 port
+Subject: [PATCH] nsh: allow dispatching the first builtin command
+
+builtin_isavail() returns a zero-based builtin index.  Treating index zero as
+unavailable prevents the first builtin command from running directly from
+NSH, for example `renew wlan0` when renew is the first generated builtin.
+
+diff --git a/apps/nshlib/nsh_command.c b/apps/nshlib/nsh_command.c
+--- a/apps/nshlib/nsh_command.c
++++ b/apps/nshlib/nsh_command.c
+@@ -1272,2 +1272,2 @@
+-  if (index > 0)
++  if (index >= 0)
+     {
+--
+2.43.0
