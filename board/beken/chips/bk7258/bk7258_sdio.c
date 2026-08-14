@@ -1,9 +1,9 @@
 /****************************************************************************
  * SPDX-License-Identifier: Apache-2.0
  *
- * BK7258 SD-NAND SDIO host.  The first port is deliberately polling based:
- * it keeps the hardware state machine observable while command and PIO
- * behavior are being validated on the target board.  No SDIO DMA is used.
+ * BK7258 SD-NAND SDIO host.  Commands use bounded polling; PIO data
+ * completion is interrupt driven and FIFO data is copied in task context.
+ * No SDIO DMA is used.
  ****************************************************************************/
 
 #include <nuttx/config.h>
@@ -16,11 +16,14 @@
 #include <string.h>
 
 #include <nuttx/clock.h>
+#include <nuttx/irq.h>
 #include <nuttx/mutex.h>
+#include <nuttx/semaphore.h>
 #include <nuttx/sdio.h>
 #include <nuttx/signal.h>
 
 #include "arm_internal.h"
+#include "irq.h"
 #include "bk7258_gpio.h"
 #include "bk7258_sdio.h"
 #include "hardware/bk7258_gpio.h"
@@ -38,11 +41,20 @@ struct bk7258_sdio_s
   sdio_eventset_t wait_events;
   sdio_eventset_t wake_events;
   uint32_t wait_timeout;
-  clock_t wait_start;
   uint32_t clock_code;
+  uint32_t irq_status;
+  uint32_t last_cmd;
+  int last_cmd_result;
+  int data_result;
   bool data_active;
+  bool irq_attached;
   bool initialized;
-  mutex_t io_lock;
+  sem_t data_sem;
+#if defined(CONFIG_SCHED_WORKQUEUE) && defined(CONFIG_SCHED_HPWORK)
+  worker_t callback;
+  FAR void *callback_arg;
+  sdio_eventset_t callback_events;
+#endif
 };
 
 static struct bk7258_sdio_s g_sdio;
@@ -93,13 +105,73 @@ static void sdio_reset_hw(struct bk7258_sdio_s *priv)
   value = sdio_read(BK7258_SDIO_FIFO);
   value &= ~(0xffffu | BK7258_SDIO_FIFO_RX_RESET |
              BK7258_SDIO_FIFO_TX_RESET | BK7258_SDIO_STATE_RESET);
-   value |= 0x0101u | BK7258_SDIO_CLOCK_RECOVERY;
+  value |= 0x0101u | BK7258_SDIO_CLOCK_RECOVERY;
   sdio_write(BK7258_SDIO_FIFO, value);
 
   sdio_write(BK7258_SDIO_CMD_TIMER, BK7258_SDIO_TIMEOUT);
   sdio_write(BK7258_SDIO_DATA_TIMER, BK7258_SDIO_TIMEOUT);
   sdio_write(BK7258_SDIO_DATA_CTRL, BK7258_SDIO_DATA_BYTE_SELECT);
   sdio_set_clock(priv, BK7258_SDIO_ID_CLOCK);
+}
+
+static void sdio_reset_data_state(void)
+{
+  modifyreg32(BK7258_SDIO_FIFO,
+              BK7258_SDIO_FIFO_RX_RESET |
+              BK7258_SDIO_FIFO_TX_RESET |
+              BK7258_SDIO_STATE_RESET, 0);
+}
+
+static int sdio_interrupt(int irq, FAR void *context, FAR void *arg)
+{
+  FAR struct bk7258_sdio_s *priv = &g_sdio;
+  uint32_t status;
+  uint32_t clear;
+
+  (void)irq;
+  (void)context;
+  (void)arg;
+
+  status = sdio_read(BK7258_SDIO_INT_STATUS);
+  clear = status & (BK7258_SDIO_DATA_RECEIVE_END |
+                    BK7258_SDIO_DATA_TIMEOUT |
+                    BK7258_SDIO_RX_NEED_READ |
+                    BK7258_SDIO_DATA_CRC_OK |
+                    BK7258_SDIO_DATA_CRC_FAIL);
+
+  if (priv->data_active &&
+      (status & (BK7258_SDIO_DATA_RECEIVE_END |
+                 BK7258_SDIO_DATA_TIMEOUT)) != 0)
+    {
+      priv->irq_status = status;
+      if ((status & BK7258_SDIO_DATA_TIMEOUT) != 0)
+        {
+          priv->data_result = -ETIMEDOUT;
+        }
+      else if ((status & BK7258_SDIO_DATA_CRC_FAIL) != 0 ||
+               (status & BK7258_SDIO_DATA_CRC_OK) == 0)
+        {
+          priv->data_result = -EIO;
+        }
+      else
+        {
+          priv->data_result = OK;
+        }
+
+      priv->data_active = false;
+      if (clear != 0)
+        {
+          sdio_write(BK7258_SDIO_INT_STATUS, clear);
+        }
+
+      nxsem_post(&priv->data_sem);
+    }
+  else if (clear != 0)
+    {
+      sdio_write(BK7258_SDIO_INT_STATUS, clear);
+    }
+
+  return OK;
 }
 
 static int sdio_wait_command(struct bk7258_sdio_s *priv, uint32_t cmd)
@@ -169,10 +241,16 @@ static int sdio_wait_command(struct bk7258_sdio_s *priv, uint32_t cmd)
 }
 
 static int sdio_sendcmd(FAR struct sdio_dev_s *dev, uint32_t cmd,
-                        uint32_t arg)
+                         uint32_t arg)
 {
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
   uint32_t response;
   uint32_t value;
+
+  if ((cmd & MMCSD_DATAXFR_MASK) == MMCSD_WRDATAXFR)
+    {
+      return -EROFS;
+    }
 
   response = (cmd & MMCSD_RESPONSE_MASK) >> MMCSD_RESPONSE_SHIFT;
   value = ((cmd & MMCSD_CMDIDX_MASK) << BK7258_SDIO_CMD_INDEX_SHIFT);
@@ -180,7 +258,7 @@ static int sdio_sendcmd(FAR struct sdio_dev_s *dev, uint32_t cmd,
     {
       value |= BK7258_SDIO_CMD_RESPONSE;
     }
-  if (response == MMCSD_R2_RESPONSE)
+  if (response == (MMCSD_R2_RESPONSE >> MMCSD_RESPONSE_SHIFT))
     {
       value |= BK7258_SDIO_CMD_LONG;
     }
@@ -193,18 +271,43 @@ static int sdio_sendcmd(FAR struct sdio_dev_s *dev, uint32_t cmd,
     }
 
   sdio_write(BK7258_SDIO_CMD_ARGUMENT, arg);
+  priv->last_cmd = cmd;
+  priv->last_cmd_result = -EINPROGRESS;
   sdio_write(BK7258_SDIO_CMD_CTRL, value | BK7258_SDIO_CMD_START);
   return OK;
 }
 
 static int sdio_waitresponse(FAR struct sdio_dev_s *dev, uint32_t cmd)
 {
-  return sdio_wait_command((FAR struct bk7258_sdio_s *)dev, cmd);
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+
+  priv->last_cmd_result = sdio_wait_command(priv, cmd);
+  return priv->last_cmd_result;
+}
+
+static int sdio_response_result(FAR struct bk7258_sdio_s *priv,
+                                uint32_t cmd)
+{
+  if (priv->last_cmd != cmd)
+    {
+      return -EPROTO;
+    }
+
+  return priv->last_cmd_result;
 }
 
 static int sdio_recv_r1(FAR struct sdio_dev_s *dev, uint32_t cmd,
                         FAR uint32_t *value)
 {
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+  int ret;
+
+  ret = sdio_response_result(priv, cmd);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
   *value = sdio_read(BK7258_SDIO_RESPONSE(0));
   printf("SDIO R1 CMD%u=0x%08lx\n", (unsigned)(cmd & MMCSD_CMDIDX_MASK),
          (unsigned long)*value);
@@ -214,6 +317,15 @@ static int sdio_recv_r1(FAR struct sdio_dev_s *dev, uint32_t cmd,
 static int sdio_recv_r2(FAR struct sdio_dev_s *dev, uint32_t cmd,
                         FAR uint32_t value[4])
 {
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+  int ret;
+
+  ret = sdio_response_result(priv, cmd);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
   /* The vendor driver assigns response register 0 to CSD_3 (bits
    * 127..96), register 1 to CSD_2, register 2 to CSD_1 and register 3 to
    * CSD_0. This is already the word order expected by NuttX. */
@@ -264,8 +376,15 @@ static void sdio_reset(FAR struct sdio_dev_s *dev)
 
   sdio_reset_hw(priv);
   priv->data_active = false;
+  priv->buffer = NULL;
   priv->remaining = 0;
+  priv->wait_events = 0;
   priv->wake_events = 0;
+  priv->irq_status = 0;
+  priv->data_result = -ECANCELED;
+  while (nxsem_trywait(&priv->data_sem) == OK)
+    {
+    }
 }
 
 static sdio_capset_t sdio_capabilities(FAR struct sdio_dev_s *dev)
@@ -277,7 +396,7 @@ static sdio_capset_t sdio_capabilities(FAR struct sdio_dev_s *dev)
 static sdio_statset_t sdio_status(FAR struct sdio_dev_s *dev)
 {
   (void)dev;
-  return SDIO_STATUS_PRESENT;
+  return SDIO_STATUS_PRESENT | SDIO_STATUS_WRPROTECTED;
 }
 
 static void sdio_widebus(FAR struct sdio_dev_s *dev, bool enable)
@@ -290,7 +409,12 @@ static void sdio_clock(FAR struct sdio_dev_s *dev, enum sdio_clock_e rate)
 {
   FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
 
-  if (rate == CLOCK_IDMODE)
+  if (rate == CLOCK_SDIO_DISABLED)
+    {
+      sdio_write(BK7258_SDIO_DATA_CTRL, 0);
+      modifyreg32(BK7258_SDIO_FIFO, BK7258_SDIO_CLOCK_GATE, 0);
+    }
+  else if (rate == CLOCK_IDMODE)
     {
       sdio_set_clock(priv, BK7258_SDIO_ID_CLOCK);
       modifyreg32(BK7258_SDIO_FIFO, 0, BK7258_SDIO_CLOCK_GATE);
@@ -304,7 +428,22 @@ static void sdio_clock(FAR struct sdio_dev_s *dev, enum sdio_clock_e rate)
 
 static int sdio_attach(FAR struct sdio_dev_s *dev)
 {
-  (void)dev;
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+  int ret;
+
+  if (priv->irq_attached)
+    {
+      return OK;
+    }
+
+  ret = irq_attach(BK7258_IRQ_SDIO, sdio_interrupt, priv);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  up_enable_irq(BK7258_IRQ_SDIO);
+  priv->irq_attached = true;
   return OK;
 }
 
@@ -324,7 +463,7 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
   uint32_t value;
 
   if (buffer == NULL || nbytes == 0 || priv->blocklen == 0 ||
-      nbytes > (priv->blocklen * priv->nblocks))
+      priv->nblocks == 0 || nbytes != (priv->blocklen * priv->nblocks))
     {
       return -EINVAL;
     }
@@ -333,6 +472,9 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
    * status before asserting the RX FIFO and SD state resets. */
   sdio_write(BK7258_SDIO_DATA_TIMER, BK7258_SDIO_TIMEOUT);
   sdio_write(BK7258_SDIO_INT_STATUS, 0xffffffffu);
+  while (nxsem_trywait(&priv->data_sem) == OK)
+    {
+    }
 
   /* Complete the vendor V2 reset pulse before configuring the receive
    * transaction. */
@@ -347,18 +489,31 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
 
   value = ((priv->blocklen << BK7258_SDIO_DATA_BLOCK_SHIFT) &
            BK7258_SDIO_DATA_BLOCK_MASK) | BK7258_SDIO_DATA_BYTE_SELECT;
+  /* BK7258 V2 uses its multi-block data engine for 512-byte reads even when
+   * the card command is CMD17. Short register transfers such as SCR remain
+   * in single-block mode. */
+
   if (priv->blocklen == 512)
     {
       value |= BK7258_SDIO_DATA_MULTIBLOCK;
     }
   /* Keep configuration and start as separate writes, matching the vendor
    * set_read_multi_block_data()/start_receive_data() sequence. */
-  sdio_write(BK7258_SDIO_DATA_CTRL, value);
-  modifyreg32(BK7258_SDIO_INT_MASK, 0, BK7258_SDIO_DATA_RECEIVE_END);
-  sdio_write(BK7258_SDIO_DATA_CTRL, value | BK7258_SDIO_DATA_ENABLE);
   priv->buffer = buffer;
   priv->remaining = nbytes;
+  priv->irq_status = 0;
+  priv->data_result = -EINPROGRESS;
   priv->data_active = true;
+  sdio_write(BK7258_SDIO_DATA_CTRL, value);
+  modifyreg32(BK7258_SDIO_INT_MASK, 0,
+              BK7258_SDIO_DATA_RECEIVE_END |
+              BK7258_SDIO_DATA_TIMEOUT);
+  sdio_write(BK7258_SDIO_DATA_CTRL, value | BK7258_SDIO_DATA_ENABLE);
+
+  /* The vendor card driver requires this settling interval after starting
+   * the receive engine; without it the receive-end event can be missed. */
+
+  nxsig_usleep(2000);
   printf("SDIO data setup block=%lu count=%lu bytes=%lu\n",
          (unsigned long)priv->blocklen, (unsigned long)priv->nblocks,
          (unsigned long)nbytes);
@@ -379,10 +534,16 @@ static int sdio_cancel(FAR struct sdio_dev_s *dev)
   FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
 
   sdio_write(BK7258_SDIO_DATA_CTRL, 0);
+  modifyreg32(BK7258_SDIO_INT_MASK,
+              BK7258_SDIO_DATA_RECEIVE_END |
+              BK7258_SDIO_DATA_TIMEOUT, 0);
   sdio_write(BK7258_SDIO_INT_STATUS, 0xffffffffu);
   priv->data_active = false;
+  priv->buffer = NULL;
   priv->remaining = 0;
   priv->wake_events = SDIOWAIT_ERROR;
+  priv->data_result = -ECANCELED;
+  nxsem_post(&priv->data_sem);
   return OK;
 }
 
@@ -393,11 +554,10 @@ static void sdio_waitenable(FAR struct sdio_dev_s *dev,
 
   priv->wait_events = eventset;
   priv->wake_events = 0;
-  priv->wait_timeout = timeout == 0 ? 1000 : timeout;
-  priv->wait_start = clock_systime_ticks();
+  priv->wait_timeout = timeout;
 }
 
-static void sdio_drain_fifo(FAR struct bk7258_sdio_s *priv)
+static int sdio_drain_fifo(FAR struct bk7258_sdio_s *priv)
 {
   while (priv->remaining != 0)
     {
@@ -414,7 +574,7 @@ static void sdio_drain_fifo(FAR struct bk7258_sdio_s *priv)
 
       if (timeout == 0)
         {
-          return;
+          return -EIO;
         }
 
       word = sdio_read(BK7258_SDIO_RX_FIFO);
@@ -422,240 +582,98 @@ static void sdio_drain_fifo(FAR struct bk7258_sdio_s *priv)
       priv->buffer += copy;
       priv->remaining -= copy;
     }
-}
 
-int bk7258_sdio_read_blocks(FAR uint8_t *buffer, uint32_t sector,
-                            unsigned int nblocks)
-{
-  FAR struct sdio_dev_s *dev;
-  FAR struct bk7258_sdio_s *priv;
-  sdio_eventset_t event;
-  unsigned int i;
-  unsigned int nonff = 0;
-  uint32_t hash = 2166136261u;
-  uint32_t response;
-  uint32_t value;
-  bool stream_active = false;
-  int data_ret;
-  int ret;
-
-  if (buffer == NULL || nblocks == 0 || nblocks > 1)
-    {
-      return -EINVAL;
-    }
-
-  dev = bk7258_sdio_initialize(0);
-  if (dev == NULL)
-    {
-      return -ENODEV;
-    }
-
-  priv = (FAR struct bk7258_sdio_s *)dev;
-  ret = nxmutex_lock(&priv->io_lock);
-  if (ret < 0)
-    {
-      return ret;
-    }
-
-  SDIO_BLOCKSETUP(dev, 512, 1);
-  SDIO_WAITENABLE(dev, SDIOWAIT_TRANSFERDONE | SDIOWAIT_TIMEOUT |
-                  SDIOWAIT_ERROR, 2000);
-  ret = SDIO_RECVSETUP(dev, buffer, 512);
-  if (ret == OK)
-    {
-      /* OCR=0x80ff8000 has CCS clear, so CMD18 uses byte addressing. */
-      ret = SDIO_SENDCMD(dev, MMCSD_CMD18, sector << 9);
-    }
-  if (ret == OK)
-    {
-      ret = SDIO_WAITRESPONSE(dev, MMCSD_CMD18);
-    }
-  if (ret == OK)
-    {
-      ret = SDIO_RECVR1(dev, MMCSD_CMD18, &response);
-      stream_active = ret == OK;
-    }
-  if (ret == OK)
-    {
-      event = SDIO_EVENTWAIT(dev);
-      if ((event & SDIOWAIT_TRANSFERDONE) == 0)
-        {
-          ret = (event & SDIOWAIT_TIMEOUT) != 0 ? -ETIMEDOUT : -EIO;
-        }
-    }
-
-  data_ret = ret;
-
-  if (stream_active)
-    {
-      /* Match the vendor V2 CMD12 path after the FIFO block is consumed. */
-      value = sdio_read(BK7258_SDIO_FIFO);
-      value &= ~(BK7258_SDIO_FIFO_RX_RESET |
-                 BK7258_SDIO_FIFO_TX_RESET | BK7258_SDIO_STATE_RESET);
-      sdio_write(BK7258_SDIO_FIFO, value);
-      modifyreg32(BK7258_SDIO_FIFO, 0, BK7258_SDIO_CLOCK_GATE);
-
-      ret = SDIO_SENDCMD(dev, MMCSD_CMD12, 0);
-      if (ret == OK)
-        {
-          ret = SDIO_WAITRESPONSE(dev, MMCSD_CMD12);
-        }
-      if (ret == OK)
-        {
-          ret = SDIO_RECVR1(dev, MMCSD_CMD12, &response);
-        }
-
-      modifyreg32(BK7258_SDIO_FIFO, BK7258_SDIO_CLOCK_GATE, 0);
-      value = sdio_read(BK7258_SDIO_FIFO);
-      value &= ~(BK7258_SDIO_FIFO_RX_RESET |
-                 BK7258_SDIO_FIFO_TX_RESET | BK7258_SDIO_STATE_RESET);
-      sdio_write(BK7258_SDIO_FIFO, value);
-
-      if (data_ret != OK)
-        {
-          ret = data_ret;
-        }
-    }
-
-  if (ret == OK)
-    {
-      int signature = -1;
-
-      for (i = 0; i < 512; i++)
-        {
-          hash = (hash ^ buffer[i]) * 16777619u;
-          if (buffer[i] != 0xff)
-            {
-              nonff++;
-            }
-
-          if (i != 0 && buffer[i - 1] == 0x55 && buffer[i] == 0xaa)
-            {
-              signature = (int)i - 1;
-            }
-        }
-
-      printf("SDIO sector=%lu nonff=%u hash=%08lx first=%02x%02x%02x%02x "
-             "last=%02x%02x%02x%02x signature=%d\n",
-             (unsigned long)sector, nonff, (unsigned long)hash,
-              buffer[0], buffer[1], buffer[2], buffer[3],
-              buffer[508], buffer[509], buffer[510], buffer[511], signature);
-
-    }
-
-  nxmutex_unlock(&priv->io_lock);
-  return ret;
+  return OK;
 }
 
 static sdio_eventset_t sdio_eventwait(FAR struct sdio_dev_s *dev)
 {
   FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
-  clock_t deadline = priv->wait_start + MSEC2TICK(priv->wait_timeout);
+  uint32_t status;
+  int ret;
 
-  for (;;)
+  if ((priv->wait_events & SDIOWAIT_TIMEOUT) != 0)
     {
-      uint32_t status = sdio_read(BK7258_SDIO_INT_STATUS);
-
-      if ((status & BK7258_SDIO_DATA_CRC_FAIL) != 0)
-        {
-          printf("SDIO data CRC error status=0x%08lx remaining=%lu\n",
-                 (unsigned long)status, (unsigned long)priv->remaining);
-          sdio_write(BK7258_SDIO_INT_STATUS,
-                     status & (BK7258_SDIO_DATA_RECEIVE_END |
-                               BK7258_SDIO_DATA_CRC_FAIL |
-                               BK7258_SDIO_DATA_CRC_OK));
-          priv->data_active = false;
-          priv->wake_events = SDIOWAIT_ERROR;
-          break;
-        }
-
-      if ((status & (BK7258_SDIO_DATA_TIMEOUT |
-                      BK7258_SDIO_FIFO_OVERFLOW)) != 0)
-        {
-          clock_t drain_deadline = clock_systime_ticks() + MSEC2TICK(10);
-
-          while (priv->remaining != 0 &&
-                 (int32_t)(clock_systime_ticks() - drain_deadline) < 0)
-            {
-              sdio_drain_fifo(priv);
-            }
-
-          printf("SDIO data error status=0x%08lx remaining=%lu\n",
-                 (unsigned long)status, (unsigned long)priv->remaining);
-          sdio_write(BK7258_SDIO_INT_STATUS,
-                      status & (BK7258_SDIO_DATA_RECEIVE_END |
-                                BK7258_SDIO_DATA_TIMEOUT |
-                                BK7258_SDIO_RX_NEED_READ |
-                                BK7258_SDIO_DATA_CRC_FAIL |
-                                BK7258_SDIO_FIFO_OVERFLOW |
-                                BK7258_SDIO_DATA_CRC_OK));
-          priv->data_active = false;
-           priv->wake_events = SDIOWAIT_ERROR;
-          break;
-        }
-
-      if (priv->data_active &&
-          (status & BK7258_SDIO_DATA_RECEIVE_END) != 0)
-        {
-           if ((status & BK7258_SDIO_DATA_CRC_OK) == 0)
-             {
-               priv->data_active = false;
-               priv->wake_events = SDIOWAIT_ERROR;
-               break;
-             }
-
-           /* The vendor reader clears the receive-end W1C bit before
-            * consuming the completed block from the RX FIFO. */
-           sdio_write(BK7258_SDIO_INT_STATUS,
-                      BK7258_SDIO_DATA_RECEIVE_END);
-           sdio_drain_fifo(priv);
-           sdio_write(BK7258_SDIO_INT_STATUS,
-                      status & (BK7258_SDIO_DATA_RECEIVE_END |
-                                BK7258_SDIO_DATA_CRC_OK |
-                                BK7258_SDIO_DATA_CRC_FAIL |
-                                BK7258_SDIO_RX_NEED_READ));
-           priv->data_active = false;
-           priv->wake_events = priv->remaining == 0 ? SDIOWAIT_TRANSFERDONE :
-                               SDIOWAIT_ERROR;
-            printf("SDIO data complete status=0x%08lx remaining=%lu event=0x%x\n",
-                   (unsigned long)status, (unsigned long)priv->remaining,
-                   priv->wake_events);
-            break;
-        }
-
-      if ((int32_t)(clock_systime_ticks() - deadline) >= 0)
-        {
-          priv->data_active = false;
-          priv->wake_events = SDIOWAIT_TIMEOUT;
-          printf("SDIO data timeout status=0x%08lx remaining=%lu\n",
-                 (unsigned long)status, (unsigned long)priv->remaining);
-          break;
-        }
-
-      if (!priv->data_active)
-        {
-          nxsig_usleep(100);
-        }
+      ret = nxsem_tickwait_uninterruptible(&priv->data_sem,
+                                            MSEC2TICK(priv->wait_timeout));
+    }
+  else
+    {
+      ret = nxsem_wait_uninterruptible(&priv->data_sem);
     }
 
+  status = priv->irq_status;
+  if (ret < 0)
+    {
+      priv->data_active = false;
+      priv->wake_events = SDIOWAIT_TIMEOUT;
+      printf("SDIO data wait timeout status=0x%08lx remaining=%lu\n",
+             (unsigned long)sdio_read(BK7258_SDIO_INT_STATUS),
+             (unsigned long)priv->remaining);
+    }
+  else if (priv->data_result < 0)
+    {
+      priv->wake_events = priv->data_result == -ETIMEDOUT ? SDIOWAIT_TIMEOUT :
+                          SDIOWAIT_ERROR;
+      printf("SDIO data error=%d status=0x%08lx remaining=%lu\n",
+             priv->data_result, (unsigned long)status,
+             (unsigned long)priv->remaining);
+    }
+  else if (sdio_drain_fifo(priv) == OK && priv->remaining == 0)
+    {
+      priv->wake_events = SDIOWAIT_TRANSFERDONE;
+      printf("SDIO data complete status=0x%08lx event=0x%x\n",
+             (unsigned long)status, priv->wake_events);
+    }
+  else
+    {
+      priv->wake_events = SDIOWAIT_ERROR;
+      printf("SDIO FIFO drain failed status=0x%08lx remaining=%lu\n",
+             (unsigned long)status, (unsigned long)priv->remaining);
+    }
+
+  modifyreg32(BK7258_SDIO_INT_MASK,
+              BK7258_SDIO_DATA_RECEIVE_END |
+              BK7258_SDIO_DATA_TIMEOUT, 0);
+  sdio_reset_data_state();
+
   priv->wait_events = 0;
+  priv->buffer = NULL;
+  priv->remaining = 0;
   return priv->wake_events;
 }
 
 static void sdio_callbackenable(FAR struct sdio_dev_s *dev,
                                 sdio_eventset_t eventset)
 {
-  (void)dev;
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+
+#if defined(CONFIG_SCHED_WORKQUEUE) && defined(CONFIG_SCHED_HPWORK)
+  priv->callback_events = eventset;
+  if (priv->callback != NULL &&
+      (eventset & SDIOMEDIA_INSERTED) != 0 &&
+      (sdio_status(dev) & SDIO_STATUS_PRESENT) != 0)
+    {
+      worker_t callback = priv->callback;
+      FAR void *arg = priv->callback_arg;
+
+      priv->callback_events = 0;
+      callback(arg);
+    }
+#else
   (void)eventset;
+#endif
 }
 
 #if defined(CONFIG_SCHED_WORKQUEUE) && defined(CONFIG_SCHED_HPWORK)
 static int sdio_registercallback(FAR struct sdio_dev_s *dev,
                                  worker_t callback, FAR void *arg)
 {
-  (void)dev;
-  (void)callback;
-  (void)arg;
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+
+  priv->callback = callback;
+  priv->callback_arg = arg;
+  priv->callback_events = 0;
   return OK;
 }
 #endif
@@ -710,7 +728,7 @@ FAR struct sdio_dev_s *bk7258_sdio_initialize(int slotno)
       memset(&g_sdio, 0, sizeof(g_sdio));
       memcpy(&g_sdio.dev, &g_sdio_template, sizeof(g_sdio.dev));
       nxmutex_init(&g_sdio.dev.mutex);
-      nxmutex_init(&g_sdio.io_lock);
+      nxsem_init(&g_sdio.data_sem, 0, 0);
       sdio_pinmux();
       sdio_reset_hw(&g_sdio);
       modifyreg32(BK7258_SDIO_FIFO, 0, BK7258_SDIO_CLOCK_GATE);

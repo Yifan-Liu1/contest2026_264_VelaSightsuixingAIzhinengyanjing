@@ -20,6 +20,11 @@ CHIP_CSRCS += bk7258_ipc_heartbeat.c
 CHIP_CSRCS += bk7258_wifi.c
 CHIP_CSRCS += bk7258_mb_uart.c
 CHIP_CSRCS += bk7258_pm_pwc.c
+
+ifeq ($(CONFIG_BK7258_SDIO),y)
+CHIP_CSRCS += bk7258_sdio.c
+endif
+
 CHIP_CSRCS += bk7258_psram.c
 CHIP_CSRCS += bk7258_allocateheap.c
 CHIP_CSRCS += bk7258_qspi.c

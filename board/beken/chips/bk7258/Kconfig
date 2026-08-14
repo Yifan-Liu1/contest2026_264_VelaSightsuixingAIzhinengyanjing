@@ -41,7 +41,8 @@ config BK7258_SDIO
 	depends on MMCSD
 	help
 		Enable the GPIO14..GPIO19 SDIO host used by the board's fixed
-		SD-NAND. The first implementation is one-bit polling PIO only.
+		SD-NAND. The first implementation is one-bit, interrupt-assisted
+		PIO and read-only.
 
 config BK7258_TRNG
 	bool "BK7258 hardware TRNG"

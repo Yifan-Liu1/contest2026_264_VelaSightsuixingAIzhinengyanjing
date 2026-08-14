@@ -17,7 +17,6 @@ set(SRCS
     bk7258_wifi.c
     bk7258_mb_uart.c
     bk7258_pm_pwc.c
-    bk7258_sdio.c
     bk7258_psram.c
     bk7258_allocateheap.c
     bk7258_qspi.c
@@ -31,6 +30,10 @@ set(SRCS
     bk7258_cpuindex.c
     bk7258_idle.c
     bk7258_reset.c)
+
+if(CONFIG_BK7258_SDIO)
+  list(APPEND SRCS bk7258_sdio.c)
+endif()
 
 if(CONFIG_BK7258_TRNG)
   list(APPEND SRCS bk7258_trng.c)
