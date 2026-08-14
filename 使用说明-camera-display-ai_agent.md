@@ -31,6 +31,8 @@ BK7258 DevKit 上逐条敲出来的结果。
 | `camera_preview live+face 40` | ✅ | 跑 40 帧后退出 |
 | `camera_preview live+face expr=smile` | ⬜ | 指定初始表情；名字错会列出可用值 |
 | `camera_preview live+face 40 cycle=1` | ✅ | 每秒轮换表情，实测打印 `preview: expression -> smile` |
+| `camera_preview live+face 120 src=/mnt/expr.txt` | ✅ | **表情由文件驱动**——识别方写一个词进去即可：`echo smile > /mnt/expr.txt` → `preview: expression <- smile`。用文件而非 IPC，因为 `/dev/video0` 独占，识别方在预览持有相机时打不开设备 |
+| `camera_preview live+face 120 src=/mnt/expr.txt jpeg=60` | ✅ | 双屏 + 外部表情 + 每 60 帧产出上传用 JPEG，实测 **25.07 fps** |
 
 **为什么要分工**，实测对比：
 
@@ -42,6 +44,23 @@ BK7258 DevKit 上逐条敲出来的结果。
 
 一次推屏 51200 字节要 24–26 ms，两屏串行就是 50 ms/帧。表情屏只在表情变化时重画，
 所以不进每帧路径，预览就能跑满相机速率。
+
+## 一点五、识别性能：决定"实时"是几秒级
+
+模型两行用真 key + 从本板取回的真帧在主机测，其余板上测：
+
+| 环节 | 实测 |
+|---|---|
+| 文本 `ask` 往返（板上） | `llm_ms=5091`（主机同 15 KB 请求 4.6 s） |
+| 视觉 480x480（43859 B → base64 58480 B） | **14.4–14.8 s**，`image_tokens=225` |
+| 视觉 240x240（8941 B → base64 11924 B） | **3.6 s**，`image_tokens=64`，答案仍正确 |
+| 预览流出 JPEG（480x480） | 313 ms（copy 27 + 软件编码 286） |
+| 表情渲染 + 推屏 | 24–26 ms |
+
+**480x480 到 240x240 是 4 倍差距**，而对占满画面的人脸没有质量损失——这是识别回路上最大的
+杠杆。据此端到端刷新周期：480x480 约 **15 s**，240x240 约 **4 s**。预览始终 29 fps 不受影响。
+
+模型的拒绝路径在真实调用中生效：对着空桌子的帧返回 `unable_to_judge: true, reason: no_face`。
 
 ## 二、从预览流产出 JPEG（上传用）
 
