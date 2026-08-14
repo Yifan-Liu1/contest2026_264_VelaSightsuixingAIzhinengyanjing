@@ -425,6 +425,63 @@ adding.
 Until a network is joined the agent degrades cleanly rather than hanging:
 `[agent] Network timeout — net services not started.`
 
+## Enabling it on your own board
+
+Three steps, in this order.  The first two are what makes the LLM reachable at
+all; skipping either leaves an agent that starts and then cannot call anything.
+
+```sh
+cd <openvela work tree root>
+
+# 1. Upstream patches (idempotent, --revert supported)
+sh contest2026_264_.../board/beken/boards/bk7258/bk7258-ap/ai_agent/apply.sh
+
+# 2. Your own API key, never committed
+cp contest2026_264_.../ai_agent/agent_secrets.h.example \
+   packages/ai_agent/include/agent_secrets.h
+$EDITOR packages/ai_agent/include/agent_secrets.h     # fill in the key
+
+# 3. Build, package, flash
+./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8
+./autoflash.sh -A
+```
+
+`agent_secrets.h` is picked up by `__has_include` in `agent_config.h`.  Two
+things bite here: ninja does not know that a *previously absent* header has
+appeared, so the first build after creating it needs `touch` on a file that
+includes it (or delete the `.o`); and the key ends up in plaintext in the
+firmware, so a `.bin` built this way must not be handed around.
+
+**MiMo has two credential sets and mixing them up looks like a bad key.**
+Measured with a real key: `tp-` prefix against `api.xiaomimimo.com` returns
+`401 Invalid API Key` with both `Authorization: Bearer` and `api-key:` headers;
+the same key against `token-plan-cn.xiaomimimo.com` returns HTTP 200. Also
+note the agent's built-in `mimo` presets name `mimo-v2-flash` and
+`mimo-v2-omni`, both retired on 2026-06-30 -- the only model that answers now
+is `mimo-v2.5`.
+
+| Credential | BASE_URL | key |
+|---|---|---|
+| 按量付费 | `api.xiaomimimo.com/v1` | `sk-…` |
+| Token Plan | `token-plan-cn.xiaomimimo.com/v1` | `tp-…` |
+
+### Measured latency
+
+All on hardware except the two model rows, which were measured from a host on
+the same key with a frame captured from this board:
+
+| Step | Measured |
+|---|---|
+| Text `ask` round trip, on board | `llm_ms=5091` (host: 4.6 s for the same 15 KB request) |
+| Vision, 480x480 JPEG (43859 B → 58480 B base64) | **14.4–14.8 s**, `image_tokens=225` |
+| Vision, 240x240 JPEG (8941 B → 11924 B base64) | **3.6 s**, `image_tokens=64`, answer still correct |
+| JPEG out of the preview stream | 313 ms (copy 27 ms + software encode 286 ms) |
+| Expression render + panel push | 24–26 ms |
+
+The 4x difference between 480x480 and 240x240 is the single biggest lever on
+the recognition loop, and it costs nothing in answer quality for a face that
+fills the frame.
+
 ## Upstream defects found while porting
 
 To be sent as pull requests against `open-vela/packages_ai_agent`
@@ -435,6 +492,9 @@ work tree; patches here are archived copies, not a fork.
 |---|---|---|
 | `src/tools/tool_camera.c` | Hardcoded geometry with no negotiation; 6 `%u` conversions applied to `uint32_t` (wrong on this ABI, and fatal under `-Werror=format`) | patch 0001 |
 | `src/core/agent_loop.c:665` | `-Wformat-truncation`: `%s` may write up to 511 bytes into a 473..483 byte region | not patched |
+| `src/core/agent_loop.c` (`calc_elapsed_ms`) | **The LLM watchdog times calls with `gettimeofday()`, and `vela_tls.c` sets the wall clock forward during the first handshake** (`Clock too old, forcing to 2026`). The first `ask` after boot therefore measures ~2.7e9 ms and is declared timed out even when the answer arrives. The helper already guards against the clock going *backwards*; forwards is the case that actually happens here. Should use `CLOCK_MONOTONIC` | not patched -- workaround: make one HTTPS call (`net_test`) before the first `ask` |
+| `src/llm/llm_proxy.c` (endpoint + diagnostics) | `AGENT_LLM_API_HOST` is an unconditional `#define`, so `agent_secrets.h` can supply a key and model but not a host -- a board configured entirely at build time has nowhere to send the request. Also, "Failed to parse API JSON" logged nothing about what arrived, which hid a captive-portal redirect page behind what looked like a model problem | patch 0002 |
+| agent response cache | An identical question replays the cached answer, including a cached *error* string: after a failed call, re-asking the same question prints the old failure with `Cache hit, skipping LLM call` and never retries. Cost us a wrong conclusion once | not patched -- vary the question when retesting |
 | `src/tools/skill_loader.c:448` | `%x` applied to `uint32_t` | not patched |
 
 The two unpatched ones only block `-Werror`; they are reported here so the
