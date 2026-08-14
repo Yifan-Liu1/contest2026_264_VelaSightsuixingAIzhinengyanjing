@@ -1089,8 +1089,8 @@ int bk7258_bt_transport_send(enum bt_buf_type_e type,
 
       packet_type = BK7258_BT_HCI_COMMAND_PKT;
       opcode = bt_get_le16(command);
-      printf("bt-ipc: tx-cmd opcode=%04x len=%lu\n",
-             (unsigned int)opcode, (unsigned long)length);
+      /* printf("bt-ipc: tx-cmd opcode=%04x len=%lu\n",
+             (unsigned int)opcode, (unsigned long)length); */
 
       if (opcode == BT_HCI_OP_HOST_BUFFER_SIZE)
         {

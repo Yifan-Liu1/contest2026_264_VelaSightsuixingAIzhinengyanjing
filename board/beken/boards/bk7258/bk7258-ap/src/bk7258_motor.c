@@ -51,11 +51,11 @@ static int bk7258_motor_button_worker(int argc, char **argv)
   unsigned int samples = 0;
   int ret;
   int fd = -1;
-  clock_t request_start;
+  /* clock_t request_start; */
 
   (void)argc;
   (void)argv;
-  request_start = clock_systime_ticks();
+  /* request_start = clock_systime_ticks(); */
   ret = bk7258_mailbox_send_pwc(BK7258_PM_CLK_CTRL_CMD,
                                 BK7258_PM_CLK_ID_PWM_1,
                                 BK7258_PM_CLK_POWER_UP, 0);
@@ -66,8 +66,8 @@ static int bk7258_motor_button_worker(int argc, char **argv)
     }
 
   ret = bk7258_mailbox_wait_pwc(200);
-  syslog(LOG_INFO, "power-key motor: PWM clock transport wait=%d elapsed=%lu ms\n",
-         ret, (unsigned long)TICK2MSEC(clock_systime_ticks() - request_start));
+  /* syslog(LOG_INFO, "power-key motor: PWM clock transport wait=%d elapsed=%lu ms\n",
+         ret, (unsigned long)TICK2MSEC(clock_systime_ticks() - request_start)); */
   if (ret < 0)
     {
       syslog(LOG_ERR, "power-key motor: PWM clock ACK failed: %d\n", ret);
@@ -103,7 +103,7 @@ ready:
       return ret;
     }
 
-  printf("power-key motor worker ready, PWM parameters applied\n");
+  /* printf("power-key motor worker ready, PWM parameters applied\n"); */
 
   for (;;)
     {
@@ -122,7 +122,7 @@ ready:
       if (samples == BK7258_KEY_DEBOUNCE_COUNT && pressed != candidate)
         {
           int cmd = candidate ? PWMIOC_START : PWMIOC_STOP;
-          clock_t edge_start = clock_systime_ticks();
+          /* clock_t edge_start = clock_systime_ticks(); */
 
           if (ioctl(fd, cmd, 0) < 0)
             {
@@ -133,10 +133,10 @@ ready:
             }
 
           pressed = candidate;
-          syslog(LOG_INFO,
+          /* syslog(LOG_INFO,
                  "power-key motor: button=%u, pwm cmd=%d applied elapsed=%lu ms\n",
                  candidate, cmd,
-                 (unsigned long)TICK2MSEC(clock_systime_ticks() - edge_start));
+                 (unsigned long)TICK2MSEC(clock_systime_ticks() - edge_start)); */
         }
 
       nxsig_usleep(BK7258_KEY_POLL_US);
