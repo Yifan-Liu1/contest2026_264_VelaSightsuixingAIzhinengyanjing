@@ -987,3 +987,7 @@ IPv6、DNS 和应用协议按阶段增加。具体 symbol 以当前 OpenVela Kco
 截至 2026-08-05，前述代码、配置和最终构建条件已满足；扫描、连接、DHCP、数据面、复位恢复和压力条件尚未在实板证明，因此不能将本次离线构建写成“Wi-Fi 实板移植验收完成”。
 
 CPU2 SMP、SoftAP、P2P、monitor、CSI、FTM、零拷贝和高性能 descriptor ring 是后续工作，不属于本文完成定义。
+
+SoftAP 后续实施边界、CP/NuttX IPv4 与 DHCP 所有权、STA/AP 互斥切换和双网卡
+演进条件见 `BK7258_OPENVELA_WIFI_AP_MODE_PORTING_PLAN.md`。该文档已经选定
+单 `wlan0` 互斥运行时切换为首选方案，但不代表 SoftAP 已开始移植或已经验收。

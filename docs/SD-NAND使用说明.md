@@ -21,11 +21,23 @@ ls -l /mnt/sdnand
 常用文件操作：
 
 ```sh
-printf "hello\n" > /mnt/sdnand/test.txt
+echo hello > /mnt/sdnand/test.txt
 cat /mnt/sdnand/test.txt
 mv /mnt/sdnand/test.txt /mnt/sdnand/demo.txt
 rm /mnt/sdnand/demo.txt
 ```
+
+当前精简 NSH 的 `printf` 默认不追加换行。例如
+`printf hellon > /mnt/sdnand/test.txt` 写入的是字面值 `hellon`，不是 `hello` 加
+换行。通过 `printf` 生成的无末尾换行文件使用 `cat` 时，内容可能在下一次 `nsh>`
+提示符刷新时显示为空白；这是控制台显示现象，不影响文件内容或 SD-NAND 读写。
+普通文本行建议使用 `echo` 写入；需要核对实际字节时使用：
+
+```sh
+hexdump /mnt/sdnand/test.txt
+```
+
+该 NSH 的 `hexdump` 不支持 GNU/Linux 的 `-C` 参数。
 
 手工挂载或卸载：
 
