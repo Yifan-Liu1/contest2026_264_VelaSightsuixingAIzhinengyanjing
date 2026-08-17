@@ -47,7 +47,15 @@ print("found %d fenced block(s), %d payload header(s)" % (len(blocks), len(meta)
 ok = 0
 for i, (declared, body) in enumerate(blocks):
     declared = int(declared)
-    b64 = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+    # Keep only lines that are pure base64.  The driver prints on the same
+    # console as the application ("bk7258_camera_imgdata: ...", "ap0: ..."),
+    # and anything landing inside the fence would otherwise be spliced into
+    # the payload -- observed as a frame decoding to 39743 bytes where 31991
+    # were declared.  Dropping whole non-base64 lines recovers the payload
+    # exactly; the FNV-1a check below is what proves it.
+    b64 = "".join(line.strip() for line in body.split("\n")
+                  if line.strip() and
+                  re.fullmatch(r"[A-Za-z0-9+/=]+", line.strip()))
     try:
         raw = base64.b64decode(b64)
     except Exception as exc:                       # noqa: BLE001
