@@ -64,6 +64,7 @@
 #include <jpeglib.h>
 
 #include "bk7258_jpeg_enc.h"
+#include "bk7258_camera_imgdata.h"
 #include "bk7258_psram.h"
 
 /****************************************************************************
@@ -354,7 +355,7 @@ static size_t bk7258_jpeg_raw_size(uint32_t pixelformat,
 }
 
 /****************************************************************************
- * Name: bk7258_jpeg_scratch_size
+ * Name: bk7258_jpeg_sw_scratch_size
  *
  * Description:
  *   Scratch needed to de-interleave one frame into planes.  Zero for formats
@@ -362,8 +363,8 @@ static size_t bk7258_jpeg_raw_size(uint32_t pixelformat,
  *
  ****************************************************************************/
 
-static size_t bk7258_jpeg_scratch_size(uint32_t pixelformat,
-                                       uint32_t width, uint32_t height)
+size_t bk7258_jpeg_sw_scratch_size(uint32_t pixelformat,
+                                   uint32_t width, uint32_t height)
 {
   if (pixelformat == V4L2_PIX_FMT_UYVY ||
       pixelformat == V4L2_PIX_FMT_VYUY)
@@ -459,16 +460,24 @@ static void bk7258_jpeg_deinterleave(
 }
 
 /****************************************************************************
- * Name: bk7258_jpeg_compress
+ * Name: bk7258_jpeg_sw_encode
  *
  * Description:
  *   Encode one frame.  Returns the encoded length, or a negated errno.
  *
+ *   Public, and deliberately free of this driver's device context, because
+ *   the capture path needs the same encoder: the hardware JPEG block on
+ *   /dev/video0 mis-assembles its bitstream (see the capture driver), so
+ *   camera-to-JPEG is served by capturing UYVY and encoding it here.  Both
+ *   users pass their own geometry, quality and de-interleave scratch.
+ *
+ *   Runs for a long time by driver standards -- 252 to 286ms for 640x480 at
+ *   quality 80, measured -- so callers must be in a thread, never in an
+ *   interrupt handler.
+ *
  ****************************************************************************/
 
-static int bk7258_jpeg_compress(struct bk7258_jpeg_enc_s *enc,
-                                uint8_t *src, size_t srclen,
-                                uint8_t *dst, size_t dstlen)
+int bk7258_jpeg_sw_encode(FAR const struct bk7258_jpeg_sw_req_s *req)
 {
   struct jpeg_compress_struct cinfo;
   struct jpeg_error_mgr jerr;
@@ -477,9 +486,13 @@ static int bk7258_jpeg_compress(struct bk7258_jpeg_enc_s *enc,
   JSAMPROW crows[2 * DCTSIZE];
   JSAMPROW vrows[2 * DCTSIZE];
   JSAMPARRAY data[3];
-  uint32_t width = enc->output_fmt.fmt.pix.width;
-  uint32_t height = enc->output_fmt.fmt.pix.height;
-  uint32_t format = enc->output_fmt.fmt.pix.pixelformat;
+  FAR uint8_t *src = req->src;
+  size_t srclen = req->srclen;
+  FAR uint8_t *dst = req->dst;
+  size_t dstlen = req->dstlen;
+  uint32_t width = req->width;
+  uint32_t height = req->height;
+  uint32_t format = req->pixelformat;
   unsigned long outlen;
   uint8_t *outptr = dst;
   int mcu_rows;
@@ -498,7 +511,9 @@ static int bk7258_jpeg_compress(struct bk7258_jpeg_enc_s *enc,
 
       case V4L2_PIX_FMT_UYVY:
       case V4L2_PIX_FMT_VYUY:
-        if (enc->scratch == NULL)
+        if (req->scratch == NULL ||
+            req->scratch_size < bk7258_jpeg_sw_scratch_size(format, width,
+                                                         height))
           {
             return -ENOMEM;
           }
@@ -506,7 +521,7 @@ static int bk7258_jpeg_compress(struct bk7258_jpeg_enc_s *enc,
         bk7258_jpeg_deinterleave(&planes,
                                  format == V4L2_PIX_FMT_UYVY ?
                                  &g_uyvy_order : &g_vyuy_order,
-                                 src, enc->scratch, width, height);
+                                 src, req->scratch, width, height);
         break;
 
       default:
@@ -540,7 +555,7 @@ static int bk7258_jpeg_compress(struct bk7258_jpeg_enc_s *enc,
   cinfo.comp_info[2].v_samp_factor = 1;
 
   cinfo.raw_data_in = TRUE;
-  jpeg_set_quality(&cinfo, enc->quality, TRUE);
+  jpeg_set_quality(&cinfo, req->quality, TRUE);
   jpeg_start_compress(&cinfo, TRUE);
 
   /* One pass feeds a whole MCU row: DCTSIZE scanlines per vertical sampling
@@ -704,7 +719,7 @@ static int bk7258_jpeg_output_streamon(void *priv)
   struct bk7258_jpeg_enc_s *enc = priv;
   size_t need;
 
-  need = bk7258_jpeg_scratch_size(enc->output_fmt.fmt.pix.pixelformat,
+  need = bk7258_jpeg_sw_scratch_size(enc->output_fmt.fmt.pix.pixelformat,
                                   enc->output_fmt.fmt.pix.width,
                                   enc->output_fmt.fmt.pix.height);
 
@@ -1454,10 +1469,20 @@ static void bk7258_jpeg_process(struct bk7258_jpeg_enc_s *enc)
     }
   else
     {
-      ret = bk7258_jpeg_compress(enc, (uint8_t *)src->m.vaddr,
-                                 src->bytesused,
-                                 (uint8_t *)dst->m.vaddr,
-                                 bk7258_jpeg_capture_g_bufsize(enc));
+      struct bk7258_jpeg_sw_req_s req;
+
+      req.src          = (FAR uint8_t *)src->m.vaddr;
+      req.srclen       = src->bytesused;
+      req.dst          = (FAR uint8_t *)dst->m.vaddr;
+      req.dstlen       = bk7258_jpeg_capture_g_bufsize(enc);
+      req.scratch      = enc->scratch;
+      req.scratch_size = enc->scratch_size;
+      req.width        = enc->output_fmt.fmt.pix.width;
+      req.height       = enc->output_fmt.fmt.pix.height;
+      req.pixelformat  = enc->output_fmt.fmt.pix.pixelformat;
+      req.quality      = enc->quality;
+
+      ret = bk7258_jpeg_sw_encode(&req);
     }
 
   if (ret < 0)
@@ -1491,6 +1516,72 @@ static void bk7258_jpeg_process(struct bk7258_jpeg_enc_s *enc)
  * Public Functions
  ****************************************************************************/
 
+#ifdef CONFIG_BK7258_CAMERA_JPEG_SW
+/****************************************************************************
+ * Name: bk7258_camera_sw_jpeg_encode
+ *
+ * Description:
+ *   The capture driver's software JPEG hook.  Encodes one raw camera frame
+ *   (V Y1 U Y0, the sensor's own order) into the application's V4L2 buffer.
+ *
+ *   The de-interleave scratch is allocated once, on first use, and kept: it
+ *   is 614400 bytes for 640x480, which the AP's malloc heap cannot hold.
+ *
+ *   It comes from the *display* pool, not the encode pool this M2M driver
+ *   uses.  The encode pool is 1433600 bytes and the M2M device needs
+ *   614400 + 311296 of it for one session; adding a persistent 614400 here
+ *   pushed the total over and /dev/video1 started failing REQBUFS with
+ *   ENOMEM -- measured as "preview_jpeg: REQBUFS(capture) failed, errno=12"
+ *   the first time /dev/video0 had encoded anything.  The display pool is
+ *   5.7MB and already holds this pipeline's capture buffers.
+ *
+ ****************************************************************************/
+
+static FAR uint8_t *g_sw_scratch;
+static size_t g_sw_scratch_size;
+
+static int bk7258_camera_sw_jpeg_encode(FAR uint8_t *src, size_t srclen,
+                                        FAR uint8_t *dst, size_t dstlen,
+                                        uint32_t width, uint32_t height)
+{
+  struct bk7258_jpeg_sw_req_s req;
+  size_t need = bk7258_jpeg_sw_scratch_size(V4L2_PIX_FMT_VYUY,
+                                            width, height);
+
+  if (need > g_sw_scratch_size)
+    {
+      if (g_sw_scratch != NULL)
+        {
+          bk7258_media_pool_free(BK7258_PSRAM_POOL_DISPLAY, g_sw_scratch);
+          g_sw_scratch = NULL;
+          g_sw_scratch_size = 0;
+        }
+
+      g_sw_scratch = bk7258_media_pool_alloc(BK7258_PSRAM_POOL_DISPLAY,
+                                             32, need);
+      if (g_sw_scratch == NULL)
+        {
+          return -ENOMEM;
+        }
+
+      g_sw_scratch_size = need;
+    }
+
+  req.src          = src;
+  req.srclen       = srclen;
+  req.dst          = dst;
+  req.dstlen       = dstlen;
+  req.scratch      = g_sw_scratch;
+  req.scratch_size = g_sw_scratch_size;
+  req.width        = width;
+  req.height       = height;
+  req.pixelformat  = V4L2_PIX_FMT_VYUY;
+  req.quality      = CONFIG_BK7258_JPEG_ENC_QUALITY;
+
+  return bk7258_jpeg_sw_encode(&req);
+}
+#endif
+
 /****************************************************************************
  * Name: bk7258_jpeg_enc_initialize
  ****************************************************************************/
@@ -1511,5 +1602,22 @@ int bk7258_jpeg_enc_initialize(void)
   printf("bk7258_jpeg: %s registered (YUV420/UYVY -> JPEG, q=%d, "
          "buffers from PSRAM)\n",
          CONFIG_BK7258_JPEG_ENC_DEV_PATH, CONFIG_BK7258_JPEG_ENC_QUALITY);
+
+  /* Serve /dev/video0's JPEG format from here too.  The hardware JPEG block
+   * delivers at 30fps but mis-assembles its bitstream, so a camera-to-JPEG
+   * capture comes back as parts of two frames; encoding a UYVY capture is
+   * slower and correct.  See bk7258_camera_set_sw_jpeg().
+   */
+
+#ifdef CONFIG_BK7258_CAMERA_JPEG_SW
+  bk7258_camera_set_sw_jpeg(bk7258_camera_sw_jpeg_encode);
+#endif
+
+#ifdef CONFIG_BK7258_CAMERA_JPEG_SW
+  printf("bk7258_jpeg: /dev/video0 JPEG served by the software encoder\n");
+#else
+  printf("bk7258_jpeg: /dev/video0 JPEG served by the hardware encoder\n");
+#endif
+
   return 0;
 }

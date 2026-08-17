@@ -205,6 +205,8 @@ static void agent_camera_usage(void)
          "  b64      print the last frame as base64 (retrieve without a\n"
          "           filesystem; see the file header)\n"
          "  b64all   print every frame as base64, one fenced block each\n"
+         "  session=<id>  tag frames with a session id, sequence and\n"
+         "           monotonic timestamp (the metadata an upload needs)\n"
          "  rec=<n>  record n frames at the sensor rate into memory, then\n"
          "           dump them all as base64 -- use this for a clip\n"
          "  caps     enumerate formats and sizes only\n");
@@ -821,13 +823,15 @@ static int agent_camera_capture(struct agent_camera_s *cam,
                                 int width, int height,
                                 unsigned int count, bool negotiate,
                                 const char *out_path, bool b64,
-                                bool b64_all, unsigned int rec)
+                                bool b64_all, unsigned int rec,
+                                FAR const char *session)
 {
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   struct v4l2_requestbuffers req;
   struct v4l2_capability cap;
   struct timeval t_start;
   struct timeval t_end;
+  struct timespec t_session = { 0, 0 };
   unsigned long elapsed_ms;
   FAR uint8_t **rec_frames = NULL;
   FAR size_t *rec_lens = NULL;
@@ -1015,6 +1019,38 @@ static int agent_camera_capture(struct agent_camera_s *cam,
              frame, (uint32_t)dqbuf.index, (uint32_t)dqbuf.bytesused,
              (uint32_t)dqbuf.flags);
 
+      /* The metadata the upload path has to put on every frame: which
+       * session it belongs to, a monotonically increasing sequence, and a
+       * monotonic clock offset from the start of the session (spec 8.3's
+       * X-Sequence / X-Timestamp-Ms).  Printed here rather than invented at
+       * upload time so the numbers come from the same place the frame does.
+       *
+       * gettimeofday() is deliberately not used for the offset: the first TLS
+       * handshake shoves the realtime clock from 1970 to 2026, which would
+       * make every earlier timestamp nonsense.  clock_gettime(MONOTONIC) is
+       * unaffected.
+       */
+
+      if (session != NULL)
+        {
+          struct timespec mono;
+
+          clock_gettime(CLOCK_MONOTONIC, &mono);
+
+          if (t_session.tv_sec == 0 && t_session.tv_nsec == 0)
+            {
+              t_session = mono;
+            }
+
+          printf("agent_camera: meta session=%s sequence=%u "
+                 "timestamp_ms=%lu width=%d height=%d bytes=%" PRIu32 "\n",
+                 session, frame + 1,
+                 (unsigned long)((mono.tv_sec - t_session.tv_sec) * 1000ul +
+                                 (mono.tv_nsec - t_session.tv_nsec) /
+                                 1000000l),
+                 width, height, (uint32_t)dqbuf.bytesused);
+        }
+
       /* The driver completes a buffer with V4L2_BUF_FLAG_ERROR when its
        * watchdog fires rather than leaving DQBUF blocked forever (see
        * invariant 8 in docs/reference/camera.md).  Such a buffer carries no
@@ -1175,6 +1211,7 @@ int main(int argc, FAR char *argv[])
   bool b64 = false;
   bool b64_all = false;
   unsigned int rec = 0;
+  FAR const char *session = NULL;
   int width = 0;
   int height = 0;
   int nsizes;
@@ -1224,6 +1261,10 @@ int main(int argc, FAR char *argv[])
       else if (strcmp(arg, "b64") == 0)
         {
           b64 = true;
+        }
+      else if (strncmp(arg, "session=", 8) == 0)
+        {
+          session = arg + 8;
         }
       else if (strncmp(arg, "rec=", 4) == 0)
         {
@@ -1339,7 +1380,7 @@ int main(int argc, FAR char *argv[])
     }
 
   ret = agent_camera_capture(&cam, width, height, count, negotiate,
-                             out_path, b64, b64_all, rec);
+                             out_path, b64, b64_all, rec, session);
   agent_camera_teardown(&cam);
 
   if (ret < 0)
