@@ -1,243 +1,141 @@
-# BK7258 OpenVela AP移植
+# VelaSight 随行 AI 智能眼镜：BK7258 OpenVela 适配
 
-本项目将OpenVela/NuttX移植到BK7258 AP核，并保留博通原厂CP固件、Bootloader、分区和最终打包流程。当前已实现AP核启动，以及AP日志通过Mailbox转发到CP UART0输出。
+## 一、作品简介
 
-## 简单使用说明
+本项目将 OpenVela/NuttX 移植到 BK7258 三核平台，以物理 CPU1/CPU2 运行
+OpenVela AP，保留物理 CPU0 上的 Armino CP、Bootloader、无线控制器和标准打包
+流程。在此基础上接入 Mailbox 控制台、Wi-Fi、相机、音频、显示、振动反馈和板载
+SD-NAND，为随行 AI 智能眼镜提供可复现的系统底座。
 
-本项目需要配合博通`bk_avdk_smp` SMP工程使用：
+项目当前已完成 AP 双核启动、单 UART0 双向控制台、NuttX `wlan0` 网络链路、
+Camera/Audio 基础门禁，以及板载 SD-NAND 的只读 MMCSD/VFAT 链路。SD-NAND
+保持 1-bit、PIO、只读模式，不启用 DMA、4-bit、格式化或写操作。
+
+## 二、选题方向
+
+本作品属于 **新硬件适配** 方向，同时承载 AI 硬件产品验证。主要工作不是将应用
+简单部署到现成开发板，而是完成 BK7258 Cortex-M33 AP 的启动、中断、内存、SMP、
+跨核 Mailbox、板级外设和 OpenVela 子系统接入，并保留可重复构建和烧录的 CP/AP
+组合固件流程。
+
+主要技术特点：
+
+- 物理 CPU0 运行 Armino CP，物理 CPU1/CPU2 运行 OpenVela/NuttX SMP。
+- AP 日志和 NSH 输入输出通过 Mailbox V2 转发到 CP UART0，无需额外 USB-TTL。
+- Wi-Fi controller 保留在 CP，OpenVela AP 提供 NuttX `wlan0` 和网络协议栈。
+- SD-NAND 通过 BK7258 SDIO Host 接入 NuttX MMCSD，提供只读 VFAT 访问。
+- 最终固件通过 Beken 标准分区和 packager 生成 `all-app.bin`。
+
+## 三、目录结构
 
 ```text
-工作区/
-├── contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/
+app/                         比赛应用与板级验证命令
+board/beken/                 BK7258 OpenVela 芯片层和板级适配
+external/bk_avdk_smp/        可复现的 Armino CP 覆盖文件
+docs/                        构建说明、移植方案、验收记录和参考资料
+docs/plans/                  7 份活跃实施方案
+docs/archive/                未启动或已归档的历史方案与工具说明
+docs/reference/              OpenVela 官方移植文档的本地参考副本
+logs/                        按大赛格式导出的 AI Coding 日志
+.claude/skills/autoflash/    自动烧录操作技能
+autoflash.sh                 BK7258 固件自动烧录脚本
+```
+
+文档入口：
+
+- [固件构建步骤](docs/固件构建步骤.md)
+- [项目技能规范](docs/SKILLS.md)
+- [GitHub 开发指南](docs/github开发指南.md)
+- [基础适配门禁验收记录](docs/8.16基础适配门禁验收记录.md)
+- [Wi-Fi 使用说明](docs/WiFi使用说明.md)
+- [移植方案索引](docs/plans/README.md)
+
+## 四、构建、烧录与运行
+
+### 4.1 工作区布局
+
+本项目需要比赛仓、OpenVela 工作树和 Beken AVDK SMP 工程：
+
+```text
+/home/mi/vela_competition/
+├── contest/
+│   └── contest2026_264_VelaSightsuixingAIzhinengyanjing/
 └── bk_avdk_smp/
 ```
 
-构建前，需要将比赛仓`external/bk_avdk_smp/`中的权威覆盖文件同步到
-`bk_avdk_smp`。完整文件清单、可直接执行的同步脚本、逐字节校验、OpenVela AP
-构建、CP构建和最终固件打包步骤见`external/bk_avdk_smp/README.md`。Git协作和
-提交规则见`github开发指南.md`。
+先按 [external/bk_avdk_smp/README.md](external/bk_avdk_smp/README.md) 将比赛仓中的
+CP 权威覆盖文件同步到 `bk_avdk_smp`，并执行逐字节校验。
 
-## UART0控制台使用
-
-连接开发板UART0：
+### 4.2 构建 OpenVela AP
 
 ```bash
-picocom --no-escape -b 115200 --flow n --parity n --databits 8 /dev/ttyUSB0
+cd /home/mi/vela_competition/contest
+
+./build.sh \
+  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
+  --cmake distclean
+
+./build.sh \
+  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
+  -e -Werror \
+  --cmake \
+  -j8
 ```
 
-CP启动后可先查看AP链路状态，再进入AP的OpenVela NSH控制台：
+### 4.3 打包最终固件
+
+```bash
+cp /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+
+cd /home/mi/vela_competition/bk_avdk_smp
+podman run --rm \
+  --userns=keep-id \
+  -v "$PWD:/armino" \
+  -w /armino \
+  localhost/bekencorp/armino-idk:1.5 \
+  make -C projects/app_ab bk7258 \
+  SDK_DIR=/armino \
+  EXTERNAL_AP_BIN=/armino/build/openvela-ap.bin
+```
+
+完整步骤、产物路径和哈希校验见 [docs/固件构建步骤.md](docs/固件构建步骤.md)。
+
+### 4.4 烧录和控制台
+
+```bash
+cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+./autoflash.sh -p /dev/ttyUSB1 -n 1
+```
+
+连接开发板 UART0 后，在 CP 命令行进入 AP NSH：
 
 ```text
 ap_console status
 ap_console open
 ```
 
-进入AP控制台后可以直接执行NSH命令，例如：
-
-```text
-help
-uname -a
-ps
-free
-ctrlc_test
-```
-
-`ctrlc_test`会持续等待TTY `SIGINT`。按`Ctrl-C`后应打印
-`ctrlc_test received SIGINT`并返回NSH提示符。
-
-AP控制台支持方向键、Home、End、Delete、Backspace、命令历史，以及
-`Ctrl-A`、`Ctrl-B`、`Ctrl-D`、`Ctrl-E`、`Ctrl-F`、`Ctrl-H`、`Ctrl-K`、
-`Ctrl-L`、`Ctrl-N`、`Ctrl-P`和`Ctrl-U`等CLE快捷键。
-
-退出AP控制台并返回CP命令行时，严格按以下顺序操作：
-
-1. 按下`Ctrl-]`。
-2. 松开按键。
-3. 再按`.`。
-
-返回CP命令行后可再次检查状态：
-
-```text
-ap_console status
-```
-
-## 主要目录
-
-```text
-board/beken/chips/bk7258/                  BK7258 AP启动、中断、定时器和Mailbox驱动
-board/beken/boards/bk7258/bk7258-ap/       BK7258 AP板级配置、链接脚本和bring-up
-external/bk_avdk_smp/                      已验证的博通CP覆盖文件
-logs/                                      AI Coding日志
-```
-
-## 已实现功能
-
-- BK7258物理CPU1/AP启动OpenVela/NuttX。
-- Cortex-M33启动向量、C运行时、MPU、FPU、IRQ和SysTick基础适配。
-- Mailbox v2基础传输、logical channel、sequence、ACK、超时和FIFO full恢复。
-- 原厂兼容HW_CTRL command 1 power-up、command 2两秒heartbeat，以及独立的PWC `0x5/0x11`生命周期握手。
-- AP日志通过Mailbox UART0转发到CP物理UART0。
-- GPIO40红灯和GPIO41绿灯由NuttX内核自动LED状态接口接管，用于显示
-  中断、信号、断言、Panic、空闲和启动状态。
-- AP、CP和Bootloader通过`bk_avdk_smp`标准打包流程生成`all-app.bin`。
-- 当前为物理CPU1+CPU2的OpenVela/NuttX SMP，CP保持物理CPU0。
-
----
-
-# contest2026_264_VelaSightsuixingAIzhinengyanjing
-
-👋 欢迎参加 **2026 首届 openvela AI 硬件开发者大赛**！
-
-这是组委会为你的队伍创建的**专属参赛仓库**（本仓为样例/模板，队伍编号 `264`；你看到的将是你自己的 `contest2026_<编号>_<队伍名>`）。比赛期间，你的全部参赛代码、打包产物与 AI Coding 日志都提交到这里。
-
-> 本仓既是「代码仓」，又内置了一键拉取整套 openvela 工程的 `repo` 清单（manifest）。你只需跟它打交道，**自始至终只动一个文件夹**。
-
----
-
-## 一、先读这些官方文档
-
-**通用（所有赛道必读）：**
-
-| 文档                                                                                                                                     | 用途                                           |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| [《大赛总览》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/contest_overview.md)                        | 赛道、流程、评分、资源，建议先通读             |
-| [《参赛代码提交指南》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/code_submission_guide.md)           | 仓库获取、提交流程、时间与权限（**以此为准**） |
-| [《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md) | 如何导出 AI 对话日志并提交到 `logs/`           |
-
-**按你的赛道选读（三选一）：**
-
-| 赛道                  | 教程导航                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快应用 / 手表应用创新 | [快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)                         |
-| AI 硬件产品创新       | [AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)              |
-| 新硬件适配            | [新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md) |
-
----
-
-## 二、第一步：拉取完整工程
-
-用组委会提供的命令一键拉取「openvela 全量源码 + 你的专属仓」：
-
-```bash
-repo init -u https://github.com/open-vela/contest2026_264_VelaSightsuixingAIzhinengyanjing \
-  -b dev-ai-contest-2026 -m contest2026_264_VelaSightsuixingAIzhinengyanjing.xml
-repo sync -c -j8
-```
-
-同步后，你的整个仓库位于工作区的 `contest2026_264_VelaSightsuixingAIzhinengyanjing/`，openvela 全量源码在外层（`nuttx/`、`apps/`、`packages/`、`vendor/` 等）。
-
----
-
-## 三、第二步：在哪里写代码
-
-**只在自己的仓目录 `contest2026_264_VelaSightsuixingAIzhinengyanjing/` 里开发。** 不同作品形态放在对应子目录，manifest 会通过 `<linkfile>` 把它们**软链**到 openvela 编译树该在的位置——你不用手动 copy：
-
-| 作品形态 | 你的代码放这里             | 系统自动映射到                                 |
-| -------- | -------------------------- | ---------------------------------------------- |
-| 应用     | `app/<name>/`              | `packages/demos/contest2026_264_<name>`        |
-| 板级适配 | `board/beken/boards/bk7258/`、`board/beken/chips/bk7258/` | `vendor/beken/boards/bk7258/`、`vendor/beken/chips/bk7258/` |
-
-本仓实际映射的七个应用：`ctrlc_test`、`periph_selftest`、`audio_test`、
-`camera_preview`、`jpeg_test`、`agent_camera`、`hello_screen`。组委会模板里的
-`quickapp/hello_quickapp/` 与 `board/contest_board/` 两个样例骨架用不到，已删除，
-对应的 `<linkfile>` 也一并从 manifest 移除。
-
-> 新增作品时按同样规则加子目录，并在 `contest2026_264_VelaSightsuixingAIzhinengyanjing.xml` 里补一条 `<linkfile>` 映射即可。**生产仓库（packages/nuttx/vendor 等）零改动。**
->
-> ⚠️ **软链和 defconfig 必须成对存在**：`app/<name>/` 只有经 `<linkfile>` 软链进
-> `packages/demos/` 才会被 Kconfig 扫到。软链缺失时，defconfig 里的
-> `CONFIG_LVX_USE_DEMO_CONTEST2026_264_<NAME>=y` 会被**静默丢弃**，app 不进固件而构建
-> 照样"成功"。加完 linkfile 记得 `repo sync`（或本地 `ln -s`）并核对：
-> `grep LVX_USE_DEMO_CONTEST2026 cmake_out/<cfg>/.config`。
-
-建议仓库目录约定（便于评委定位）：
-
-```text
-app/ | board/               # 你的作品代码
-logs/                       # AI Coding 日志（主动导出后提交，格式见 logs/README.md）
-README.md                   # 作品说明（提交前请改成你自己的，见第六节）
-```
-
-> 仓内附带了一个 `.gitignore.example`，给出了**编译产物**等不需要进仓的文件示例。如需启用，`cp .gitignore.example .gitignore` 后按需增删即可。**注意 `logs/` 下最终导出的 AI Coding 日志必须提交，不要忽略。**
->
-> `logs/` 的目录结构与提交格式见 [logs/README.md](logs/README.md)。
-
----
-
-## 四、第三步：编译与运行
-
-编译/运行步骤随作品形态不同而不同，请参考你所在赛道的教程导航：
-
-- 快应用 / 手表应用：[快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)（含模拟器与开发板部署）。
-- AI 硬件产品创新：[AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)（环境搭建、编译烧录、Skill 开发）。
-- 新硬件适配：[新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md)（BSP 移植、最小 NSH 基线）。
-
-子目录已通过 manifest 中的 `<linkfile>` 软链进 openvela 编译树，因此构建在 openvela 工作区**根目录**（即你这个仓的上一级）进行。openvela 使用 `build.sh` 作为统一入口，接收一个 **board config 路径**作为参数：
-
-```bash
-# 进入 openvela 工作区根目录（你的仓的上一级）
-cd ..
-
-# 通用语法：第一个参数是 board config 路径，第二个参数可以是 menuconfig / distclean 等
-./build.sh <board-config-path> [menuconfig|distclean] [-j8]
-```
-
-> 具体的 board config 路径、目标产物、模拟器/真机部署方式请以你所在赛道的教程导航为准。本仓 `app/` 下各应用对应的 Kconfig 选项（`LVX_USE_DEMO_CONTEST2026_264_*`）可通过 `menuconfig` 启用，也已按需写进 `board/beken/boards/bk7258/bk7258-ap/configs/*/defconfig`。
-
----
-
-## 五、第四步：提交作品
-
-1. **fork** 你的专属仓 → 开发 → `git commit` 并推送 → 向专属仓发起 **Pull Request**，可**自行 review 并合入**（无需等组委会）。
-2. **AI Coding 日志**：与 AI 工具的对话会自动记录到本机 staging（不会自动上传），需你**主动导出/打包**选定会话到仓内 `logs/` 目录后一并提交。详见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
-3. 若需改动 **nuttx 等公共仓库**，不在本仓改，而是 fork 对应公共仓、以 PR 提交到 `dev-ai-contest-2026` 分支，由组委会 review 后合入。
-
-> ⏰ **提交作品截止：9 月 20 日**。截止后统一收回 push 权限，仍可查看 / clone。
->
-> 获奖后再按要求将作品 PR 至 openvela 上游对应仓库（走标准 PR + CI 流程）。
-
-### 关于 PR 与 CLA
-
-- 本仓所有改动通过 **Pull Request** 合入（分支保护强制，可自行合入自己的 PR）。
-- 首次贡献需在[**官网签署 CLA**](https://openvela.com/#/community/cla)；PR 上会自动跑 `cla/signature` 检查，在官网签署成功后，在 PR 评论 `/check-cla` 复检即可通过。
-
----
-
-## 六、提交前：把本 README 改成你的作品说明
-
-本文件目前是组委会给的**使用说明书**。**作品提交前，请把它替换成你自己作品的说明**，方便评委快速了解你做了什么、怎么跑起来。建议至少包含以下内容：
-
-```markdown
-# <你的作品名>
-
-## 一、作品简介
-<一句话/一段话说明这个作品是什么、解决什么问题、亮点在哪>
-
-## 二、选题方向
-<快应用 / 手表应用创新 ｜ AI 硬件产品创新 ｜ 新硬件适配 ｜ 自定方向，并简述理由>
-
-## 三、目录结构
-<列出你这个仓里各目录/文件的作用，例如：>
-- `app/xxx/`        — <说明>
-- `board/xxx/`      — <说明>
-- `logs/`           — AI Coding 日志
-- `docs/` 或其他    — <说明>
-
-## 四、运行方式
-<拉取工程后，如何编译、烧录/部署、运行的完整步骤；最好能让评委照着一步步复现>
+退出 AP 控制台时先按 `Ctrl-]`，松开后再按 `.`。SD-NAND 会在系统启动后延迟
+5 秒初始化，也可在 NSH 中执行 `sdnand_init` 手动触发。成功后设备节点为
+`/dev/mmcsd0`，MBR 分区为 `/dev/mmcsd0p0`。
 
 ## 五、AI Coding 使用说明
-<说明本作品如何借助 AI 辅助开发：
-- 在需求拆解 / 方案设计 / 编码 / 调试 / 文档等环节如何与 AI 协作；
-- AI 对开发效率或质量带来的实际帮助。
-完整对话日志见 logs/ 目录>
-```
 
-> 提示：将会根据「作品本身 + 你的 README 说明 + `logs/` 里的 AI Coding 日志」来理解和评估你的作品，README 写清楚很重要。
+AI 参与了需求拆解、源码取证、移植方案设计、驱动实现、构建错误定位、串口日志
+分析、实板验证和文档维护。项目使用 [docs/SKILLS.md](docs/SKILLS.md) 固定架构约束、
+仓库职责、任务路由和验证门禁，再由 `docs/plans/` 中的子系统方案维护协议细节和
+测试矩阵，避免让历史结论覆盖当前源码、最终配置和实板证据。
 
----
+AI 生成或建议的改动均需经过源码比对、`-Werror` 构建、最终镜像哈希校验和对应
+实板门禁。按大赛格式导出的完整对话记录放在 `logs/`；运行期串口日志不冒充
+AI Coding 日志。
 
-## 附：仓库命名规范
+## 六、当前边界
 
-`contest2026_<编号>_<队伍名>` — 编号三位零填充；队名 slug（全小写、英文/拼音、连字符）。例：`contest2026_264_VelaSightsuixingAIzhinengyanjing`。
-（仓库由组委会统一创建，**每队仅一个仓**，无需自行命名。）
+- Bluetooth Host 仍处于方案阶段，未作为已完成功能声明。
+- SD-NAND 当前只读，未启用写入、格式化、DMA、4-bit 或 multiblock。
+- Secure alias 和 CMSE 是当前功能基线，不等于量产 secure boot 已闭环。
+- 构建成功、打包成功、实板启动和功能验收分别记录，不互相替代。
+
+提交、rebase、PR、CLA 和 Rebase and merge 要求见
+[docs/github开发指南.md](docs/github开发指南.md)。

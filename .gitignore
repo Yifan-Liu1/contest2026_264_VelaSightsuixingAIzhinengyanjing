@@ -28,7 +28,7 @@ music.flac
 board/beken/chips/bk7258/sim_tests
 
 # Local scratch notes, not for submission
-docs/
+docs/local/
 
 # ============================================================
 # Code map (codemap/ is an Obsidian vault)

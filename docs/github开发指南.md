@@ -271,7 +271,7 @@ git diff --check
 
 git add board/beken
 git add contest2026_264_VelaSightsuixingAIzhinengyanjing.xml
-git add github开发指南.md
+git add docs/github开发指南.md
 
 git diff --cached --name-only
 git commit -m "feat: complete BK7258 porting milestone"

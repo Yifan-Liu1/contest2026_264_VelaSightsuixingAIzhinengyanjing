@@ -54,4 +54,4 @@ SUCCESS! HTTP Status: 200
 
 - 不要把真实 Wi-Fi 密码提交到仓库或测试日志中。开放热点不涉及这个问题。
 - 当前的 HTTPS 是加密但未验证证书的（无 RTC/SNTP，且 `VERIFY_OPTIONAL`），详见
-  `8.16基础适配门禁验收记录.md` 第 7 节。
+  `docs/8.16基础适配门禁验收记录.md` 第 7 节。

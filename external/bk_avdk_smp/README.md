@@ -359,7 +359,7 @@ V1 version并检查真实ret/version后才能联调；本CP侧任务未修改AP 
 `PM_CPU1_BOOT_READY_CMD=0x5`；`0x5` 只解除 CP boot worker 等待，不应解释为 SMP
 commit。`PM_OPENVELA_READY_CMD=0x11` 及其 PSRAM/clock/SMP commit 契约已废弃，不再是
 现行必需协议；相关设计、联调结论和当时产物 hash 仅见
-`BK7258_OPENVELA_SMP_PORTING_PLAN.md` 第 15 节历史记录。正常 recovery 的 INIT/拒绝会
+`docs/archive/BK7258_OPENVELA_SMP_PORTING_PLAN.md` 第 15 节历史记录。正常 recovery 的 INIT/拒绝会
 取消 shutdown 并恢复 boot vote；只有 FINISH 才进入 shutdown。runtime DVFS 不由 AP 发起；
 CP 保留单核 CPU1 的固定 480 MHz vote，以及 DVFS 错误传播、readback 和 rollback 修复。
 
@@ -414,5 +414,5 @@ OpenVela AP SHA256 abd642f2a82842abb08c61a82c205afe5627b809fc47d328458d27bda4489
 
 该记录只证明当时版本的`nuttx.bin`、`build/openvela-ap.bin`和
 `package/tmp/app1.bin`一致。当前OpenVela AP已更新；SMP联调期间的后续hash已移至
-`BK7258_OPENVELA_SMP_PORTING_PLAN.md`第15节且同样只作历史对照。当前hash及最终包状态
+`docs/archive/BK7258_OPENVELA_SMP_PORTING_PLAN.md`第15节且同样只作历史对照。当前hash及最终包状态
 必须按第4节重新验证，不得引用历史hash作为当前修改已进入最终包的证据。
