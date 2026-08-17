@@ -142,11 +142,22 @@ void bk7258_ipc_heartbeat_poll(void)
   if (g_heartbeat_completions != g_heartbeat_reported)
     {
       g_heartbeat_reported = g_heartbeat_completions;
-      if (g_heartbeat_reported <= 3u)
+
+      /* Only the first ACK is worth a line: it is the evidence that the
+       * HW_CTRL round trip works at all.  The next ones say nothing new and
+       * they used to print straight into the freshly-drawn NSH prompt
+       * ("nsh> IPC: heartbeat queued count=1 ...") for the first six seconds
+       * of every boot, which reads like a broken console.  A heartbeat that
+       * stops being ACKed is not silent: the failure path below reports it
+       * through syslog(LOG_ERR), and the consequence is loud anyway -- the
+       * CP resets the part after CONFIG_INT_WDT_PERIOD_MS.
+       */
+
+      if (g_heartbeat_reported == 1u)
         {
-          printf("IPC: heartbeat ACK result=%d count=%lu\n",
+          printf("IPC: heartbeat ACK result=%d, interval=%u ms\n",
                  g_heartbeat_result,
-                 (unsigned long)g_heartbeat_reported);
+                 (unsigned int)TICK2MSEC(IPC_HEARTBEAT_INTERVAL));
         }
     }
 
@@ -183,12 +194,6 @@ void bk7258_ipc_heartbeat_poll(void)
     {
       g_heartbeat_submissions++;
       g_next_heartbeat = now + IPC_HEARTBEAT_INTERVAL;
-      if (g_heartbeat_submissions <= 3u)
-        {
-          printf("IPC: heartbeat queued count=%lu tick=%llu\n",
-                 (unsigned long)g_heartbeat_submissions,
-                 (unsigned long long)now);
-        }
     }
   else
     {
