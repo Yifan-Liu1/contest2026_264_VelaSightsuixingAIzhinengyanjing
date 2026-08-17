@@ -343,3 +343,32 @@ sha256sum cmake_out/bk7258-ap_ai_agent/nuttx.bin \
 
 `apply.sh` 实测幂等：重复执行报 `already applied`，`--revert` 报 `reverted`，再执行报
 `applied`。
+
+## 配置持久化：`kvdb`（2026-08-17）
+
+密钥和 Wi-Fi 口令不再写进代码或编译期头文件，改由 `kvdb` 保管，并自动写成 ai_agent 启动时
+读的配置文件（`/mnt/ai_agent/config/config.json` 的 `llm_backend_0` 槽），所以密钥不进镜像、
+也不进公共仓 `packages/ai_agent`。
+
+```bash
+kvdb                                  # 列出，.key/.psk 自动打码
+kvdb set llm.host token-plan-cn.xiaomimimo.com
+kvdb set llm.key  tp-xxxxxxxx
+kvdb set llm.model mimo-v2.5
+kvdb set wifi.ssid <2.4G SSID>
+kvdb set wifi.psk  <密码>
+kvdb get llm.key --raw                # 明文要显式要求
+kvdb del llm.key
+```
+
+**当前状态：配置只在本次启动内有效。** flash 后端（`easyflash_ap` 分区，8KB @ 0x007FC000）
+由 `CONFIG_BK7258_KVDB_FLASH` 控制，**默认关闭且不要打开**：跨核连接已通
+（`flash: connected to the CP flash server (cpu0 port1)`），但读请求发出后约 190ms 会把
+mailbox 链路打下来，心跳随之丢失、CP 复位。定位过程见
+`docs/superpowers/plans/2026-08-14-vela-kvdb-persistent-config.md` 第 5 节。
+
+`kvdb set` 会明确告知，开机日志也会说明当前模式：
+
+```
+kvdb: in-memory only (flash backend disabled)
+```

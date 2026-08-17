@@ -8,7 +8,8 @@ set(SRCS
     bk7258_gc9d01.c
     bk7258_ramdisk.c
     bk7258_camera_imgsensor.c
-    bk7258_camera_bringup.c)
+    bk7258_camera_bringup.c
+    bk7258_agent_config.c)
 
 if(CONFIG_BK7258_SDIO)
   list(APPEND SRCS bk7258_mmcsd.c)

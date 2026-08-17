@@ -70,12 +70,29 @@ _Static_assert((BK7258_MB_HEADER_STATE_MASK &
 #define BK7258_MB_CTRL_RESET        0x04u
 #define BK7258_MB_STATE_COM_FAIL    0x01u
 
+/* Armino's ACK_STATE_COMPLETE.  The mb_ipc socket layer only treats a command
+ * as delivered when the acknowledgement says this; a state of zero leaves its
+ * socket in "receive in process" and it then rejects everything else with
+ * RX_BUSY.  Notification-only channels (BT, Wi-Fi, SARADC) do not look at it,
+ * which is why they worked with zero.
+ */
+
+#define BK7258_MB_STATE_ACK_COMPLETE 0x02u
+
 #define BK7258_MB_CHAN_HW_CTRL_TX   0x10u
+
+/* mb_ipc's socket router.  Index 1 in the vendor's channel enum
+ * (include/driver/mailbox_channel.h: MB_CHNL_HW_CTRL, CP0_MB_CHNL_IPC,
+ * MB_CHNL_PWC, ...), which is what the CP's flash server listens on.
+ */
+
+#define BK7258_MB_CHAN_IPC_TX       0x11u
 #define BK7258_MB_CHAN_PWC_TX       0x12u
 #define BK7258_MB_CHAN_BT_TX        0x13u
 #define BK7258_MB_CHAN_WIFI_CMD_TX  0x14u
 #define BK7258_MB_CHAN_WIFI_DATA_TX 0x15u
 #define BK7258_MB_CHAN_UART0_TX     0x19u
+#define BK7258_MB_CHAN_IPC_RX       0x41u
 #define BK7258_MB_CHAN_PWC_RX       0x42u
 #define BK7258_MB_CHAN_BT_RX        0x43u
 #define BK7258_MB_CHAN_WIFI_CMD_RX  0x44u
@@ -97,6 +114,16 @@ _Static_assert((BK7258_MB_HEADER_STATE_MASK &
 #define BK7258_SWAP_SIZE            0x00000800u
 #define BK7258_IPC_TX_ADDRESS       0x2809f900u
 #define BK7258_IPC_TX_SIZE          0x00000080u
+/* The flash service's 16-byte descriptor.  It has to live in SWAP, not in the
+ * AP's own RAM: the frame only carries a pointer, and the CP has to be able to
+ * read what it points at.  A descriptor in AP RAM produced no answer at all
+ * from the server -- the request was accepted by the router and then silently
+ * dropped.
+ */
+
+#define BK7258_FLASH_IPC_ADDRESS    0x2809f980u
+#define BK7258_FLASH_IPC_SIZE       0x00000020u
+
 #define BK7258_MB_UART_RX_ADDRESS   0x2809fc00u
 #define BK7258_MB_UART_TX_ADDRESS   0x2809fd00u
 #define BK7258_MB_SHARED_TX_START   BK7258_IPC_TX_ADDRESS

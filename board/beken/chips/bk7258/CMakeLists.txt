@@ -29,7 +29,9 @@ set(SRCS
     bk7258_aud.c
     bk7258_cpuindex.c
     bk7258_idle.c
-    bk7258_reset.c)
+    bk7258_reset.c
+    bk7258_flash_client.c
+    bk7258_kvdb.c)
 
 if(CONFIG_BK7258_SDIO)
   list(APPEND SRCS bk7258_sdio.c)

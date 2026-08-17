@@ -10,6 +10,7 @@
 
   <project path="contest2026_264_VelaSightsuixingAIzhinengyanjing" name="contest2026_264_VelaSightsuixingAIzhinengyanjing">
     <linkfile src="app/ctrlc_test" dest="packages/demos/contest2026_264_ctrlc_test"/>
+    <linkfile src="app/kvdb_tool" dest="packages/demos/contest2026_264_kvdb_tool"/>
     <linkfile src="app/periph_selftest" dest="packages/demos/contest2026_264_periph_selftest"/>
     <linkfile src="app/sdnand_init" dest="packages/demos/contest2026_264_sdnand_init"/>
     <linkfile src="app/audio_test" dest="packages/demos/contest2026_264_audio_test"/>

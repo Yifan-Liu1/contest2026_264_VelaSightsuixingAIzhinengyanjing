@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include <nuttx/board.h>
+#include <nuttx/kthread.h>
 #include <nuttx/fs/fs.h>
 #include <nuttx/video/fb.h>
 
@@ -19,9 +20,10 @@
 #include "bk7258_psram.h"
 #include "bk7258_ramdisk.h"
 #include "bk7258_gc9d01_fb.h"
-#include "bk7258_status_screen.h"
 #include "hardware/bk7258_mbox.h"
 #include "bk7258_wifi.h"
+#include "bk7258_kvdb.h"
+#include "bk7258_status_screen.h"
 
 #ifdef CONFIG_BK7258_TRNG
 #  include "bk7258_trng.h"
@@ -231,6 +233,38 @@ int bk7258_bringup(void)
 }
 
 /****************************************************************************
+ * Name: kvdb_loader
+ *
+ * Description:
+ *   Attaches the flash backend to the configuration store and injects the
+ *   stored LLM settings into the agent's config file.
+ *
+ *   A task rather than part of bring-up because both steps block on the CP.
+ *   Doing the flash read from bring-up stopped the AP from servicing the
+ *   mailbox, so the heartbeat lapsed and the CP's 8-second watchdog reset the
+ *   chip: a reboot loop that printed "connected to the CP flash server" every
+ *   ~9 s and ended each round in "ap_bridg: link down".  Here a slow or
+ *   missing flash service only delays this one task.
+ *
+ *   Failure is not fatal: the store still works, it just does not survive a
+ *   reset, and bk7258_kvdb_persistent() reports that.
+ *
+ ****************************************************************************/
+
+static int kvdb_loader(int argc, FAR char *argv[])
+{
+  UNUSED(argc);
+  UNUSED(argv);
+
+  if (bk7258_kvdb_load() >= 0)
+    {
+      bk7258_kvdb_seed_agent_config();
+    }
+
+  return 0;
+}
+
+/****************************************************************************
  * Name: bk7258_report_cache
  *
  * Description:
@@ -402,6 +436,20 @@ void board_late_initialize(void)
   (void)bk7258_jpeg_enc_initialize();
 #endif
 
+  /* Configuration that survives a reset.  Deliberately after the display and
+   * the camera: it talks to the CP's flash service over the mailbox and can
+   * wait up to a second if that service does not answer, which is not
+   * something the boot screen should queue behind.  A failure here is
+   * reported and ignored -- the board still runs, it just forgets settings on
+   * reset, which is what it did before this existed.
+   */
+
+  /* In-memory store now; the flash side is done by kvdb_loader below.
+   * Nothing here may block on the CP -- see bk7258_kvdb_init().
+   */
+
+  (void)bk7258_kvdb_init();
+
   /* Leave the panels showing the product's own idle state rather than the
    * boot greeting.  From here on the screen is event driven: it is repainted
    * when a state or a result changes and at no other time, which is what the
@@ -417,4 +465,13 @@ void board_late_initialize(void)
 
   bk7258_bt_bringup();
 #endif
+
+  /* Last, and detached: see kvdb_loader(). */
+
+  if (kthread_create("kvdb_loader", SCHED_PRIORITY_DEFAULT, 2048,
+                     kvdb_loader, NULL) < 0)
+    {
+      printf("bk7258_bringup: kvdb_loader not started; settings will not "
+             "survive a reset\n");
+    }
 }

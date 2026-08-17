@@ -302,6 +302,22 @@ endif
 
 endif
 
+config BK7258_KVDB_FLASH
+	bool "Back the key-value store with flash (experimental)"
+	default n
+	---help---
+		Persists the store in the AP's own flash partition by asking the
+		CP's flash service over the mailbox, so an API key or Wi-Fi
+		passphrase survives a reset.
+
+		Off by default because the request path is not finished: connecting
+		to the server works and is verified on hardware, and with the
+		acknowledgement state fixed the server does answer a read, but the
+		boot then stops before NSH -- so the read path still does something
+		the AP cannot survive.  With this off the store works normally for
+		the current boot and simply does not persist, which is what the
+		board did before it existed.
+
 config BK7258_CAMERA_JPEG_FPS
 	int "Fixed JPEG sampling rate on /dev/video0 (frames per second)"
 	default 5

@@ -1,0 +1,7 @@
+############################################################################
+# Persistent configuration (kvdb)
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_264_KVDB_TOOL),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_264_kvdb_tool
+endif
