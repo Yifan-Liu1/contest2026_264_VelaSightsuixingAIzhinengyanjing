@@ -59,6 +59,39 @@
  *                  14.5-14.6 for why the marker check is not enough.
  *     n=<count>    capture <count> frames in one streaming session
  *                  (default 1, which is what the tool does)
+ *     b64all       like b64 but for *every* frame of the session, each in
+ *                  its own fenced block tagged with its index and length.
+ *                  This is the recording interface: a burst comes out as a
+ *                  sequence of JPEGs that the host assembles into a clip.
+ *
+ *                    ./serial_cmd.sh -r -w 150 -o /tmp/clip.log \
+ *                       'agent_camera n=24 b64all'
+ *
+ *                  Every session also ends with a measured frame rate line
+ *                  ("session N frame(s) in X ms = Y.YY fps").  Take that
+ *                  number from a run *without* b64all: printing tens of
+ *                  kilobytes per frame down a 115200 console dominates the
+ *                  session and the rate reported with b64all is the console
+ *                  speed, not the camera's.
+ *     rec=<count>  record <count> frames into memory at the sensor's own
+ *                  rate and dump them afterwards.  This is what a clip
+ *                  needs: with b64all the console pace (3.5s per frame at
+ *                  115200) sets the sampling interval and the result is a
+ *                  time lapse, not motion.  Combine with n= large enough to
+ *                  cover the recording, e.g.
+ *
+ *                    'agent_camera 640x480 bufs=4 n=60 rec=20'
+ *
+ *                  rec frames are kept out of the n captured, spread evenly:
+ *                  n=60 rec=20 keeps every third frame, i.e. a 20-frame clip
+ *                  at about 10fps with the sensor still running at 30.  Ask
+ *                  for rec == n only at low resolution: copying a 640x480
+ *                  frame out takes longer than the 33ms between frames (both
+ *                  ends are non-cacheable PSRAM), the DMA catches up, and
+ *                  most frames come back with a truncated scan.
+ *
+ *                  Frames are held in the heap, which reaches PSRAM here, so
+ *                  30 x ~30KB is fine; the SRAM heap alone would not be.
  *     caps         only enumerate formats and sizes, capture nothing
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -69,6 +102,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 
 #include <errno.h>
@@ -99,6 +133,15 @@
 
 #define CAM_BUF_SIZE       (160 * 1024)
 #define CAM_NUM_BUFFERS    2
+
+/* How many buffers this tool can hold at once.  The *default* stays at
+ * CAM_NUM_BUFFERS because that is what packages/ai_agent's camera_capture
+ * asks for and this tool exists to reproduce it; 'bufs=4' is for recording,
+ * where the copy out of each frame has to overlap the DMA filling the next
+ * one and two buffers leave no slack.
+ */
+
+#define CAM_MAX_BUFFERS    4
 #define CAM_TIMEOUT_MS     5000
 
 /* tool_camera.c's two hardcoded geometries. */
@@ -129,8 +172,8 @@ struct agent_camera_size_s
 struct agent_camera_s
 {
   int      fd;
-  void    *bufs[CAM_NUM_BUFFERS];
-  size_t   buflen[CAM_NUM_BUFFERS];
+  void    *bufs[CAM_MAX_BUFFERS];
+  size_t   buflen[CAM_MAX_BUFFERS];
   uint32_t nbuffers;
   bool     streaming;
 };
@@ -159,8 +202,11 @@ static void agent_camera_usage(void)
          "  high     1280x720, tool_camera.c's \"high\" request\n"
          "  strict   do not negotiate a refused geometry (pre-patch\n"
          "           tool_camera.c behaviour)\n"
-         "  b64      print the first frame as base64 (retrieve without a\n"
+         "  b64      print the last frame as base64 (retrieve without a\n"
          "           filesystem; see the file header)\n"
+         "  b64all   print every frame as base64, one fenced block each\n"
+         "  rec=<n>  record n frames at the sensor rate into memory, then\n"
+         "           dump them all as base64 -- use this for a clip\n"
          "  caps     enumerate formats and sizes only\n");
 }
 
@@ -584,6 +630,43 @@ static uint32_t agent_camera_fnv1a(const uint8_t *data, size_t len)
   return hash;
 }
 
+/****************************************************************************
+ * Name: agent_camera_copy32
+ *
+ * Description:
+ *   Word-at-a-time copy out of a capture buffer.  This libc's memcpy is
+ *   byte-wise, and the source is non-cacheable PSRAM, so copying a ~28KB
+ *   frame with it takes longer than the 33ms the sensor gives us between
+ *   frames.  With only a couple of V4L2 buffers in flight that loses the
+ *   race: the DMA reaches the buffer we are still reading and the frame
+ *   comes out with a truncated scan -- SOI, EOI and every marker present, so
+ *   the structure check passes, but a real decoder reports "broken data
+ *   stream".  Measured before this existed: 3 of 29 recorded frames decoded.
+ *
+ *   Both ends are 4-byte aligned here (the capture buffers come from a PSRAM
+ *   pool, the destination from malloc), and the tail is handled bytewise.
+ *
+ ****************************************************************************/
+
+static void agent_camera_copy32(FAR uint8_t *dst, FAR const uint8_t *src,
+                                size_t len)
+{
+  FAR uint32_t *d = (FAR uint32_t *)dst;
+  FAR const uint32_t *s = (FAR const uint32_t *)src;
+  size_t words = len >> 2;
+  size_t i;
+
+  for (i = 0; i < words; i++)
+    {
+      d[i] = s[i];
+    }
+
+  for (i = words << 2; i < len; i++)
+    {
+      dst[i] = src[i];
+    }
+}
+
 static void agent_camera_print_b64(const uint8_t *data, size_t len)
 {
   static const char tbl[] =
@@ -737,11 +820,19 @@ static void agent_camera_teardown(struct agent_camera_s *cam)
 static int agent_camera_capture(struct agent_camera_s *cam,
                                 int width, int height,
                                 unsigned int count, bool negotiate,
-                                const char *out_path, bool b64)
+                                const char *out_path, bool b64,
+                                bool b64_all, unsigned int rec)
 {
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   struct v4l2_requestbuffers req;
   struct v4l2_capability cap;
+  struct timeval t_start;
+  struct timeval t_end;
+  unsigned long elapsed_ms;
+  FAR uint8_t **rec_frames = NULL;
+  FAR size_t *rec_lens = NULL;
+  unsigned int rec_stored = 0;
+  unsigned int rec_every = 1;
   uint32_t chosen_fmt = 0;
   unsigned int frame;
   uint32_t i;
@@ -783,7 +874,7 @@ static int agent_camera_capture(struct agent_camera_s *cam,
       return -errno;
     }
 
-  cam->nbuffers = req.count < CAM_NUM_BUFFERS ? req.count : CAM_NUM_BUFFERS;
+  cam->nbuffers = req.count < CAM_MAX_BUFFERS ? req.count : CAM_MAX_BUFFERS;
   printf("agent_camera: %" PRIu32 " buffer(s) granted\n", cam->nbuffers);
 
   for (i = 0; i < cam->nbuffers; i++)
@@ -842,6 +933,50 @@ static int agent_camera_capture(struct agent_camera_s *cam,
 
   cam->streaming = true;
 
+  /* Wall clock across the streaming session, so the session reports the
+   * frame rate it actually achieved rather than the 30fps the sensor is
+   * configured for.  Note that 'b64all' prints tens of kilobytes per
+   * frame down a 115200 console, which dominates everything else; take
+   * the rate from a run without it.
+   */
+
+  /* Recording mode keeps the frames instead of printing them, so the
+   * capture runs at the sensor's rate and the console work happens
+   * afterwards.  Printing inside the loop cannot do that: one frame of
+   * base64 is ~40KB, i.e. 3.5s at 115200, so every "next" frame would be
+   * whatever the driver had most recently overwritten and the clip would be
+   * a time lapse rather than motion.  The frames come from the heap, which
+   * on this board reaches into PSRAM (6MB), so 30 x ~30KB is affordable
+   * while the 300KB SRAM heap alone would not be.
+   */
+
+  if (rec > 0)
+    {
+      /* Keep rec frames out of the count captured, spread evenly.  Copying
+       * a frame out costs more than the 33ms between frames at 640x480 --
+       * both ends are non-cacheable PSRAM -- so recording every frame loses
+       * the race with the DMA and most scans come back truncated (measured:
+       * 2 to 11 clean out of 30).  Sampling every rec_every'th frame buys
+       * that many frame times per copy, and the result is still a real
+       * recording: the frames are the sensor's own, spaced by a known
+       * interval, just at a lower rate than 30fps.
+       */
+
+      rec_every = count > rec ? count / rec : 1;
+
+      rec_frames = (FAR uint8_t **)calloc(rec, sizeof(FAR uint8_t *));
+      rec_lens = (FAR size_t *)calloc(rec, sizeof(size_t));
+      if (rec_frames == NULL || rec_lens == NULL)
+        {
+          printf("agent_camera: cannot hold %u frames\n", rec);
+          free(rec_frames);
+          free(rec_lens);
+          return -ENOMEM;
+        }
+    }
+
+  gettimeofday(&t_start, NULL);
+
   for (frame = 0; frame < count; frame++)
     {
       struct pollfd pfd;
@@ -899,6 +1034,39 @@ static int agent_camera_capture(struct agent_camera_s *cam,
         {
           const uint8_t *data = cam->bufs[dqbuf.index];
 
+          /* Get the bytes out of the capture buffer *first*, before anything
+           * else touches them.  agent_camera_check_jpeg() walks the whole
+           * frame looking for markers, and doing that in place -- byte at a
+           * time, out of non-cacheable PSRAM -- costs more than the 33ms the
+           * sensor leaves between frames, so the DMA catches up and the scan
+           * we then copy is already truncated.  Measured: validating first
+           * gave 11 of 29 frames a clean decode, copying first gives the
+           * numbers quoted in the recording section of the docs.
+           */
+
+          if (rec > 0 && rec_stored < rec && (frame % rec_every) == 0)
+            {
+              FAR uint8_t *copy = (FAR uint8_t *)malloc(dqbuf.bytesused);
+
+              if (copy == NULL)
+                {
+                  printf("agent_camera: out of memory at frame %u, "
+                         "recording %u frame(s)\n", frame, rec_stored);
+                  rec = rec_stored;
+                }
+              else
+                {
+                  agent_camera_copy32(copy, data, dqbuf.bytesused);
+                  rec_frames[rec_stored] = copy;
+                  rec_lens[rec_stored] = dqbuf.bytesused;
+                  rec_stored++;
+
+                  /* Validate the copy, not the live buffer. */
+
+                  data = copy;
+                }
+            }
+
           agent_camera_check_jpeg(data, dqbuf.bytesused);
 
           /* Deliver the *last* frame of the session, not the first.
@@ -918,6 +1086,19 @@ static int agent_camera_capture(struct agent_camera_s *cam,
            * frames to step past the transient.
            */
 
+          /* Every frame, when asked for.  This is the interface a host-side
+           * recording uses: one fenced base64 block per frame, each carrying
+           * its own index and length, so a burst can be reassembled into a
+           * clip without a filesystem on the board.  See the file header for
+           * the extraction one-liner.
+           */
+
+          if (b64_all)
+            {
+              printf("agent_camera: frame %u of %u\n", frame + 1, count);
+              agent_camera_print_b64(data, dqbuf.bytesused);
+            }
+
           if (frame + 1 == count)
             {
               if (out_path != NULL)
@@ -925,7 +1106,7 @@ static int agent_camera_capture(struct agent_camera_s *cam,
                   agent_camera_write_file(out_path, data, dqbuf.bytesused);
                 }
 
-              if (b64)
+              if (b64 && !b64_all)
                 {
                   agent_camera_print_b64(data, dqbuf.bytesused);
                 }
@@ -938,6 +1119,42 @@ static int agent_camera_capture(struct agent_camera_s *cam,
           return -errno;
         }
     }
+
+  gettimeofday(&t_end, NULL);
+  elapsed_ms = (unsigned long)((t_end.tv_sec - t_start.tv_sec) * 1000 +
+                              (t_end.tv_usec - t_start.tv_usec) / 1000);
+
+  printf("agent_camera: session %u frame(s) in %lu ms = %lu.%02lu fps%s\n",
+         count, elapsed_ms,
+         elapsed_ms ? (unsigned long)count * 1000ul / elapsed_ms : 0ul,
+         elapsed_ms ? (unsigned long)count * 100000ul / elapsed_ms % 100ul
+                    : 0ul,
+         b64_all ? " (inflated by base64 output)" : "");
+
+  if (rec_stored > 0)
+    {
+      unsigned int stored;
+
+      printf("agent_camera: recording %u frame(s), 1 in every %u captured "
+             "(about %lu.%02lu fps), dumping now\n",
+             rec_stored, rec_every,
+             elapsed_ms ? (unsigned long)rec_stored * 1000ul / elapsed_ms
+                        : 0ul,
+             elapsed_ms ? (unsigned long)rec_stored * 100000ul / elapsed_ms
+                          % 100ul : 0ul);
+
+      for (stored = 0; stored < rec_stored; stored++)
+        {
+          printf("agent_camera: frame %u of %u\n", stored + 1, rec_stored);
+          agent_camera_print_b64(rec_frames[stored], rec_lens[stored]);
+          free(rec_frames[stored]);
+        }
+
+      printf("agent_camera: recording done\n");
+    }
+
+  free(rec_frames);
+  free(rec_lens);
 
   return OK;
 }
@@ -956,6 +1173,8 @@ int main(int argc, FAR char *argv[])
   bool auto_size = true;
   bool negotiate = true;
   bool b64 = false;
+  bool b64_all = false;
+  unsigned int rec = 0;
   int width = 0;
   int height = 0;
   int nsizes;
@@ -997,7 +1216,7 @@ int main(int argc, FAR char *argv[])
         {
           unsigned long v = strtoul(arg + 5, NULL, 10);
 
-          if (v >= 1 && v <= CAM_NUM_BUFFERS)
+          if (v >= 1 && v <= CAM_MAX_BUFFERS)
             {
               g_nbufs = (uint32_t)v;
             }
@@ -1005,6 +1224,15 @@ int main(int argc, FAR char *argv[])
       else if (strcmp(arg, "b64") == 0)
         {
           b64 = true;
+        }
+      else if (strncmp(arg, "rec=", 4) == 0)
+        {
+          rec = (unsigned int)atoi(arg + 4);
+        }
+      else if (strcmp(arg, "b64all") == 0)
+        {
+          b64 = true;
+          b64_all = true;
         }
       else if (strncmp(arg, "out=", 4) == 0)
         {
@@ -1111,7 +1339,7 @@ int main(int argc, FAR char *argv[])
     }
 
   ret = agent_camera_capture(&cam, width, height, count, negotiate,
-                             out_path, b64);
+                             out_path, b64, b64_all, rec);
   agent_camera_teardown(&cam);
 
   if (ret < 0)

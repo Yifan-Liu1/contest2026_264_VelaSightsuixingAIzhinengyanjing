@@ -56,6 +56,10 @@
  *                           JPEG encoder (/dev/video1); default N=60, about
  *                           two seconds at the measured rate
  *   jpegout=<path>          save the first encoded frame (needs a filesystem)
+ *   jpegb64                 print every encoded frame as fenced base64, the
+ *                           same form agent_camera uses, so
+ *                           tools/b64frames.py rebuilds it without any
+ *                           filesystem on the board
  *   q=N                     JPEG quality, default 80
  *   sat=N                   chroma gain in percent (default 100)
  *   gain=N                  luma gain in percent (default 100)
@@ -80,6 +84,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -423,6 +428,85 @@ static void preview_release_ctty(void)
       ioctl(STDIN_FILENO, TIOCNOTTY, 0);
       g_ctty_claimed = false;
     }
+}
+
+/****************************************************************************
+ * Name: preview_print_b64
+ *
+ * Description:
+ *   Emit an encoded frame on the console in the same fenced base64 form
+ *   agent_camera uses, so tools/b64frames.py rebuilds either one and the two
+ *   paths can be compared byte for byte.  It exists here because the two
+ *   paths do not agree: the hardware JPEG path (agent_camera, /dev/video0 in
+ *   JPEG mode) mis-assembles its bitstream -- consecutive frames of a static
+ *   scene came back differing by 50 to 140 grey levels, the tail of each
+ *   picture belonging to a different frame, while every marker check passed
+ *   -- whereas this path encodes a frame that came through the verified UYVY
+ *   capture, so it is the one to trust for evidence.
+ *
+ ****************************************************************************/
+
+static void preview_print_b64(FAR const uint8_t *data, size_t len)
+{
+  static const char tbl[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  uint32_t hash = 2166136261u;
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    {
+      hash ^= data[i];
+      hash *= 16777619u;
+    }
+
+  printf("agent_camera: payload len=%zu fnv1a=0x%08" PRIx32 "\n", len, hash);
+  printf("-----BEGIN AGENT_CAMERA JPEG %zu-----\n", len);
+
+  for (i = 0; i < len; i += 3)
+    {
+      size_t remain = len - i;
+      uint32_t v = (uint32_t)data[i] << 16;
+      char quad[4];
+
+      if (remain > 1)
+        {
+          v |= (uint32_t)data[i + 1] << 8;
+        }
+
+      if (remain > 2)
+        {
+          v |= data[i + 2];
+        }
+
+      quad[0] = tbl[(v >> 18) & 0x3f];
+      quad[1] = tbl[(v >> 12) & 0x3f];
+      quad[2] = remain > 1 ? tbl[(v >> 6) & 0x3f] : '=';
+      quad[3] = remain > 2 ? tbl[v & 0x3f] : '=';
+
+      fwrite(quad, 1, 4, stdout);
+
+      if ((i / 3) % 19 == 18)
+        {
+          putchar('\n');
+
+          /* Same throttle as agent_camera_print_b64(), and for the same
+           * reason: the AP's console is a mailbox bridge holding 1024 bytes,
+           * and an unthrottled 33KB burst arrives truncated -- measured
+           * 2026-08-17, a 12-frame dump came back with 2 of 12 fences intact
+           * and both bodies short.  Pausing every two lines keeps the writer
+           * under the bridge's drain rate.
+           */
+
+          if (((i / 3) / 19) % 2 == 1)
+            {
+              fflush(stdout);
+              usleep(30000);
+            }
+        }
+    }
+
+  putchar('\n');
+  printf("-----END AGENT_CAMERA JPEG-----\n");
 }
 
 static uint32_t now_ms(void)
@@ -1791,6 +1875,7 @@ int main(int argc, FAR char *argv[])
   FAR const char *face_name = NULL;
   FAR const char *face_src = NULL;
   FAR const char *jpeg_out = NULL;
+  bool jpeg_b64 = false;
   FAR struct preview_jpeg_s *enc = NULL;
   int jpeg_every = 0;
   int jpeg_quality = 80;
@@ -1926,6 +2011,14 @@ int main(int argc, FAR char *argv[])
       else if (strncmp(argv[i], "jpeg=", 5) == 0)
         {
           jpeg_every = atoi(argv[i] + 5);
+        }
+      else if (strcmp(argv[i], "jpegb64") == 0)
+        {
+          jpeg_b64 = true;
+          if (jpeg_every == 0)
+            {
+              jpeg_every = 1;
+            }
         }
       else if (strncmp(argv[i], "jpegout=", 8) == 0)
         {
@@ -2246,6 +2339,11 @@ int main(int argc, FAR char *argv[])
                              jpg[0], jpg[1],
                              jlen >= 2 ? jpg[jlen - 2] : 0,
                              jlen >= 1 ? jpg[jlen - 1] : 0);
+
+                      if (jpeg_b64)
+                        {
+                          preview_print_b64(jpg, jlen);
+                        }
 
                       if (jpeg_out != NULL)
                         {

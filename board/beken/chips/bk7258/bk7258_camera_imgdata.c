@@ -232,6 +232,7 @@ struct bk7258_camera_imgdata_s
   volatile uint32_t jpeg_short;    /* Frames completed without an EOI. */
   volatile uint32_t jpeg_err_seen; /* err_count at the last VSYNC check. */
   volatile uint32_t jpeg_resets;   /* Recoveries performed. */
+  volatile uint32_t jpeg_vsyncs;   /* VSYNC negedges seen this session. */
   FAR uint8_t *jpeg_stage;         /* Encoder input staging area, PSRAM. */
   uint32_t jpeg_stage_bytes;
   volatile int32_t jpeg_eoi_delta;  /* EOI offset minus byte_count_pfrm. */
@@ -660,6 +661,8 @@ static void bk7258_camera_jpeg_vsync(FAR void *arg)
     {
       return;
     }
+
+  priv->jpeg_vsyncs++;
 
   bk7258_jpeg_enc_get_stats(&st);
 
@@ -1139,6 +1142,7 @@ static int bk7258_camera_imgdata_start_capture(
       bk7258_jpeg_enc_get_stats(&st);
       priv->jpeg_err_seen = st.err_count;
       priv->jpeg_resets = 0;
+      priv->jpeg_vsyncs = 0;
       bk7258_yuv_buf_set_vsync_callback(bk7258_camera_jpeg_vsync, priv);
       priv->capturing = true;
       bk7258_camera_jpeg_dma_arm(priv);
@@ -1232,11 +1236,12 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
            */
 
           printf("bk7258_camera_imgdata: stop_capture: jpeg chunks=%u "
-                 "short=%u resets=%u hdr_fail=%u eoi_delta=%d "
+                 "short=%u resets=%u vsyncs=%u hdr_fail=%u eoi_delta=%d "
                  "dma_remain=%u\n",
                  (unsigned int)priv->jpeg_chunks,
                  (unsigned int)priv->jpeg_short,
                  (unsigned int)priv->jpeg_resets,
+                 (unsigned int)priv->jpeg_vsyncs,
                  (unsigned int)priv->jpeg_hdr_fail,
                  (int)priv->jpeg_eoi_delta,
                  (unsigned int)bk7258_dma_get_channel_remain_len(
