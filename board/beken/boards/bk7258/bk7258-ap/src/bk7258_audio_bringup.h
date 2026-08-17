@@ -43,6 +43,27 @@
 
 #define BK7258_AUDIOIOC_DIAG _AUDIOIOC(200)
 
+/* Set the capture front end's gain staging, before AUDIOIOC_CONFIGURE.
+ *
+ * Gain has to be swept to be chosen: the analog stage sits ahead of the ADC,
+ * so it is the only one that changes the signal-to-noise ratio, but raising it
+ * too far clips transients that no amount of digital gain can undo -- a first
+ * bring-up run at half scale reported peak 32767 at an RMS of only 2671.  The
+ * useful setting is therefore the largest analog gain that speech does not
+ * clip, and finding it means measuring several values.  Doing that through an
+ * ioctl rather than a rebuilt image turns a sixteen-flash afternoon into one
+ * flash and sixteen commands.
+ */
+
+#define BK7258_AUDIOIOC_SET_CAPGAIN _AUDIOIOC(201)
+
+struct bk7258_audio_capgain_s
+{
+  uint8_t mic_gain;    /* 0..0x0f analog, ahead of the ADC */
+  uint8_t adc_gain;    /* 0..0x3f digital, 0x2d == 0 dB    */
+  bool    hpf;         /* true: use the ADC high-pass stages */
+};
+
 /****************************************************************************
  * Public Function Prototypes
  ****************************************************************************/

@@ -127,6 +127,19 @@ struct bk7258_aud_config
   uint8_t adc_gain;                 /* 0..0x3f digital                  */
   uint8_t mic_gain;                 /* 0..0x0f analog, both MIC1/MIC2   */
 
+  /* Run the capture path through the ADC's two high-pass stages instead of
+   * bypassing them.
+   *
+   * The vendor bypasses both, which lets the microphone's DC offset and any
+   * low-frequency rumble through untouched.  Neither carries speech, and the
+   * offset costs headroom that the quiet electret front end cannot spare, so
+   * for voice the filters are worth having.  It is a configuration rather
+   * than a fixed choice because the bypassed path is what the vendor
+   * validated, and the difference is worth being able to measure.
+   */
+
+  bool adc_hpf;
+
   /* Enable the MIC2 channel so capture yields L=voice / R=echo-reference
    * interleaved pairs.  With this false only MIC1 is enabled and capture
    * is plain mono voice.
