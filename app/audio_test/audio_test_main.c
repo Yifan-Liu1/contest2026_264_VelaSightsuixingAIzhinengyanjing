@@ -47,6 +47,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
+
+#include <arch/chip/bk7258_psram.h>
+
+#include "audio_test_ogg.h"
+#include "audio_test_stream.h"
 #include <math.h>
 #include <mqueue.h>
 #include <stdbool.h>
@@ -76,6 +81,27 @@
  */
 
 #define AUDIO_TEST_IOC_DIAG     _AUDIOIOC(200)
+
+/* Mirrors BK7258_AUDIOIOC_SET_CAPGAIN and its argument in
+ * board/.../src/bk7258_audio_bringup.h, which applications cannot include.
+ * Keep the two in step.
+ */
+
+#define AUDIO_TEST_IOC_CAPGAIN  _AUDIOIOC(201)
+
+struct audio_test_capgain_s
+{
+  uint8_t mic_gain;
+  uint8_t adc_gain;
+  bool    hpf;
+};
+
+/* Gain staging left as the driver has it until asked otherwise: -1 means
+ * "do not send the ioctl", so a plain run still measures the current
+ * baseline rather than silently a different one.
+ */
+
+#define AUDIO_TEST_GAIN_UNSET   (-1)
 
 #define AUDIO_TEST_PLAY_DEV     "/dev/audio/pcm0p"
 #define AUDIO_TEST_CAP_DEV      "/dev/audio/pcm0c"
@@ -136,6 +162,36 @@
  */
 
 #define AUDIO_TEST_DEF_RECPLAY_SECONDS 5
+
+/* Default length and bitrate of an 'opus' capture.
+ *
+ * Five seconds is a sentence, which is what a recogniser needs to be worth
+ * asking.  24 kbps is above what wideband speech needs for intelligibility
+ * and still leaves the base64 dump short enough to cross this console in a
+ * couple of seconds.
+ */
+
+#define AUDIO_TEST_DEF_OPUS_SECONDS    5
+#define AUDIO_TEST_DEF_OPUS_BITRATE    24000
+
+/* Defaults for continuous chunked capture.
+ *
+ * Two seconds per chunk is the figure the upload plan settled on: long
+ * enough that the per-chunk request overhead is noise next to the payload,
+ * short enough that a recogniser sees a phrase soon after it is spoken.
+ *
+ * Thirty seconds is the default session length only because a command has to
+ * stop by itself; -t sets whatever is wanted.  It is deliberately several
+ * times the chunk length so a run exercises the ring rather than filling it
+ * once.
+ */
+
+#define AUDIO_TEST_DEF_CHUNK_MS        2000
+#define AUDIO_TEST_DEF_STREAM_SECONDS  30
+
+/* How often the session prints its counters while running. */
+
+#define AUDIO_TEST_STREAM_REPORT_S     5
 
 /* Target peak the recording is scaled to before it is played back.
  *
@@ -222,7 +278,17 @@ struct audio_test_cfg_s
   unsigned int tone_hz;
   unsigned int amplitude;           /* raw 16-bit sample peak */
   unsigned int play_peak;           /* recplay target peak, 0: no scaling */
+  unsigned int bitrate;             /* opus target bits per second */
+  bool ogg;                         /* encode to Ogg Opus and dump base64 */
   int dac_volume;                   /* -1: leave alone, else 0..1000 */
+  int mic_gain;                     /* analog, 0..15, or _UNSET */
+  int adc_gain;                     /* digital, 0..63, or _UNSET */
+  int hpf;                          /* 0/1 high-pass stages, or _UNSET */
+  const char *pcm_host;             /* non-NULL: send raw PCM there */
+  int pcm_port;
+  const char *stream_host;          /* non-NULL: chunked upload target */
+  int stream_port;
+  unsigned int chunk_ms;            /* chunk length for 'stream' */
 };
 
 /* A recording held in the heap.  Capture appends to it and playback drains
@@ -236,6 +302,7 @@ struct audio_test_clip_s
   size_t used;                      /* bytes written by capture */
   size_t played;                    /* bytes handed back to playback */
   unsigned int settle;              /* capture buffers still to discard */
+  bool psram;                       /* data came from the PSRAM heap */
 };
 
 /****************************************************************************
@@ -252,18 +319,37 @@ static float g_tone_phase;
 
 static void audio_test_usage(void)
 {
-  printf("Usage: audio_test <play|rec|loop|recplay|diag> [options]\n"
+  printf("Usage: audio_test <play|rec|loop|recplay|opus|diag> [options]\n"
          "  play     sine out the speaker\n"
          "  rec      capture and report signal statistics\n"
          "  loop     live microphone to speaker passthrough\n"
          "  recplay  record into RAM, then play the recording back\n"
+         "  opus     record, encode to Ogg Opus, print it as base64\n"
+         "  dump     print the last encoded file again\n"
+         "  send <ip> <port>\n"
+         "           send the last encoded file over TCP\n"
+         "  pcm <ip> <port>\n"
+         "           record, then send raw PCM over TCP (no encoder, so\n"
+         "           the samples are what the ADC produced)\n"
+         "  stream <ip> <port>\n"
+         "           capture continuously and upload fixed-length chunks\n"
+         "           while still recording; capture is never blocked by\n"
+         "           the network, chunks are dropped instead\n"
+         "  -c <ms>    stream: chunk length, default %d\n"
          "  diag     capture with a driver register dump\n"
+         "  -b <bps>   opus bitrate, default %d\n"
          "  -t <sec>   duration, default %d\n"
          "  -r <rate>  sample rate (8000|16000|32000), default %d\n"
          "  -f <hz>    tone frequency for play/loop, default %d\n"
          "  -g <peak>  recplay: scale the recording to this peak before\n"
          "             playback, 0 to play it raw, default %d\n"
-         "  -v <0..1000> DAC volume, default: leave as configured\n",
+         "  -v <0..1000> DAC volume, default: leave as configured\n"
+         "  -m <0..15>   analog MIC gain (ahead of the ADC; raising this\n"
+         "               is the only way to improve SNR, and too much\n"
+         "               clips transients irrecoverably)\n"
+         "  -d <0..63>   ADC digital gain, 0x2d (45) is 0 dB\n"
+         "  -p <0|1>     ADC high-pass stages, 0 bypasses them\n",
+         AUDIO_TEST_DEF_CHUNK_MS, AUDIO_TEST_DEF_OPUS_BITRATE,
          AUDIO_TEST_DEF_SECONDS, AUDIO_TEST_DEF_RATE,
          AUDIO_TEST_DEF_TONE_HZ, AUDIO_TEST_DEF_PLAY_PEAK);
 }
@@ -594,6 +680,35 @@ static int audio_test_open(struct audio_test_stream_s *stream,
       printf("audio_test: RESERVE failed on %s: %d\n", devpath, errno);
       ret = -errno;
       goto err;
+    }
+
+  /* Gain staging goes in before CONFIGURE, which is where the driver runs
+   * adc_setup() and latches these into the analog front end.
+   */
+
+  if (!playback && (cfg->mic_gain != AUDIO_TEST_GAIN_UNSET ||
+                    cfg->adc_gain != AUDIO_TEST_GAIN_UNSET ||
+                    cfg->hpf != AUDIO_TEST_GAIN_UNSET))
+    {
+      struct audio_test_capgain_s gain;
+
+      gain.mic_gain = cfg->mic_gain == AUDIO_TEST_GAIN_UNSET ?
+                      0 : (uint8_t)cfg->mic_gain;
+      gain.adc_gain = cfg->adc_gain == AUDIO_TEST_GAIN_UNSET ?
+                      0x2d : (uint8_t)cfg->adc_gain;
+      gain.hpf      = cfg->hpf == AUDIO_TEST_GAIN_UNSET ?
+                      false : cfg->hpf != 0;
+
+      if (ioctl(stream->fd, AUDIO_TEST_IOC_CAPGAIN,
+                (unsigned long)&gain) < 0)
+        {
+          printf("audio_test: CAPGAIN failed: %d\n", errno);
+          ret = -errno;
+          goto err;
+        }
+
+      printf("audio_test: mic_gain=%u adc_gain=0x%02x hpf=%d\n",
+             gain.mic_gain, gain.adc_gain, gain.hpf);
     }
 
   memset(&cap_desc, 0, sizeof(cap_desc));
@@ -1150,13 +1265,34 @@ static int audio_test_recplay(const struct audio_test_cfg_s *cfg)
   printf("audio_test: clip wants %zu KiB, heap has %zu KiB free\n",
          want / 1024, (size_t)mem.fordblks / 1024);
 
-  clip.data = malloc(want);
+  /* PSRAM first, SRAM only as a fallback.
+   *
+   * The clip is the one large allocation here and it is touched at audio
+   * rate, not at memory speed, so non-cacheable PSRAM costs it nothing.  Out
+   * of SRAM it costs a great deal: this heap holds both frame buffers and
+   * everything else, and a clip large enough to be useful starves the four
+   * 2 KiB pipeline buffers the driver needs.  That is what "ALLOCBUFFER 0 of
+   * 4 returned -1" was -- a 2 s clip fitting, and then leaving nothing for
+   * the buffers that carry the audio into it.
+   */
+
+  clip.data = bk7258_psram_malloc(want);
+  clip.psram = clip.data != NULL;
   if (clip.data == NULL)
     {
-      printf("audio_test: %u s at %u Hz does not fit in the heap; retry "
-             "with a shorter -t\n", cfg->seconds, cfg->samplerate);
+      clip.data = malloc(want);
+    }
+
+  if (clip.data == NULL)
+    {
+      printf("audio_test: %u s at %u Hz fits in neither PSRAM nor the "
+             "heap; retry with a shorter -t\n", cfg->seconds,
+             cfg->samplerate);
       return -ENOMEM;
     }
+
+  printf("audio_test: clip of %zu KiB taken from %s\n", want / 1024,
+         clip.psram ? "PSRAM" : "the SRAM heap");
 
   clip.capacity = want;
   clip.settle = AUDIO_TEST_SETTLE_BUFFERS;
@@ -1255,6 +1391,35 @@ static int audio_test_recplay(const struct audio_test_cfg_s *cfg)
 
   audio_test_clip_normalise(&clip, cfg->play_peak);
 
+  /* 'pcm' ships the capture untouched.
+   *
+   * Opus would be the wrong carrier for anything that examines the noise
+   * itself: a 16 kbps encoder is built to spend its bits on what a listener
+   * notices and to discard noise-like content, so a spectrum measured after
+   * it describes the encoder as much as the microphone.  Raw PCM is also what
+   * the upload protocol specifies, so this path is not only a diagnostic.
+   */
+
+  if (cfg->pcm_host != NULL)
+    {
+      ret = audio_test_send_raw(cfg->pcm_host, cfg->pcm_port,
+                                clip.data, clip.used);
+      goto free_clip;
+    }
+
+  /* 'opus' stops here: the point of that mode is to get a file off the
+   * board, and playing the clip afterwards would only add a minute of
+   * waiting to a command whose output is being captured by a script.
+   */
+
+  if (cfg->ogg)
+    {
+      ret = audio_test_ogg_opus_dump((const int16_t *)clip.data,
+                                     clip.used / sizeof(int16_t),
+                                     cfg->samplerate, cfg->bitrate);
+      goto free_clip;
+    }
+
   /* Phase 2: play the clip back. */
 
   memset(&stream, 0, sizeof(stream));
@@ -1324,8 +1489,163 @@ static int audio_test_recplay(const struct audio_test_cfg_s *cfg)
   ret = OK;
 
 free_clip:
-  free(clip.data);
+  if (clip.psram)
+    {
+      bk7258_psram_free(clip.data);
+    }
+  else
+    {
+      free(clip.data);
+    }
+
   return ret;
+}
+
+/****************************************************************************
+ * Name: audio_test_stream_run
+ *
+ * Description:
+ *   Capture continuously, cut the stream into fixed-length chunks and upload
+ *   each one while the next is still being recorded.
+ *
+ *   This loop is deliberately not audio_test_poll(): that function folds
+ *   every buffer into statistics and optionally into a clip, both of which
+ *   are the wrong shape here.  What matters on this path is that the only
+ *   work between receiving a buffer and re-enqueueing it is one strided copy
+ *   into PSRAM -- no encode, no socket, nothing that can block -- because a
+ *   buffer that is not returned promptly is an ADC overrun.  The encode and
+ *   the upload happen on the other side of the ring, on a thread that is
+ *   free to stall.
+ *
+ ****************************************************************************/
+
+static int audio_test_stream_run(const struct audio_test_cfg_s *cfg)
+{
+  struct audio_test_stream_ctx_s *ctx;
+  struct audio_test_stream_s cap;
+  unsigned int cap_channels;
+  unsigned int settle;
+  unsigned int i;
+  time_t deadline;
+  time_t nextreport;
+  int ret;
+
+  /* As elsewhere, the channel count follows the wiring: with the AEC echo
+   * reference compiled in the frames are L/R interleaved and only the left
+   * channel is the microphone.
+   */
+
+#ifdef CONFIG_BK7258_AUDIO_AEC_REFERENCE
+  cap_channels = 2;
+#else
+  cap_channels = 1;
+#endif
+
+  ret = audio_test_open(&cap, AUDIO_TEST_CAP_DEV, AUDIO_TEST_MQ_CAP,
+                        false, cap_channels, cfg);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ctx = audio_test_stream_open(cfg->stream_host, cfg->stream_port,
+                               cfg->samplerate, cfg->chunk_ms,
+                               cfg->bitrate);
+  if (ctx == NULL)
+    {
+      audio_test_close(&cap);
+      return -ENOMEM;
+    }
+
+  for (i = 0; i < cap.nbuffers; i++)
+    {
+      cap.buffers[i]->nbytes = 0;
+      audio_test_enqueue(&cap, cap.buffers[i]);
+    }
+
+  if (ioctl(cap.fd, AUDIOIOC_START, 0) < 0)
+    {
+      printf("audio_test: capture START failed: %d\n", errno);
+      ret = -errno;
+      audio_test_stream_close(ctx);
+      audio_test_close(&cap);
+      return ret;
+    }
+
+  cap.started = true;
+  settle = AUDIO_TEST_SETTLE_BUFFERS;
+
+  printf("audio_test: capturing for %u s\n", cfg->seconds);
+
+  deadline = time(NULL) + (time_t)cfg->seconds;
+  nextreport = time(NULL) + AUDIO_TEST_STREAM_REPORT_S;
+
+  while (time(NULL) < deadline)
+    {
+      struct audio_msg_s msg;
+      struct timespec ts;
+      unsigned int prio;
+      ssize_t got;
+
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += AUDIO_TEST_POLL_MS * 1000000;
+      if (ts.tv_nsec >= 1000000000)
+        {
+          ts.tv_nsec -= 1000000000;
+          ts.tv_sec++;
+        }
+
+      got = mq_timedreceive(cap.mq, (char *)&msg, sizeof(msg), &prio, &ts);
+      if (got == sizeof(msg) && msg.msg_id == AUDIO_MSG_DEQUEUE &&
+          msg.u.ptr != NULL)
+        {
+          struct ap_buffer_s *apb = msg.u.ptr;
+
+          if (cap.inflight > 0)
+            {
+              cap.inflight--;
+            }
+
+          /* The analog front end returns full-scale samples for the first
+           * few buffers after the ADC is enabled, so they are discarded
+           * here for the same reason the statistics discard them.
+           */
+
+          if (settle > 0)
+            {
+              settle--;
+            }
+          else
+            {
+              audio_test_stream_feed(ctx, (const int16_t *)apb->samp,
+                                     apb->nbytes / sizeof(int16_t),
+                                     cap_channels);
+            }
+
+          apb->nbytes = 0;
+          audio_test_enqueue(&cap, apb);
+        }
+
+      if (time(NULL) >= nextreport)
+        {
+          audio_test_stream_report(ctx);
+          nextreport = time(NULL) + AUDIO_TEST_STREAM_REPORT_S;
+        }
+    }
+
+  ioctl(cap.fd, AUDIOIOC_STOP, 0);
+  cap.started = false;
+
+  printf("audio_test: capture stopped, draining the upload queue\n");
+
+  /* Closing flushes the tail of the recording, waits for the uploader and
+   * prints the final counters.
+   */
+
+  audio_test_stream_close(ctx);
+  audio_test_close(&cap);
+
+  return OK;
 }
 
 /****************************************************************************
@@ -1339,6 +1659,13 @@ int main(int argc, char *argv[])
   bool capture = false;
   bool diag = false;
   bool recplay = false;
+
+  /* Where the -x options begin.  'pcm' takes an address and a port as
+   * positional arguments, so its options start two words later than
+   * everything else's.
+   */
+
+  int argstart = 2;
   int i;
 
   cfg.seconds = AUDIO_TEST_DEF_SECONDS;
@@ -1346,7 +1673,17 @@ int main(int argc, char *argv[])
   cfg.tone_hz = AUDIO_TEST_DEF_TONE_HZ;
   cfg.amplitude = AUDIO_TEST_DEF_AMPLITUDE;
   cfg.play_peak = AUDIO_TEST_DEF_PLAY_PEAK;
+  cfg.bitrate = AUDIO_TEST_DEF_OPUS_BITRATE;
+  cfg.ogg = false;
   cfg.dac_volume = -1;
+  cfg.mic_gain = AUDIO_TEST_GAIN_UNSET;
+  cfg.adc_gain = AUDIO_TEST_GAIN_UNSET;
+  cfg.hpf = AUDIO_TEST_GAIN_UNSET;
+  cfg.pcm_host = NULL;
+  cfg.pcm_port = 0;
+  cfg.stream_host = NULL;
+  cfg.stream_port = 0;
+  cfg.chunk_ms = AUDIO_TEST_DEF_CHUNK_MS;
 
   if (argc < 2)
     {
@@ -1376,6 +1713,63 @@ int main(int argc, char *argv[])
       recplay = true;
       cfg.seconds = AUDIO_TEST_DEF_RECPLAY_SECONDS;
     }
+  else if (strcmp(argv[1], "dump") == 0)
+    {
+      return audio_test_ogg_redump() < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+  else if (strcmp(argv[1], "send") == 0)
+    {
+      if (argc < 4)
+        {
+          printf("Usage: audio_test send <ip> <port>\n");
+          return EXIT_FAILURE;
+        }
+
+      return audio_test_ogg_send(argv[2], atoi(argv[3])) < 0 ?
+             EXIT_FAILURE : EXIT_SUCCESS;
+    }
+  else if (strcmp(argv[1], "pcm") == 0)
+    {
+      /* Same capture path, no encoder: record then ship the samples as they
+       * came out of the ADC.
+       */
+
+      if (argc < 4)
+        {
+          printf("Usage: audio_test pcm <ip> <port> [options]\n");
+          return EXIT_FAILURE;
+        }
+
+      recplay = true;
+      cfg.seconds = AUDIO_TEST_DEF_OPUS_SECONDS;
+      cfg.pcm_host = argv[2];
+      cfg.pcm_port = atoi(argv[3]);
+      argstart = 4;
+    }
+  else if (strcmp(argv[1], "stream") == 0)
+    {
+      if (argc < 4)
+        {
+          printf("Usage: audio_test stream <ip> <port> [options]\n");
+          return EXIT_FAILURE;
+        }
+
+      cfg.stream_host = argv[2];
+      cfg.stream_port = atoi(argv[3]);
+      cfg.seconds = AUDIO_TEST_DEF_STREAM_SECONDS;
+      cfg.bitrate = AUDIO_TEST_DEF_OPUS_BITRATE;
+      argstart = 4;
+    }
+  else if (strcmp(argv[1], "opus") == 0)
+    {
+      /* Same capture path as recplay, ending in an encoder instead of the
+       * speaker.
+       */
+
+      recplay = true;
+      cfg.ogg = true;
+      cfg.seconds = AUDIO_TEST_DEF_OPUS_SECONDS;
+    }
   else if (strcmp(argv[1], "diag") == 0)
     {
       diag = true;
@@ -1387,7 +1781,7 @@ int main(int argc, char *argv[])
       return EXIT_FAILURE;
     }
 
-  for (i = 2; i + 1 < argc; i += 2)
+  for (i = argstart; i + 1 < argc; i += 2)
     {
       unsigned long value = strtoul(argv[i + 1], NULL, 0);
 
@@ -1425,6 +1819,26 @@ int main(int argc, char *argv[])
         {
           cfg.dac_volume = (int)value;
         }
+      else if (strcmp(argv[i], "-b") == 0)
+        {
+          cfg.bitrate = (unsigned int)value;
+        }
+      else if (strcmp(argv[i], "-c") == 0)
+        {
+          cfg.chunk_ms = (unsigned int)value;
+        }
+      else if (strcmp(argv[i], "-m") == 0)
+        {
+          cfg.mic_gain = (int)value;
+        }
+      else if (strcmp(argv[i], "-d") == 0)
+        {
+          cfg.adc_gain = (int)value;
+        }
+      else if (strcmp(argv[i], "-p") == 0)
+        {
+          cfg.hpf = (int)value;
+        }
       else
         {
           audio_test_usage();
@@ -1444,6 +1858,18 @@ int main(int argc, char *argv[])
       printf("audio_test: note: %u Hz needs the APLL path, which the chip "
              "driver rejects for now; expect CONFIGURE to fail\n",
              cfg.samplerate);
+    }
+
+  if (cfg.stream_host != NULL)
+    {
+      if (cfg.chunk_ms < 100)
+        {
+          printf("audio_test: a chunk shorter than 100 ms is mostly "
+                 "request overhead\n");
+          return EXIT_FAILURE;
+        }
+
+      return audio_test_stream_run(&cfg) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
 
   if (recplay)
