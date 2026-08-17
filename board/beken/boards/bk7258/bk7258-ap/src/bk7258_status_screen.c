@@ -150,6 +150,31 @@ int bk7258_status_screen_state(enum bk7258_status_e state)
 
   g_shown_state = state;
 
+  /* Entering idle also clears the summary panel.
+   *
+   * Without this the two panels disagree after boot: the greeting is drawn on
+   * both, then only the state panel is repainted, so one round display says
+   * "idle" while the other still says "hello vela" -- which reads as a broken
+   * panel, and was reported as one.  It matters beyond boot too: a summary
+   * from a finished session must not sit next to an idle state, or the screen
+   * claims something the device is no longer doing.
+   */
+
+  if (state == BK7258_STATUS_IDLE)
+    {
+      int cleared = bk7258_gc9d01_fb_two_lines(SUMMARY_PANEL, "", "");
+
+      if (cleared < 0)
+        {
+          printf("status_screen: summary panel not cleared: %d\n", cleared);
+        }
+      else
+        {
+          g_shown_summary[0][0] = '\0';
+          g_shown_summary[1][0] = '\0';
+        }
+    }
+
   /* One line per actual repaint.  Kept because it is the only outside
    * evidence that the panel was painted -- there is no way to read the glass
    * back -- and because it makes the "only on change" rule checkable: a

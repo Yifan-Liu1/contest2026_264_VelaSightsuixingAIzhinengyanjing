@@ -627,7 +627,7 @@ static int gc9d01_fb_lines(int display, FAR const char *const *lines,
 
       if (lines[i] == NULL || lines[i][0] == '\0')
         {
-          continue;
+          continue;   /* An empty line just leaves the cleared background. */
         }
 
       /* Baselines: one line centred, two lines split around the centre. */
