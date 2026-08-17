@@ -21,6 +21,7 @@
 #include <nuttx/semaphore.h>
 #include <nuttx/sdio.h>
 #include <nuttx/signal.h>
+#include <nuttx/wqueue.h>
 
 #include "arm_internal.h"
 #include "irq.h"
@@ -54,6 +55,7 @@ struct bk7258_sdio_s
   worker_t callback;
   FAR void *callback_arg;
   sdio_eventset_t callback_events;
+  struct work_s callback_work;
 #endif
 };
 
@@ -113,6 +115,56 @@ static void sdio_reset_hw(struct bk7258_sdio_s *priv)
   sdio_write(BK7258_SDIO_DATA_CTRL, BK7258_SDIO_DATA_BYTE_SELECT);
   sdio_set_clock(priv, BK7258_SDIO_ID_CLOCK);
 }
+
+static int sdio_recover_hw(struct bk7258_sdio_s *priv)
+{
+  int ret;
+
+  ret = bk7258_sdio_clock_request(false);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = bk7258_sdio_clock_request(true);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  sdio_pinmux();
+  sdio_reset_hw(priv);
+  modifyreg32(BK7258_SDIO_FIFO, 0, BK7258_SDIO_CLOCK_GATE);
+  nxsig_usleep(10000);
+  return OK;
+}
+
+#if defined(CONFIG_SCHED_WORKQUEUE) && defined(CONFIG_SCHED_HPWORK)
+static void sdio_callback_worker(FAR void *arg)
+{
+  FAR struct bk7258_sdio_s *priv = arg;
+  worker_t callback = priv->callback;
+  FAR void *callback_arg = priv->callback_arg;
+  sdio_eventset_t events = priv->callback_events;
+  int ret;
+
+  priv->callback_events = 0;
+  if (callback == NULL || (events & SDIOMEDIA_INSERTED) == 0)
+    {
+      return;
+    }
+
+  ret = sdio_recover_hw(priv);
+  if (ret < 0)
+    {
+      printf("SDIO host recovery failed, error=%d\n", ret);
+      return;
+    }
+
+  printf("SDIO host recovered; retrying fixed-media probe\n");
+  callback(callback_arg);
+}
+#endif
 
 static void sdio_reset_data_state(void)
 {
@@ -649,16 +701,19 @@ static void sdio_callbackenable(FAR struct sdio_dev_s *dev,
   FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
 
 #if defined(CONFIG_SCHED_WORKQUEUE) && defined(CONFIG_SCHED_HPWORK)
+  int ret;
+
   priv->callback_events = eventset;
   if (priv->callback != NULL &&
       (eventset & SDIOMEDIA_INSERTED) != 0 &&
       (sdio_status(dev) & SDIO_STATUS_PRESENT) != 0)
     {
-      worker_t callback = priv->callback;
-      FAR void *arg = priv->callback_arg;
-
-      priv->callback_events = 0;
-      callback(arg);
+      ret = work_queue(HPWORK, &priv->callback_work,
+                       sdio_callback_worker, priv, MSEC2TICK(100));
+      if (ret < 0)
+        {
+          printf("SDIO media probe retry queue failed, error=%d\n", ret);
+        }
     }
 #else
   (void)eventset;
@@ -719,19 +774,17 @@ FAR struct sdio_dev_s *bk7258_sdio_initialize(int slotno)
 
   if (!g_sdio.initialized)
     {
-      ret = bk7258_sdio_clock_request(true);
+      memset(&g_sdio, 0, sizeof(g_sdio));
+      memcpy(&g_sdio.dev, &g_sdio_template, sizeof(g_sdio.dev));
+      nxmutex_init(&g_sdio.dev.mutex);
+      nxsem_init(&g_sdio.data_sem, 0, 0);
+
+      ret = sdio_recover_hw(&g_sdio);
       if (ret < 0)
         {
           return NULL;
         }
 
-      memset(&g_sdio, 0, sizeof(g_sdio));
-      memcpy(&g_sdio.dev, &g_sdio_template, sizeof(g_sdio.dev));
-      nxmutex_init(&g_sdio.dev.mutex);
-      nxsem_init(&g_sdio.data_sem, 0, 0);
-      sdio_pinmux();
-      sdio_reset_hw(&g_sdio);
-      modifyreg32(BK7258_SDIO_FIFO, 0, BK7258_SDIO_CLOCK_GATE);
       g_sdio.initialized = true;
     }
 

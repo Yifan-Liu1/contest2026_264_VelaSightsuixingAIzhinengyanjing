@@ -13,8 +13,12 @@
 #include <nuttx/fs/fs.h>
 #include <nuttx/mmcsd.h>
 #include <nuttx/sdio.h>
+#include <nuttx/signal.h>
 
 #include "bk7258_sdio.h"
+
+#define BK7258_MMCSD_PROBE_WAIT_MS 7000
+#define BK7258_MMCSD_PROBE_POLL_US 250000
 
 #ifdef CONFIG_MBR_PARTITION
 static void bk7258_partition_handler(FAR struct partition_s *part,
@@ -55,6 +59,22 @@ int bk7258_mmcsd_initialize(void)
     }
 
   ret = open_blockdriver("/dev/mmcsd0", MS_RDONLY, &inode);
+  if (ret == -ENOENT)
+    {
+      unsigned int elapsed;
+
+      for (elapsed = 0; elapsed < BK7258_MMCSD_PROBE_WAIT_MS;
+           elapsed += BK7258_MMCSD_PROBE_POLL_US / 1000)
+        {
+          nxsig_usleep(BK7258_MMCSD_PROBE_POLL_US);
+          ret = open_blockdriver("/dev/mmcsd0", MS_RDONLY, &inode);
+          if (ret != -ENOENT)
+            {
+              break;
+            }
+        }
+    }
+
   if (ret < 0)
     {
       printf("MMCSD probe did not register /dev/mmcsd0, error=%d\n", ret);
