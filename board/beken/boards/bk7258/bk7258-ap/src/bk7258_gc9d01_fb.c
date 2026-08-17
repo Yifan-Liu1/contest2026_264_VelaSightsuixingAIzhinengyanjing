@@ -579,6 +579,95 @@ int bk7258_gc9d01_fb_hello_animate(int displays, int steps)
 }
 
 /****************************************************************************
+ * Name: bk7258_gc9d01_fb_text / bk7258_gc9d01_fb_two_lines
+ *
+ * Description:
+ *   Draw one word, or two lines, and push once.  These are what the
+ *   event-driven status screen uses (bk7258_status_screen.c): the product
+ *   spec forbids a live preview and asks for a state plus a one-or-two-line
+ *   summary, refreshed only when it changes.
+ *
+ *   Sized to the panel rather than to the text: a 160x160 round display shows
+ *   roughly six characters per line at a legible stroke width, so callers
+ *   are expected to have shortened the text already.  Text the font cannot
+ *   draw returns -EINVAL instead of an empty screen.
+ *
+ ****************************************************************************/
+
+static int gc9d01_fb_lines(int display, FAR const char *const *lines,
+                           int nlines, uint16_t fg)
+{
+  FAR struct gc9d01_fb_s *priv;
+  struct hs_style_s st;
+  int i;
+
+  if (display < 0 || display >= GC9D01_NDISPLAYS || nlines < 1)
+    {
+      return -EINVAL;
+    }
+
+  priv = &g_gc9d01_fb[display];
+  if (priv->fbmem == NULL)
+    {
+      return -ENODEV;
+    }
+
+  memset(&st, 0, sizeof(st));
+  st.fg = fg;
+  st.bg = 0x0000u;
+  st.em16 = (nlines > 1 ? 26 : 44) * 16;
+  st.thick16 = (nlines > 1 ? 2 : 3) * 16;
+  st.cx16 = (GC9D01_XRES / 2) * 16;
+
+  hs_clear(priv->fbmem, GC9D01_STRIDE, GC9D01_XRES, GC9D01_YRES, &st);
+
+  for (i = 0; i < nlines; i++)
+    {
+      int32_t total;
+
+      if (lines[i] == NULL || lines[i][0] == '\0')
+        {
+          continue;
+        }
+
+      /* Baselines: one line centred, two lines split around the centre. */
+
+      st.baseline16 = nlines > 1 ?
+                      ((GC9D01_YRES / 2) + (i == 0 ? -6 : 30)) * 16 :
+                      ((GC9D01_YRES / 2) + 16) * 16;
+
+      total = hs_measure(lines[i], &st, NULL);
+      if (total <= 0)
+        {
+          return -EINVAL;
+        }
+
+      hs_stroke(priv->fbmem, GC9D01_STRIDE, GC9D01_XRES, GC9D01_YRES,
+                lines[i], &st, 0, total);
+    }
+
+  return gc9d01_push(priv);
+}
+
+int bk7258_gc9d01_fb_text(int display, FAR const char *text, uint16_t colour)
+{
+  FAR const char *lines[1];
+
+  lines[0] = text;
+  return gc9d01_fb_lines(display, lines, 1, colour);
+}
+
+int bk7258_gc9d01_fb_two_lines(int display, FAR const char *line1,
+                               FAR const char *line2)
+{
+  FAR const char *lines[2];
+
+  lines[0] = line1;
+  lines[1] = line2;
+  return gc9d01_fb_lines(display, lines, 2, 0xffffu);
+}
+
+/****************************************************************************
  * Name: bk7258_gc9d01_fb_test_pattern
  *
  * Description:

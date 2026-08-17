@@ -20,6 +20,7 @@ endif()
 
 if(CONFIG_BK7258_GC9D01_FB)
   list(APPEND SRCS bk7258_gc9d01_fb.c
+    bk7258_status_screen.c
     hello_paint.c
     hello_font.c)
 endif()

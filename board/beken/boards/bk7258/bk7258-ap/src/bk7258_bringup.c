@@ -19,6 +19,7 @@
 #include "bk7258_psram.h"
 #include "bk7258_ramdisk.h"
 #include "bk7258_gc9d01_fb.h"
+#include "bk7258_status_screen.h"
 #include "hardware/bk7258_mbox.h"
 #include "bk7258_wifi.h"
 
@@ -400,6 +401,14 @@ void board_late_initialize(void)
 
   (void)bk7258_jpeg_enc_initialize();
 #endif
+
+  /* Leave the panels showing the product's own idle state rather than the
+   * boot greeting.  From here on the screen is event driven: it is repainted
+   * when a state or a result changes and at no other time, which is what the
+   * spec requires ("屏幕仅事件触发刷新，不运行实时 Camera Preview").
+   */
+
+  (void)bk7258_status_screen_state(BK7258_STATUS_IDLE);
 
 #ifdef CONFIG_BK7258_BLUETOOTH
   /* Last, so that nothing a user can see waits on the radio.  See

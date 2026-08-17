@@ -14,7 +14,7 @@ CSRCS += bk7258_leds.c
 CSRCS += bk7258_gc9d01.c
 
 ifeq ($(CONFIG_BK7258_GC9D01_FB),y)
-CSRCS += bk7258_gc9d01_fb.c hello_paint.c hello_font.c
+CSRCS += bk7258_gc9d01_fb.c bk7258_status_screen.c hello_paint.c hello_font.c
 endif
 CSRCS += bk7258_ramdisk.c
 CSRCS += bk7258_camera_imgsensor.c
