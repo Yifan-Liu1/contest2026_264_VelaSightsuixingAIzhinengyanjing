@@ -27,14 +27,57 @@ set -u
 # ############################################################################
 # 改这一行：你的工作区根目录（里面应有 tools/ 和 bk_avdk_smp/）
 # ############################################################################
-ROOT=/home/mi/vela_competition_ap_console_dev
+# Found by walking up from this script until a bk_loader turns up, the same way
+# the project's own autoflash.sh does it.
+#
+# It used to be written down as a literal path.  That breaks the moment the
+# workspace is renamed, and it breaks in the worst possible way if a directory
+# still exists at the old name: the script keeps working and flashes that
+# tree's all-app.bin, so every marker says success while the board runs
+# something other than what was just built.
+#
+# Counting "../.." up to the root would fix the rename and still hard-code how
+# deep this file sits, which is one more thing to get wrong when a skill moves.
+# Searching for the thing that has to be there instead cannot go wrong quietly:
+# it either finds a bk_loader or says it found none.
+find_root() {
+  local dir
+  dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+  while [ "$dir" != "/" ]; do
+    if [ -x "$dir/tools/bk_loader" ] || [ -x "$dir/bk_loader" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+
+    dir=$(dirname -- "$dir")
+  done
+
+  return 1
+}
+
+ROOT=$(find_root)
 
 # 也可以不改文件，临时用环境变量覆盖：
 #   VELA_WS=/your/workspace ./autoflash.sh
 ROOT="${VELA_WS:-$ROOT}"
 
+# Say so here rather than letting an empty ROOT turn into a path that starts
+# with a slash and a message about a missing tool.
+if [ -z "$ROOT" ]; then
+  echo "错误: 从脚本位置往上找不到 bk_loader，无法确定工作区根目录。" >&2
+  echo "      用 VELA_WS=/your/workspace 指定，或确认 tools/bk_loader 存在。" >&2
+  exit 1
+fi
+
 # 下面两个路径由 ROOT 派生，通常不用改。
-LOADER="$ROOT/tools/bk_loader"
+# find_root 接受两种位置，这里跟着它，不要写死一种。
+if [ -x "$ROOT/tools/bk_loader" ]; then
+  LOADER="$ROOT/tools/bk_loader"
+else
+  LOADER="$ROOT/bk_loader"
+fi
+
 DEFAULT_IMAGE="$ROOT/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin"
 
 # app_ab's partition layout for BK7258 is a fixed size, so a differently sized
