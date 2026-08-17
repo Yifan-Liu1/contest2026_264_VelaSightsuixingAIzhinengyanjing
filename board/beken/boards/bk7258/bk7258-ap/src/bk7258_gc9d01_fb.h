@@ -52,6 +52,17 @@
 
 int bk7258_gc9d01_panel_init(int display);
 
+/* Same, for a bitmask of panels at once.  Worth having because the sequence
+ * is almost entirely waiting -- 20ms rail, 230ms reset pulse, 120ms after
+ * Sleep Out -- and those waits belong to the panels, not to the bus: done
+ * per panel they cost 350ms each, done together they cost 350ms in total.
+ * Panels already initialised are skipped, so calling this for both panels
+ * from bring-up and then letting up_fbinitialize() ask again per display is
+ * safe.
+ */
+
+int bk7258_gc9d01_panels_init(int displays);
+
 /* Which LCD bus a display is wired to; negative on a bad index. */
 
 int bk7258_gc9d01_bus(int display);

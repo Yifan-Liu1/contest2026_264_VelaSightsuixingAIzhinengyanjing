@@ -50,6 +50,63 @@ int bk7258_power_key_motor_start(void);
 int bk7258_gc9d01_test(int argc, char **argv);
 int bk7258_camera_initialize(void);
 
+#ifdef CONFIG_BK7258_BLUETOOTH
+/****************************************************************************
+ * Name: bk7258_bt_bringup
+ *
+ * Description:
+ *   Bluetooth transport, host registration and (optionally) the GATT
+ *   fixture.  Deliberately NOT called from bk7258_bringup(): it only needs
+ *   the mailbox and PWC, which bk7258_bringup() has already finished, and
+ *   everything it does happens before the panels would otherwise light up.
+ *   Registering the host cost the boot greeting its head start, and a radio
+ *   that comes up a moment later is not something a user can see, whereas a
+ *   screen that stays dark is.  Called from board_late_initialize() after
+ *   the display instead.
+ *
+ *   Best-effort by the same argument: a Bluetooth failure used to abort
+ *   bring-up and take the console, camera and panels down with it.
+ *
+ ****************************************************************************/
+
+static void bk7258_bt_bringup(void)
+{
+  int ret;
+
+  ret = bk7258_bt_transport_initialize();
+  if (ret < 0)
+    {
+      printf("Bluetooth transport initialization failed, error=%d\n", ret);
+      return;
+    }
+
+#  ifdef CONFIG_BK7258_BT_RAW_SELFTEST
+  ret = bk7258_bt_raw_selftest_run();
+  if (ret < 0)
+    {
+      printf("Bluetooth raw self-test failed, error=%d\n", ret);
+    }
+#  else
+  ret = bk7258_bt_driver_register();
+  if (ret < 0)
+    {
+      printf("Bluetooth Host registration failed, error=%d\n", ret);
+      bk7258_bt_transport_dump_stats();
+      bk7258_mailbox_dump_stats();
+      return;
+    }
+
+#  ifdef CONFIG_BK7258_BT_GATT_TEST
+  ret = bk7258_bt_gatt_test_initialize();
+  if (ret < 0)
+    {
+      printf("Bluetooth GATT fixture failed, error=%d\n", ret);
+    }
+#  endif
+#  endif
+}
+#endif
+
 int bk7258_bringup(void)
 {
   uint32_t button_count;
@@ -100,42 +157,6 @@ int bk7258_bringup(void)
     {
       return ret;
     }
-
-#ifdef CONFIG_BK7258_BLUETOOTH
-  ret = bk7258_bt_transport_initialize();
-  if (ret < 0)
-    {
-      printf("Bluetooth transport initialization failed, error=%d\n", ret);
-      return ret;
-    }
-
-#  ifdef CONFIG_BK7258_BT_RAW_SELFTEST
-  ret = bk7258_bt_raw_selftest_run();
-  if (ret < 0)
-    {
-      printf("Bluetooth raw self-test failed, error=%d\n", ret);
-      return ret;
-    }
-#  else
-  ret = bk7258_bt_driver_register();
-  if (ret < 0)
-    {
-      printf("Bluetooth Host registration failed, error=%d\n", ret);
-      bk7258_bt_transport_dump_stats();
-      bk7258_mailbox_dump_stats();
-      return ret;
-    }
-
-#  ifdef CONFIG_BK7258_BT_GATT_TEST
-  ret = bk7258_bt_gatt_test_initialize();
-  if (ret < 0)
-    {
-      printf("Bluetooth GATT fixture failed, error=%d\n", ret);
-      return ret;
-    }
-#  endif
-#  endif
-#endif
 
 #ifdef CONFIG_BK7258_WIFI
   ret = bk7258_wifi_initialize();
@@ -281,6 +302,17 @@ void board_late_initialize(void)
     int display;
     int registered = 0;
 
+    /* Both panels through reset and the command table in one pass, before
+     * fb_register() asks for either of them.  The sequence is nearly all
+     * waiting (20ms rail, 230ms reset pulse, 120ms after Sleep Out) and the
+     * waits are the panels', not the bus's, so sharing them across the two
+     * panels takes ~350ms off the time to the first pixel.  fb_register()
+     * still calls up_fbinitialize() -> bk7258_gc9d01_panel_init(), which
+     * finds its panel already up and returns.
+     */
+
+    (void)bk7258_gc9d01_panels_init((1 << GC9D01_NDISPLAYS) - 1);
+
     for (display = 0; display < GC9D01_NDISPLAYS; display++)
       {
         ret = fb_register(display, 0);
@@ -300,10 +332,14 @@ void board_late_initialize(void)
      * has never been evidence that it worked; something has to be drawn at
      * boot or a dead panel looks exactly like a working one.
      *
-     * Both panels are revealed together, one column band per step, so the
-     * word is written left to right.  The cost is real -- each step pushes a
-     * full frame to both panels -- so it is bounded to a few hundred
-     * milliseconds and measured in the log.
+     * Both panels are revealed together, one stroke segment per step, so the
+     * word is written left to right.  The step count is the whole cost: the
+     * panel takes no partial update, so every step pushes a full 51200-byte
+     * frame to each panel at ~25ms, and the stroke rendering adds to that.
+     * 20 steps measured 1677ms and was by itself most of the delay between
+     * reset and a readable screen; 8 steps measured 408ms on the same board
+     * and still reads as writing rather than appearing.  Keep it at 8 unless
+     * there is a measurement to justify more.
      *
      * The pen-stroke version of this lives in the 'hello' shell command,
      * which has a proper stroke font.  It cannot be reused here: it is an
@@ -313,7 +349,7 @@ void board_late_initialize(void)
 
     if (registered != 0)
       {
-        (void)bk7258_gc9d01_fb_hello_animate(registered, 20);
+        (void)bk7258_gc9d01_fb_hello_animate(registered, 8);
       }
   }
 #endif
@@ -350,5 +386,13 @@ void board_late_initialize(void)
    */
 
   (void)bk7258_jpeg_enc_initialize();
+#endif
+
+#ifdef CONFIG_BK7258_BLUETOOTH
+  /* Last, so that nothing a user can see waits on the radio.  See
+   * bk7258_bt_bringup() above for why this is not part of bk7258_bringup().
+   */
+
+  bk7258_bt_bringup();
 #endif
 }

@@ -143,6 +143,14 @@ static const struct gc9d01_panel_s g_panels[GC9D01_NDISPLAYS] =
 
 static bool g_rail_held;
 
+/* Which panels have already been through the reset and command sequence.
+ * fb_register() -> up_fbinitialize() asks for its own display again after
+ * bring-up has initialised both together, and re-sending the sequence would
+ * reset the glass mid-greeting.
+ */
+
+static bool g_panel_ready[GC9D01_NDISPLAYS];
+
 /* All 50 entries of gc9d01_init_cmds, in order, including the delay marker
  * and the trailing Display On.  Earlier revisions of this file omitted 20
  * of them -- 11 because the old bus driver could not carry more than 4
@@ -225,15 +233,46 @@ static const struct gc9d01_init_cmd g_gc9d01_init_cmds[] =
  *   same bk_avdk_smp codebase (lcd_st7701s.c:48, lcd_nt35512.c:859,
  *   lcd_st7789v.c:167 all use rtos_delay_milliseconds(120) post-reset).
  *
+ *   Every panel in the mask is pulsed together, because all three waits are
+ *   the panel's own settling time and not bus occupancy: two panels on
+ *   separate RESET pins and separate QSPI buses have no reason to wait one
+ *   after the other.  Doing them in series cost 230ms per panel and was
+ *   half of the delay between reset and the first pixel on the glass.
+ *
  ****************************************************************************/
 
-static void gc9d01_hw_reset(unsigned int reset_pin)
+static void gc9d01_hw_reset(int displays)
 {
-  bk7258_gpio_output(reset_pin, true);
+  int display;
+
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
+    {
+      if ((displays & (1 << display)) != 0)
+        {
+          bk7258_gpio_output(g_panels[display].reset_pin, true);
+        }
+    }
+
   up_mdelay(10);
-  bk7258_gpio_write(reset_pin, false);
+
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
+    {
+      if ((displays & (1 << display)) != 0)
+        {
+          bk7258_gpio_write(g_panels[display].reset_pin, false);
+        }
+    }
+
   up_mdelay(100);
-  bk7258_gpio_write(reset_pin, true);
+
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
+    {
+      if ((displays & (1 << display)) != 0)
+        {
+          bk7258_gpio_write(g_panels[display].reset_pin, true);
+        }
+    }
+
   up_mdelay(120);
 }
 
@@ -301,17 +340,29 @@ void bk7258_gc9d01_backlight(bool on)
   bk7258_gpio_output(GC9D01_BACKLIGHT_PIN, on);
 }
 
-int bk7258_gc9d01_panel_init(int display)
+int bk7258_gc9d01_panels_init(int displays)
 {
-  const struct gc9d01_panel_s *panel;
+  int pending = 0;
+  int display;
   size_t i;
 
-  if (display < 0 || display >= GC9D01_NDISPLAYS)
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
     {
-      return -EINVAL;
+      if ((displays & (1 << display)) != 0 && !g_panel_ready[display])
+        {
+          pending |= 1 << display;
+        }
     }
 
-  panel = &g_panels[display];
+  if (pending == 0)
+    {
+      /* Either nothing was asked for, or every panel asked for is already
+       * up: up_fbinitialize() calls this again per display after bring-up
+       * has done both, and re-running the sequence would blank the glass.
+       */
+
+      return (displays & ((1 << GC9D01_NDISPLAYS) - 1)) != 0 ? OK : -EINVAL;
+    }
 
   /* Power first, and only once: the rail is shared, so take a reference on
    * behalf of the display subsystem as a whole rather than per panel.
@@ -324,14 +375,35 @@ int bk7258_gc9d01_panel_init(int display)
       up_mdelay(GC9D01_LDO_SETTLE_MS);
     }
 
-  printf("gc9d01[%d/%s]: hardware reset (RST=GPIO%u)\n", display,
-         panel->footprint, (unsigned int)panel->reset_pin);
-  gc9d01_hw_reset(panel->reset_pin);
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
+    {
+      if ((pending & (1 << display)) != 0)
+        {
+          printf("gc9d01[%d/%s]: hardware reset (RST=GPIO%u)\n", display,
+                 g_panels[display].footprint,
+                 (unsigned int)g_panels[display].reset_pin);
+        }
+    }
 
-  bk7258_lcd_spi_init(panel->bus, panel->dc_pin);
+  gc9d01_hw_reset(pending);
 
-  printf("gc9d01[%d/%s]: sending %u init entries\n", display,
-         panel->footprint, (unsigned int)GC9D01_INIT_CMD_COUNT);
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
+    {
+      if ((pending & (1 << display)) != 0)
+        {
+          bk7258_lcd_spi_init(g_panels[display].bus,
+                              g_panels[display].dc_pin);
+          printf("gc9d01[%d/%s]: sending %u init entries\n", display,
+                 g_panels[display].footprint,
+                 (unsigned int)GC9D01_INIT_CMD_COUNT);
+        }
+    }
+
+  /* One pass over the command table, feeding every panel from it.  The table
+   * is walked once rather than once per panel so that its delay marker --
+   * the 120ms the controller needs after Sleep Out -- is waited out once for
+   * all of them instead of once each.
+   */
 
   for (i = 0; i < GC9D01_INIT_CMD_COUNT; i++)
     {
@@ -343,18 +415,56 @@ int bk7258_gc9d01_panel_init(int display)
           continue;
         }
 
-      if (!bk7258_lcd_spi_write_cmd_data(panel->bus, entry->cmd,
-                                         entry->data, entry->data_len))
+      for (display = 0; display < GC9D01_NDISPLAYS; display++)
         {
-          printf("gc9d01[%d]: cmd 0x%02x (entry %u) timed out, aborting\n",
-                 display, entry->cmd, (unsigned int)i);
+          if ((pending & (1 << display)) == 0)
+            {
+              continue;
+            }
+
+          if (!bk7258_lcd_spi_write_cmd_data(g_panels[display].bus,
+                                             entry->cmd, entry->data,
+                                             entry->data_len))
+            {
+              printf("gc9d01[%d]: cmd 0x%02x (entry %u) timed out, "
+                     "aborting\n", display, entry->cmd, (unsigned int)i);
+
+              /* Drop this panel and keep going: on a two-panel board one
+               * dead bus must not cost the other panel its init sequence.
+               */
+
+              pending &= ~(1 << display);
+            }
+        }
+
+      if (pending == 0)
+        {
           return -EIO;
         }
     }
 
-  if (!bk7258_gc9d01_window_full(display))
+  for (display = 0; display < GC9D01_NDISPLAYS; display++)
     {
-      printf("gc9d01[%d]: CASET/RASET failed\n", display);
+      if ((pending & (1 << display)) == 0)
+        {
+          continue;
+        }
+
+      if (!bk7258_gc9d01_window_full(display))
+        {
+          printf("gc9d01[%d]: CASET/RASET failed\n", display);
+          pending &= ~(1 << display);
+          continue;
+        }
+
+      g_panel_ready[display] = true;
+
+      printf("gc9d01[%d/%s]: init sequence sent, backlight on\n", display,
+             g_panels[display].footprint);
+    }
+
+  if (pending == 0)
+    {
       return -EIO;
     }
 
@@ -364,9 +474,17 @@ int bk7258_gc9d01_panel_init(int display)
 
   bk7258_gc9d01_backlight(true);
 
-  printf("gc9d01[%d/%s]: init sequence sent, backlight on\n", display,
-         panel->footprint);
   return OK;
+}
+
+int bk7258_gc9d01_panel_init(int display)
+{
+  if (display < 0 || display >= GC9D01_NDISPLAYS)
+    {
+      return -EINVAL;
+    }
+
+  return bk7258_gc9d01_panels_init(1 << display);
 }
 
 /****************************************************************************
