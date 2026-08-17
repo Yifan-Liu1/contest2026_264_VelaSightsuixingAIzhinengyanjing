@@ -361,8 +361,6 @@ static int sdio_recv_r1(FAR struct sdio_dev_s *dev, uint32_t cmd,
     }
 
   *value = sdio_read(BK7258_SDIO_RESPONSE(0));
-  printf("SDIO R1 CMD%u=0x%08lx\n", (unsigned)(cmd & MMCSD_CMDIDX_MASK),
-         (unsigned long)*value);
   return OK;
 }
 
@@ -385,10 +383,6 @@ static int sdio_recv_r2(FAR struct sdio_dev_s *dev, uint32_t cmd,
   value[1] = sdio_read(BK7258_SDIO_RESPONSE(1));
   value[2] = sdio_read(BK7258_SDIO_RESPONSE(2));
   value[3] = sdio_read(BK7258_SDIO_RESPONSE(3));
-  printf("SDIO R2 CMD%u=%08lx %08lx %08lx %08lx\n",
-         (unsigned)(cmd & MMCSD_CMDIDX_MASK), (unsigned long)value[0],
-         (unsigned long)value[1], (unsigned long)value[2],
-         (unsigned long)value[3]);
   return OK;
 }
 
@@ -566,9 +560,6 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
    * the receive engine; without it the receive-end event can be missed. */
 
   nxsig_usleep(2000);
-  printf("SDIO data setup block=%lu count=%lu bytes=%lu\n",
-         (unsigned long)priv->blocklen, (unsigned long)priv->nblocks,
-         (unsigned long)nbytes);
   return OK;
 }
 
@@ -674,8 +665,6 @@ static sdio_eventset_t sdio_eventwait(FAR struct sdio_dev_s *dev)
   else if (sdio_drain_fifo(priv) == OK && priv->remaining == 0)
     {
       priv->wake_events = SDIOWAIT_TRANSFERDONE;
-      printf("SDIO data complete status=0x%08lx event=0x%x\n",
-             (unsigned long)status, priv->wake_events);
     }
   else
     {

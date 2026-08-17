@@ -1,0 +1,7 @@
+############################################################################
+# BK7258 manual SD-NAND initialization - Make.defs
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_264_SDNAND_INIT),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_264_sdnand_init
+endif

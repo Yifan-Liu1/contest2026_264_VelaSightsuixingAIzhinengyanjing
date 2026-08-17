@@ -45,4 +45,14 @@ config BK7258_BT_GATT_TEST
 		Register a test-only GATT service with read/write and notification
 		characteristics. Keep this disabled in production images.
 
+config BK7258_SDIO_AUTOINIT_DELAY_MS
+	int "SD-NAND asynchronous initialization delay (ms)"
+	default 5000
+	range 0 60000
+	depends on BK7258_SDIO && SCHED_LPWORK
+	help
+		Schedule fixed SD-NAND initialization on LPWORK after this delay.
+		Board bring-up continues immediately. The default reflects the measured
+		physical-reset test where initialization succeeded after startup settled.
+
 endif

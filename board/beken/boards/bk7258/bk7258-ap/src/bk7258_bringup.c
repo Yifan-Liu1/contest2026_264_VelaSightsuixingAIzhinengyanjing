@@ -109,6 +109,7 @@ static void bk7258_bt_bringup(void)
 
 #ifdef CONFIG_BK7258_SDIO
 int bk7258_mmcsd_initialize(void);
+int bk7258_mmcsd_schedule(unsigned int delay_ms);
 #endif
 
 int bk7258_bringup(void)
@@ -163,10 +164,11 @@ int bk7258_bringup(void)
     }
 
 #ifdef CONFIG_BK7258_SDIO
-  ret = bk7258_mmcsd_initialize();
+  ret = bk7258_mmcsd_schedule(CONFIG_BK7258_SDIO_AUTOINIT_DELAY_MS);
   if (ret < 0)
     {
-      printf("SD-NAND bring-up failed, error=%d\n", ret);
+      printf("SD-NAND delayed initialization schedule failed, error=%d\n",
+             ret);
     }
 #endif
 #ifdef CONFIG_BK7258_WIFI

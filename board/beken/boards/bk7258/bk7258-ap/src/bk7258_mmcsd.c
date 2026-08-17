@@ -12,13 +12,27 @@
 #include <nuttx/fs/partition.h>
 #include <nuttx/fs/fs.h>
 #include <nuttx/mmcsd.h>
+#include <nuttx/mutex.h>
 #include <nuttx/sdio.h>
 #include <nuttx/signal.h>
+#include <nuttx/wqueue.h>
 
 #include "bk7258_sdio.h"
 
 #define BK7258_MMCSD_PROBE_WAIT_MS 7000
 #define BK7258_MMCSD_PROBE_POLL_US 250000
+
+enum bk7258_mmcsd_state_e
+{
+  BK7258_MMCSD_NOT_STARTED = 0,
+  BK7258_MMCSD_RUNNING,
+  BK7258_MMCSD_COMPLETE
+};
+
+static mutex_t g_mmcsd_lock = NXMUTEX_INITIALIZER;
+static struct work_s g_mmcsd_work;
+static enum bk7258_mmcsd_state_e g_mmcsd_state;
+static int g_mmcsd_result = -EAGAIN;
 
 #ifdef CONFIG_MBR_PARTITION
 static void bk7258_partition_handler(FAR struct partition_s *part,
@@ -38,7 +52,7 @@ static void bk7258_partition_handler(FAR struct partition_s *part,
 }
 #endif
 
-int bk7258_mmcsd_initialize(void)
+static int bk7258_mmcsd_probe(void)
 {
   FAR struct sdio_dev_s *dev;
   FAR struct inode *inode;
@@ -95,4 +109,85 @@ int bk7258_mmcsd_initialize(void)
 #endif
 
   return OK;
+}
+
+int bk7258_mmcsd_initialize(void)
+{
+  FAR struct inode *inode;
+  int ret;
+
+  ret = nxmutex_lock(&g_mmcsd_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (g_mmcsd_state == BK7258_MMCSD_COMPLETE)
+    {
+      ret = open_blockdriver("/dev/mmcsd0", MS_RDONLY, &inode);
+      if (ret == OK)
+        {
+          close_blockdriver(inode);
+        }
+      else
+        {
+          ret = g_mmcsd_result;
+        }
+
+      nxmutex_unlock(&g_mmcsd_lock);
+      return ret;
+    }
+
+  g_mmcsd_state = BK7258_MMCSD_RUNNING;
+  ret = bk7258_mmcsd_probe();
+  g_mmcsd_result = ret;
+  g_mmcsd_state = BK7258_MMCSD_COMPLETE;
+  nxmutex_unlock(&g_mmcsd_lock);
+  return ret;
+}
+
+static void bk7258_mmcsd_worker(FAR void *arg)
+{
+  int ret;
+
+  (void)arg;
+  printf("SD-NAND delayed initialization begin\n");
+  ret = bk7258_mmcsd_initialize();
+  if (ret < 0)
+    {
+      printf("SD-NAND delayed initialization failed, error=%d\n", ret);
+    }
+  else
+    {
+      printf("SD-NAND delayed initialization complete\n");
+    }
+}
+
+int bk7258_mmcsd_schedule(unsigned int delay_ms)
+{
+  int ret;
+
+  ret = nxmutex_lock(&g_mmcsd_lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (g_mmcsd_state != BK7258_MMCSD_NOT_STARTED ||
+      !work_available(&g_mmcsd_work))
+    {
+      nxmutex_unlock(&g_mmcsd_lock);
+      return OK;
+    }
+
+  ret = work_queue(LPWORK, &g_mmcsd_work, bk7258_mmcsd_worker, NULL,
+                   MSEC2TICK(delay_ms));
+  nxmutex_unlock(&g_mmcsd_lock);
+
+  if (ret == OK)
+    {
+      printf("SD-NAND initialization scheduled in %u ms\n", delay_ms);
+    }
+
+  return ret;
 }
