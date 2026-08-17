@@ -1023,11 +1023,18 @@ int bk7258_aud_adc_setup(const struct bk7258_aud_config *cfg)
 
   flags = enter_critical_section();
 
+  /* The two bypass bits join the clear mask so they can be turned off.
+   * Previously they were only ever set, which made the high-pass stages
+   * unreachable no matter what a caller asked for.
+   */
+
   modifyreg32(BK7258_AUD_ADC_CONFIG0,
               BK7258_AUD_ADC_GAIN_MASK | BK7258_AUD_ADC_SAMPLE_EDGE |
-              BK7258_AUD_ADC_DIG_MIC_SEL,
+              BK7258_AUD_ADC_DIG_MIC_SEL |
+              BK7258_AUD_ADC_HPF1_BYPASS | BK7258_AUD_ADC_HPF2_BYPASS,
               ((uint32_t)cfg->adc_gain << BK7258_AUD_ADC_GAIN_SHIFT) |
-              BK7258_AUD_ADC_HPF1_BYPASS | BK7258_AUD_ADC_HPF2_BYPASS);
+              (cfg->adc_hpf ? 0 : (BK7258_AUD_ADC_HPF1_BYPASS |
+                                   BK7258_AUD_ADC_HPF2_BYPASS)));
 
   modifyreg32(BK7258_AUD_FIFO_CONFIG, BK7258_AUD_ADC_WR_THRED_MASK,
               AUD_ADC_WR_THRESHOLD << BK7258_AUD_ADC_WR_THRED_SHIFT);

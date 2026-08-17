@@ -987,6 +987,42 @@ static int bk7258_audio_ioctl(FAR struct audio_lowerhalf_s *dev, int cmd,
         }
         break;
 
+      /* Gain staging for the capture path.  Takes effect at the next
+       * AUDIOIOC_CONFIGURE, which is where adc_setup() runs; applying it to a
+       * stream already running would change the level mid-recording and make
+       * the measurement it exists for meaningless.
+       */
+
+      case BK7258_AUDIOIOC_SET_CAPGAIN:
+        {
+          FAR const struct bk7258_audio_capgain_s *g =
+            (FAR const struct bk7258_audio_capgain_s *)arg;
+
+          if (g == NULL)
+            {
+              return -EINVAL;
+            }
+
+          if (priv->playback)
+            {
+              return -ENOTTY;
+            }
+
+          if (g->mic_gain > BK7258_AUD_MIC_GAIN_MAX ||
+              g->adc_gain > BK7258_AUD_ADC_GAIN_MAX)
+            {
+              return -EINVAL;
+            }
+
+          priv->cfg.mic_gain = g->mic_gain;
+          priv->cfg.adc_gain = g->adc_gain;
+          priv->cfg.adc_hpf  = g->hpf;
+
+          audinfo("capture gain: mic=%u adc=%u hpf=%d\n",
+                  g->mic_gain, g->adc_gain, g->hpf);
+        }
+        break;
+
       /* Diagnostic: dump registers, then read the FIFO by polling so the
        * interrupt path is taken out of the picture entirely.
        */
@@ -1168,6 +1204,14 @@ FAR struct audio_lowerhalf_s *bk7258_audio_dev_initialize(bool playback)
   priv->cfg.dac_ana_gain = BK7258_AUD_DAC_ANA_GAIN_DEF;
   priv->cfg.adc_gain     = BK7258_AUD_ADC_GAIN_0DB;
   priv->cfg.mic_gain     = BK7258_AUD_MIC_GAIN_DEF;
+
+  /* Bypassed, matching the vendor and everything measured so far.  The
+   * high-pass stages are almost certainly the better setting for voice, but
+   * flipping the default before the difference has been measured would mean
+   * every later comparison starts from an unverified baseline.
+   */
+
+  priv->cfg.adc_hpf      = false;
 
 #if defined(CONFIG_BK7258_AUDIO_CAPTURE) && \
     defined(CONFIG_BK7258_AUDIO_AEC_REFERENCE)
