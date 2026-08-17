@@ -37,12 +37,16 @@ config BK7258_SDIO
 	bool "BK7258 SDIO host for onboard SD-NAND"
 	default n
 	select ARCH_HAVE_SDIO
+	select MMCSD_SDIO
+	select SDIO_BLOCKSETUP
 	depends on ARCH_CHIP_BK7258
 	depends on MMCSD
+	depends on MMCSD_MULTIBLOCK_LIMIT = 1
+	depends on SCHED_LPWORK
 	help
 		Enable the GPIO14..GPIO19 SDIO host used by the board's fixed
-		SD-NAND. The first implementation is one-bit, interrupt-assisted
-		PIO and read-only.
+		SD-NAND. The implementation supports one-bit, interrupt-assisted
+		PIO reads and CMD24 single-block writes.
 
 config BK7258_TRNG
 	bool "BK7258 hardware TRNG"

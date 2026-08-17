@@ -38,6 +38,7 @@ struct bk7258_sdio_s
   uint32_t blocklen;
   uint32_t nblocks;
   FAR uint8_t *buffer;
+  FAR const uint8_t *tx_buffer;
   size_t remaining;
   sdio_eventset_t wait_events;
   sdio_eventset_t wake_events;
@@ -48,6 +49,7 @@ struct bk7258_sdio_s
   int last_cmd_result;
   int data_result;
   bool data_active;
+  bool data_write;
   bool irq_attached;
   bool initialized;
   sem_t data_sem;
@@ -174,6 +176,59 @@ static void sdio_reset_data_state(void)
               BK7258_SDIO_STATE_RESET, 0);
 }
 
+static uint32_t sdio_write_status(uint32_t status)
+{
+  return (status & BK7258_SDIO_WRITE_STATUS_MASK) >>
+         BK7258_SDIO_WRITE_STATUS_SHIFT;
+}
+
+static bool sdio_write_accepted(FAR uint32_t *status)
+{
+  unsigned int retry;
+
+  for (retry = 0; retry < 1000; retry++)
+    {
+      *status = sdio_read(BK7258_SDIO_INT_STATUS);
+      if (sdio_write_status(*status) == BK7258_SDIO_WRITE_STATUS_ACCEPTED)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+static int sdio_fill_tx_fifo(FAR struct bk7258_sdio_s *priv)
+{
+  unsigned int timeout;
+
+  while (priv->remaining != 0)
+    {
+      uint32_t word = 0;
+      size_t copy = priv->remaining < sizeof(word) ? priv->remaining :
+                    sizeof(word);
+
+      timeout = 100000;
+      while ((sdio_read(BK7258_SDIO_FIFO) & BK7258_SDIO_TX_READY) == 0)
+        {
+          if (timeout == 0)
+            {
+              return -ETIMEDOUT;
+            }
+
+          timeout--;
+          up_udelay(1);
+        }
+
+      memcpy(&word, priv->tx_buffer, copy);
+      sdio_write(BK7258_SDIO_TX_FIFO, word);
+      priv->tx_buffer += copy;
+      priv->remaining -= copy;
+    }
+
+  return OK;
+}
+
 static int sdio_interrupt(int irq, FAR void *context, FAR void *arg)
 {
   FAR struct bk7258_sdio_s *priv = &g_sdio;
@@ -186,22 +241,48 @@ static int sdio_interrupt(int irq, FAR void *context, FAR void *arg)
 
   status = sdio_read(BK7258_SDIO_INT_STATUS);
   clear = status & (BK7258_SDIO_DATA_RECEIVE_END |
-                    BK7258_SDIO_DATA_TIMEOUT |
-                    BK7258_SDIO_RX_NEED_READ |
-                    BK7258_SDIO_DATA_CRC_OK |
-                    BK7258_SDIO_DATA_CRC_FAIL);
+                     BK7258_SDIO_DATA_WRITE_END |
+                     BK7258_SDIO_DATA_TIMEOUT |
+                     BK7258_SDIO_RX_NEED_READ |
+                     BK7258_SDIO_TX_NEED_WRITE |
+                     BK7258_SDIO_TX_FIFO_EMPTY |
+                     BK7258_SDIO_DATA_CRC_OK |
+                     BK7258_SDIO_DATA_CRC_FAIL);
 
   if (priv->data_active &&
-      (status & (BK7258_SDIO_DATA_RECEIVE_END |
-                 BK7258_SDIO_DATA_TIMEOUT)) != 0)
+      (status & ((priv->data_write ? BK7258_SDIO_DATA_WRITE_END :
+                                    BK7258_SDIO_DATA_RECEIVE_END) |
+                  BK7258_SDIO_DATA_TIMEOUT)) != 0)
     {
+      bool write_accepted = true;
+
+      if (priv->data_write &&
+          (status & BK7258_SDIO_DATA_TIMEOUT) == 0)
+        {
+          write_accepted = sdio_write_accepted(&status);
+          clear = status & (BK7258_SDIO_DATA_RECEIVE_END |
+                            BK7258_SDIO_DATA_WRITE_END |
+                            BK7258_SDIO_DATA_TIMEOUT |
+                            BK7258_SDIO_RX_NEED_READ |
+                            BK7258_SDIO_TX_NEED_WRITE |
+                            BK7258_SDIO_TX_FIFO_EMPTY |
+                            BK7258_SDIO_DATA_CRC_OK |
+                            BK7258_SDIO_DATA_CRC_FAIL);
+        }
+
       priv->irq_status = status;
       if ((status & BK7258_SDIO_DATA_TIMEOUT) != 0)
         {
           priv->data_result = -ETIMEDOUT;
         }
       else if ((status & BK7258_SDIO_DATA_CRC_FAIL) != 0 ||
-               (status & BK7258_SDIO_DATA_CRC_OK) == 0)
+               (!priv->data_write &&
+                (status & BK7258_SDIO_DATA_CRC_OK) == 0))
+        {
+          priv->data_result = -EIO;
+        }
+      else if (priv->data_write &&
+               (priv->remaining != 0 || !write_accepted))
         {
           priv->data_result = -EIO;
         }
@@ -298,11 +379,6 @@ static int sdio_sendcmd(FAR struct sdio_dev_s *dev, uint32_t cmd,
   FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
   uint32_t response;
   uint32_t value;
-
-  if ((cmd & MMCSD_DATAXFR_MASK) == MMCSD_WRDATAXFR)
-    {
-      return -EROFS;
-    }
 
   response = (cmd & MMCSD_RESPONSE_MASK) >> MMCSD_RESPONSE_SHIFT;
   value = ((cmd & MMCSD_CMDIDX_MASK) << BK7258_SDIO_CMD_INDEX_SHIFT);
@@ -422,7 +498,9 @@ static void sdio_reset(FAR struct sdio_dev_s *dev)
 
   sdio_reset_hw(priv);
   priv->data_active = false;
+  priv->data_write = false;
   priv->buffer = NULL;
+  priv->tx_buffer = NULL;
   priv->remaining = 0;
   priv->wait_events = 0;
   priv->wake_events = 0;
@@ -442,7 +520,7 @@ static sdio_capset_t sdio_capabilities(FAR struct sdio_dev_s *dev)
 static sdio_statset_t sdio_status(FAR struct sdio_dev_s *dev)
 {
   (void)dev;
-  return SDIO_STATUS_PRESENT | SDIO_STATUS_WRPROTECTED;
+  return SDIO_STATUS_PRESENT;
 }
 
 static void sdio_widebus(FAR struct sdio_dev_s *dev, bool enable)
@@ -550,6 +628,7 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
   priv->irq_status = 0;
   priv->data_result = -EINPROGRESS;
   priv->data_active = true;
+  priv->data_write = false;
   sdio_write(BK7258_SDIO_DATA_CTRL, value);
   modifyreg32(BK7258_SDIO_INT_MASK, 0,
               BK7258_SDIO_DATA_RECEIVE_END |
@@ -564,12 +643,71 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
 }
 
 static int sdio_sendsetup(FAR struct sdio_dev_s *dev,
-                          FAR const uint8_t *buffer, size_t nbytes)
+                           FAR const uint8_t *buffer, size_t nbytes)
 {
-  (void)dev;
-  (void)buffer;
-  (void)nbytes;
-  return -EOPNOTSUPP;
+  FAR struct bk7258_sdio_s *priv = (FAR struct bk7258_sdio_s *)dev;
+  uint32_t value;
+  int ret;
+
+  if (buffer == NULL || nbytes != 512 || priv->blocklen != 512 ||
+      priv->nblocks != 1)
+    {
+      return -EINVAL;
+    }
+
+  sdio_write(BK7258_SDIO_DATA_TIMER, BK7258_SDIO_TIMEOUT);
+  sdio_write(BK7258_SDIO_INT_STATUS, 0xffffffffu);
+  while (nxsem_trywait(&priv->data_sem) == OK)
+    {
+    }
+
+  value = sdio_read(BK7258_SDIO_FIFO);
+  value &= ~(0xffffu | BK7258_SDIO_FIFO_RX_RESET |
+             BK7258_SDIO_FIFO_TX_RESET | BK7258_SDIO_STATE_RESET |
+             BK7258_SDIO_HOST_WRITE_BLOCK);
+  sdio_write(BK7258_SDIO_FIFO, value);
+
+  value |= 0x0101u | BK7258_SDIO_FIFO_TX_RESET |
+           BK7258_SDIO_STATE_RESET | BK7258_SDIO_CLOCK_RECOVERY;
+  sdio_write(BK7258_SDIO_FIFO, value);
+
+  value = ((priv->blocklen << BK7258_SDIO_DATA_BLOCK_SHIFT) &
+            BK7258_SDIO_DATA_BLOCK_MASK) | BK7258_SDIO_DATA_BYTE_SELECT;
+  sdio_write(BK7258_SDIO_DATA_CTRL, value);
+
+  priv->buffer = NULL;
+  priv->tx_buffer = buffer;
+  priv->remaining = nbytes;
+  priv->irq_status = 0;
+  priv->data_result = -EINPROGRESS;
+  priv->data_active = true;
+  priv->data_write = true;
+
+  ret = sdio_fill_tx_fifo(priv);
+  if (ret < 0)
+    {
+      sdio_write(BK7258_SDIO_DATA_CTRL, 0);
+      modifyreg32(BK7258_SDIO_INT_MASK,
+                  BK7258_SDIO_DATA_WRITE_END |
+                  BK7258_SDIO_DATA_TIMEOUT |
+                  BK7258_SDIO_TX_NEED_WRITE |
+                  BK7258_SDIO_TX_FIFO_EMPTY |
+                  BK7258_SDIO_TX_CLOCK_GATE, 0);
+      sdio_reset_data_state();
+      priv->data_active = false;
+      priv->data_result = ret;
+      priv->tx_buffer = NULL;
+      nxsem_post(&priv->data_sem);
+      return ret;
+    }
+
+  modifyreg32(BK7258_SDIO_INT_MASK, 0,
+              BK7258_SDIO_DATA_WRITE_END |
+              BK7258_SDIO_DATA_TIMEOUT |
+              BK7258_SDIO_TX_CLOCK_GATE);
+  sdio_write(BK7258_SDIO_DATA_CTRL,
+             value | BK7258_SDIO_DATA_WRITE_ENABLE);
+  return OK;
 }
 
 static int sdio_cancel(FAR struct sdio_dev_s *dev)
@@ -578,11 +716,16 @@ static int sdio_cancel(FAR struct sdio_dev_s *dev)
 
   sdio_write(BK7258_SDIO_DATA_CTRL, 0);
   modifyreg32(BK7258_SDIO_INT_MASK,
-              BK7258_SDIO_DATA_RECEIVE_END |
-              BK7258_SDIO_DATA_TIMEOUT, 0);
+               BK7258_SDIO_DATA_RECEIVE_END |
+               BK7258_SDIO_DATA_WRITE_END |
+               BK7258_SDIO_DATA_TIMEOUT |
+               BK7258_SDIO_TX_NEED_WRITE |
+               BK7258_SDIO_TX_FIFO_EMPTY |
+               BK7258_SDIO_TX_CLOCK_GATE, 0);
   sdio_write(BK7258_SDIO_INT_STATUS, 0xffffffffu);
   priv->data_active = false;
   priv->buffer = NULL;
+  priv->tx_buffer = NULL;
   priv->remaining = 0;
   priv->wake_events = SDIOWAIT_ERROR;
   priv->data_result = -ECANCELED;
@@ -609,15 +752,15 @@ static int sdio_drain_fifo(FAR struct bk7258_sdio_s *priv)
       size_t copy = priv->remaining < sizeof(word) ? priv->remaining :
                     sizeof(word);
 
-      while ((sdio_read(BK7258_SDIO_FIFO) & BK7258_SDIO_RX_READY) == 0 &&
-             timeout-- != 0)
+      while ((sdio_read(BK7258_SDIO_FIFO) & BK7258_SDIO_RX_READY) == 0)
         {
-          up_udelay(1);
-        }
+          if (timeout == 0)
+            {
+              return -EIO;
+            }
 
-      if (timeout == 0)
-        {
-          return -EIO;
+          timeout--;
+          up_udelay(1);
         }
 
       word = sdio_read(BK7258_SDIO_RX_FIFO);
@@ -662,7 +805,12 @@ static sdio_eventset_t sdio_eventwait(FAR struct sdio_dev_s *dev)
              priv->data_result, (unsigned long)status,
              (unsigned long)priv->remaining);
     }
-  else if (sdio_drain_fifo(priv) == OK && priv->remaining == 0)
+  else if (priv->data_write && priv->remaining == 0)
+    {
+      priv->wake_events = SDIOWAIT_TRANSFERDONE;
+    }
+  else if (!priv->data_write && sdio_drain_fifo(priv) == OK &&
+           priv->remaining == 0)
     {
       priv->wake_events = SDIOWAIT_TRANSFERDONE;
     }
@@ -674,13 +822,19 @@ static sdio_eventset_t sdio_eventwait(FAR struct sdio_dev_s *dev)
     }
 
   modifyreg32(BK7258_SDIO_INT_MASK,
-              BK7258_SDIO_DATA_RECEIVE_END |
-              BK7258_SDIO_DATA_TIMEOUT, 0);
+               BK7258_SDIO_DATA_RECEIVE_END |
+               BK7258_SDIO_DATA_WRITE_END |
+               BK7258_SDIO_DATA_TIMEOUT |
+               BK7258_SDIO_TX_NEED_WRITE |
+               BK7258_SDIO_TX_FIFO_EMPTY |
+               BK7258_SDIO_TX_CLOCK_GATE, 0);
   sdio_reset_data_state();
 
   priv->wait_events = 0;
   priv->buffer = NULL;
+  priv->tx_buffer = NULL;
   priv->remaining = 0;
+  priv->data_write = false;
   return priv->wake_events;
 }
 

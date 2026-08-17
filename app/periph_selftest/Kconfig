@@ -6,11 +6,12 @@
 config LVX_USE_DEMO_CONTEST2026_264_PERIPH_SELFTEST
 	bool "BK7258 peripheral self-test"
 	default n
+	depends on BK7258_SDIO && FS_FAT
 	---help---
 		Enable the periph_selftest NSH command: checks the wlan0 interface
 		is present, reads /proc/version, /proc/uptime and /proc/meminfo,
-		writes through the mailbox UART (/dev/ttyMB0), verifies that PSRAM
-		is online and read/write-consistent, and that systick advances.
+		writes through the mailbox UART (/dev/ttyMB0), verifies PSRAM and
+		persistent SD-NAND storage, and checks that systick advances.
 		Each check prints its own PASS/FAIL line and the command ends with
 		a failure count.
 

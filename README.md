@@ -8,8 +8,8 @@ OpenVela AP，保留物理 CPU0 上的 Armino CP、Bootloader、无线控制器�
 SD-NAND，为随行 AI 智能眼镜提供可复现的系统底座。
 
 项目当前已完成 AP 双核启动、单 UART0 双向控制台、NuttX `wlan0` 网络链路、
-Camera/Audio 基础门禁，以及板载 SD-NAND 的只读 MMCSD/VFAT 链路。SD-NAND
-保持 1-bit、PIO、只读模式，不启用 DMA、4-bit、格式化或写操作。
+Camera/Audio 基础门禁，以及板载 SD-NAND 的可写 MMCSD/VFAT 链路。SD-NAND
+保持 1-bit PIO 和 CMD24 单块写，不启用 DMA、4-bit 或 CMD25 多块写。
 
 ## 二、选题方向
 
@@ -23,7 +23,7 @@ Camera/Audio 基础门禁，以及板载 SD-NAND 的只读 MMCSD/VFAT 链路。S
 - 物理 CPU0 运行 Armino CP，物理 CPU1/CPU2 运行 OpenVela/NuttX SMP。
 - AP 日志和 NSH 输入输出通过 Mailbox V2 转发到 CP UART0，无需额外 USB-TTL。
 - Wi-Fi controller 保留在 CP，OpenVela AP 提供 NuttX `wlan0` 和网络协议栈。
-- SD-NAND 通过 BK7258 SDIO Host 接入 NuttX MMCSD，提供只读 VFAT 访问。
+- SD-NAND 通过 BK7258 SDIO Host 接入 NuttX MMCSD，提供 `/mnt/sdnand` 持久 VFAT。
 - 最终固件通过 Beken 标准分区和 packager 生成 `all-app.bin`。
 
 ## 三、目录结构
@@ -116,8 +116,10 @@ ap_console open
 ```
 
 退出 AP 控制台时先按 `Ctrl-]`，松开后再按 `.`。SD-NAND 会在系统启动后延迟
-5 秒初始化，也可在 NSH 中执行 `sdnand_init` 手动触发。成功后设备节点为
-`/dev/mmcsd0`，MBR 分区为 `/dev/mmcsd0p0`。
+5 秒初始化，并将已有 FAT 自动挂载到 `/mnt/sdnand`；挂载失败只报错，不自动
+格式化。`sdnand_init status` 可查看状态，`sdnand_init provision --confirm` 显式执行
+破坏性 raw 写门禁并整盘重建 FAT32。设备节点为 `/dev/mmcsd0`；已有 MBR 时优先
+使用 `/dev/mmcsd0p0`，整盘 FAT32 使用前者。
 
 ## 五、AI Coding 使用说明
 
@@ -133,7 +135,9 @@ AI Coding 日志。
 ## 六、当前边界
 
 - Bluetooth Host 仍处于方案阶段，未作为已完成功能声明。
-- SD-NAND 当前只读，未启用写入、格式化、DMA、4-bit 或 multiblock。
+- SD-NAND 已通过 CMD24、FAT32 格式化、0/512/4096-byte 文件、rename/unlink 和
+  重启持久化实板门禁；10,000 次随机写、断电、24 小时长稳、DMA、4-bit 和
+  CMD25 multiblock 尚未验收或启用。
 - Secure alias 和 CMSE 是当前功能基线，不等于量产 secure boot 已闭环。
 - 构建成功、打包成功、实板启动和功能验收分别记录，不互相替代。
 

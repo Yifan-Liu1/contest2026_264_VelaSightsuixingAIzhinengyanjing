@@ -4,10 +4,9 @@
 #
 
 config LVX_USE_DEMO_CONTEST2026_264_SDNAND_INIT
-	bool "BK7258 manual SD-NAND initialization"
+	bool "BK7258 SD-NAND storage management"
 	default n
-	depends on BK7258_SDIO
+	depends on BK7258_SDIO && FS_FAT && FSUTILS_MKFATFS
 	---help---
-		Enable the sdnand_init NSH command. The command initializes the fixed
-		SD-NAND through the native SDIO/MMCSD stack after boot, allowing the
-		physical-reset timing issue to be tested independently of board bring-up.
+		Enable the sdnand_init NSH command for initialization, status, mount,
+		unmount and explicit destructive FAT provisioning.

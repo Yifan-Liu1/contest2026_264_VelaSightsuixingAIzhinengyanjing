@@ -20,6 +20,10 @@ CSRCS += bk7258_ramdisk.c
 CSRCS += bk7258_camera_imgsensor.c
 CSRCS += bk7258_camera_bringup.c
 
+ifeq ($(CONFIG_BK7258_SDIO),y)
+CSRCS += bk7258_mmcsd.c
+endif
+
 ifeq ($(CONFIG_BK7258_AUDIO),y)
 CSRCS += bk7258_audio_bringup.c
 CSRCS += bk7258_audio_dev.c

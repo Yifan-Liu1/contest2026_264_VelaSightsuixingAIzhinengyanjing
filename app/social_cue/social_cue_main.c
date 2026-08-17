@@ -70,7 +70,12 @@
  * configuration.  It matches CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR.
  */
 
-#define SC_SKILLS_DIR     "/mnt/ai_agent/skills"
+#ifdef CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR
+#  define SC_DATA_DIR     CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR
+#else
+#  define SC_DATA_DIR     "/mnt/sdnand/ai_agent"
+#endif
+#define SC_SKILLS_DIR     SC_DATA_DIR "/skills"
 #define SC_SKILL_PATH     SC_SKILLS_DIR "/social-cue-assistant.md"
 
 /* One frame, JPEG.  480x480 is the only geometry this sensor driver offers
@@ -535,7 +540,7 @@ static int sc_install_skill(void)
    * to work whether or not it has run yet.
    */
 
-  mkdir("/mnt/ai_agent", 0755);
+  mkdir(SC_DATA_DIR, 0755);
   mkdir(SC_SKILLS_DIR, 0755);
 
   f = fopen(SC_SKILL_PATH, "w");

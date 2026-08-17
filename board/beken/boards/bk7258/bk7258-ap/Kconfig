@@ -55,4 +55,20 @@ config BK7258_SDIO_AUTOINIT_DELAY_MS
 		Board bring-up continues immediately. The default reflects the measured
 		physical-reset test where initialization succeeded after startup settled.
 
+config BK7258_SDNAND_AUTOMOUNT
+	bool "Automatically mount SD-NAND after initialization"
+	default y
+	depends on BK7258_SDIO && FS_FAT
+	help
+		Mount the detected FAT volume after the delayed MMCSD probe succeeds.
+		Mount failures are reported and never trigger an automatic format.
+
+config BK7258_SDNAND_MOUNTPOINT
+	string "SD-NAND persistent mount point"
+	default "/mnt/sdnand"
+	depends on BK7258_SDIO && FS_FAT
+	help
+		Persistent VFAT mount point. The PSRAM-backed /mnt filesystem remains
+		available for volatile files while this child mount stores durable data.
+
 endif

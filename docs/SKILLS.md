@@ -123,7 +123,7 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 | CPU2 NuttX SMP | 已实现基础启动、IPI 和双逻辑 CPU 运行基线 |
 | Wi-Fi wlan0 | 已实现并通过关联、DHCP、DNS、TCP/TLS/HTTPS 实板门禁 |
 | Bluetooth NuttX Host | 方案阶段，未实现 |
-| SDIO / MMCSD / FAT | 只读 1-bit PIO、MMCSD、MBR 和 VFAT 实板通过；写入/DMA/4-bit 未启用 |
+| SDIO / MMCSD / FAT | 可写 1-bit PIO、CMD24、MMCSD、FAT32、自动挂载和重启持久化实板通过；DMA/4-bit/CMD25 未启用，压力与断电门禁未完成 |
 | 量产 secure boot | 未建立 |
 
 构建成功、打包成功、实板启动和功能验收是四个不同状态，不得混写成"完成"。

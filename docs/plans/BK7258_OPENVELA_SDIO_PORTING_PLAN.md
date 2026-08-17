@@ -1,8 +1,10 @@
 # BK7258 OpenVela SDIO、SD-NAND 与 FAT 移植适配计划
 
-> 文档版本：V4
+> 文档版本：V5
 >
-> 文档状态：可执行实施计划。本文不表示当前代码已经完成 SDIO/MMCSD 适配。
+> 文档状态：2026-08-17 实施基线。1-bit PIO 读写、CMD24、MMCSD、FAT32、
+> `/mnt/sdnand` 自动挂载和重启持久化已通过实板门禁；压力、断电、DMA、4-bit
+> 和 CMD25 多块写仍未完成或未启用。后续 P0-P7 保留为阶段设计和未完成门禁。
 >
 > 适用范围：BK7258 AP/CPU1 上的 OpenVela/NuttX，通过 SDIO Host 访问板载
 > SD-NAND，并以 NuttX 原生 FAT/VFAT 提供文件访问。
@@ -41,8 +43,8 @@ BK7258 SDIO 驱动或 FAT glue 的实现来源。
 
 执行期间遵守以下安全规则：
 
-1. 首版只读识别介质，禁止自动格式化、`mkfatfs`、整盘 `dd` 写入和破坏性测试。
-2. 在没有 sector 备份、分区确认和 owner 确认前，不执行写测试。
+1. 普通启动只挂载已有 FAT，禁止因挂载失败自动格式化。
+2. 原始写测试和整盘 FAT32 重建必须通过 `--confirm` 显式授权。
 3. 原厂 AP 和 OpenVela 不能同时访问同一个 SD-NAND。
 4. CP 不能因为存在 dormant SDIO 源码而被认为拥有存储数据面。
 5. 任何 SDIO clock request 失败时，禁止访问 SDIO MMIO 寄存器。
@@ -73,28 +75,23 @@ BK7258 SDIO V2 Host, IRQ-assisted PIO
 ```
 
 CPU1/AP 是 SDIO Host、sector 和文件系统的数据面 owner。CPU0/CP 只提供已经
-确认的 PWC/PM 时钟控制服务；CPU2 不访问 SDIO。首版不实现 USB MSC、CP proxy、
-热插拔、自动格式化、multiblock 和 4-bit PIO。
+确认的 PWC/PM 时钟控制服务；CPU2 不访问 SDIO。当前不实现 USB MSC、CP proxy、
+热插拔、自动格式化、CMD25 multiblock 和 4-bit PIO。
 
 ### 1.2 当前 contest 状态基线
 
-截至本计划核验时，以下功能尚未接入 contest OpenVela：
+截至 2026-08-17，当前实现状态如下：
 
 | 项目 | 当前状态 | 证据 |
 |---|---|---|
-| BK7258 SDIO lower-half | 不存在 | `board/beken/chips/bk7258/CMakeLists.txt` 未列出 `bk7258_sdio.c` |
-| MMCSD board bind | 不存在 | `board/beken/boards/bk7258/bk7258-ap/src/CMakeLists.txt` 未列出 `bk7258_mmcsd.c` |
-| `BK7258_SDIO` Kconfig | 不存在 | 当前 chip `Kconfig` 未定义 |
-| SDIO IRQ 定义 | 不存在 | `include/irq.h` 未定义 SDIO IRQ |
-| SDIO PWC clock request | 不存在 | `bk7258_pm_pwc.c` 当前只处理 boot-ready、PSRAM 和 recovery |
-| MMCSD | 未启用 | `contest/cmake_out/bk7258-ap_nsh/.config` 为 `# CONFIG_MMCSD is not set` |
-| NuttX FAT | 已启用 | 当前 `defconfig` 有 `CONFIG_FS_FAT=y` |
-| `mkfatfs` 工具 | 当前被编入 | 当前 `defconfig` 有 `CONFIG_FSUTILS_MKFATFS=y`，首版必须关闭 |
-| 通用 DMA 源码 | 已存在 | `bk7258_dma.c` 是 memory-to-memory DMA，不是 SDIO DMA |
-| SDIO DMA | 未适配 | 首版必须保持 `CONFIG_SDIO_DMA=n` 且不返回 DMA capability |
-
-因此，实施起点是“已有 AP 启动、Mailbox/PWC 基础、GPIO/PWM 等功能，SDIO
-数据面从零实现”，不是“已有原厂 SDIO 驱动只需换文件系统”。
+| BK7258 SDIO lower-half | 已实现 1-bit IRQ-assisted PIO RX/TX | CMD17/CMD24 与错误清理路径已接入 |
+| MMCSD board bind | 已实现 | 延迟 5 秒初始化并注册 `/dev/mmcsd0` |
+| MBR / whole-disk FAT | 已实现 | 有效 MBR 优先 `/dev/mmcsd0p0`，否则使用 `/dev/mmcsd0` |
+| 持久挂载 | 已实现 | 已有 FAT 自动挂载 `/mnt/sdnand`，失败不自动格式化 |
+| 显式 provisioning | 已实现 | `provision --confirm` 使用 1 sector/cluster 重建约 119 MiB FAT32 |
+| 文件写与重启持久化 | 实板通过 | 0/512/4096-byte、rename/unlink、`fsync` 和 `VELA.TST` 重启读回 |
+| SDIO DMA / 4-bit / CMD25 | 未启用 | 保持 1-bit、PIO、`CONFIG_MMCSD_MULTIBLOCK_LIMIT=1` |
+| 压力与掉电 | 未完成 | 10,000 次随机写、24 小时、断电和高并发仍是后续门禁 |
 
 ### 1.3 工作区状态记录
 
@@ -326,7 +323,7 @@ bk_avdk_smp/ap/middleware/soc/bk7258_ap/soc/icu_map.h
 | card detect | 固定 present，不启用 GPIO detect |
 | write protect | 固定介质，不启用 GPIO write protect |
 | 文件系统 | 先只读识别已有 FAT；随后受控读写 |
-| 格式化 | 首版禁止，`CONFIG_FSUTILS_MKFATFS=n` |
+| 格式化 | P0-P5 禁止；当前仅 `provision --confirm` 可调用 `mkfatfs` |
 | USB MSC | 关闭 |
 
 4-bit PIO、multiblock、自动掉电、热插拔和 USB MSC 必须在基础单块读写通过后
@@ -752,11 +749,11 @@ CMD12、2/4/8/32/128 sectors 和错误恢复。通过后再评估 4-bit：
 
 当前 `defconfig` 顶部注明由 menuconfig 生成。修改配置时以该文件所属配置为
 输入，通过 menuconfig 或 `savedefconfig` 更新，不手工维护生成的 `.config`。
-首版必须移除 `CONFIG_FSUTILS_MKFATFS=y`。保留已有的 `CONFIG_FS_FAT=y`，并
-加入 MMCSD/SDIO 配置；`CONFIG_DMA` 是否因其他外设需要保持开启，不影响本计划，
-但 `CONFIG_SDIO_DMA` 必须关闭。
+当前显式 provisioning 命令需要 `CONFIG_FSUTILS_MKFATFS=y`。保留已有的
+`CONFIG_FS_FAT=y` 并启用 MMCSD/SDIO；`CONFIG_DMA` 是否因其他外设需要保持开启，
+不影响本计划，但 `CONFIG_SDIO_DMA` 必须关闭。
 
-建议的首版差异：
+当前交付配置：
 
 ```text
 CONFIG_BK7258_SDIO=y
@@ -767,7 +764,9 @@ CONFIG_MMCSD_MULTIBLOCK_LIMIT=1
 CONFIG_SDIO_BLOCKSETUP=y
 CONFIG_SCHED_HPWORK=y
 CONFIG_FS_FAT=y
-# CONFIG_FSUTILS_MKFATFS is not set
+CONFIG_FSUTILS_MKFATFS=y
+CONFIG_BK7258_SDNAND_AUTOMOUNT=y
+CONFIG_BK7258_SDNAND_MOUNTPOINT="/mnt/sdnand"
 # CONFIG_SDIO_DMA is not set
 # CONFIG_MMCSD_MMCSUPPORT is not set
 # CONFIG_MMCSD_SPI is not set
@@ -861,7 +860,8 @@ CONFIG_MMCSD_SDIO=y
 CONFIG_FS_FAT=y
 CONFIG_SDIO_BLOCKSETUP=y
 CONFIG_SDIO_DMA 未设置
-CONFIG_FSUTILS_MKFATFS 未设置
+CONFIG_FSUTILS_MKFATFS=y
+CONFIG_BK7258_SDNAND_AUTOMOUNT=y
 SDIO lower-half 符号存在
 无 Armino SDIO/FAT glue 链接
 ```
@@ -956,7 +956,8 @@ CP ELF 无 Host/card/FAT 实现符号
 OpenVela 不链接 Armino SDIO/FAT glue
 SDIO_DMA=n
 不返回 SDIO_CAPS_DMASUPPORTED
-FSUTILS_MKFATFS=n
+FSUTILS_MKFATFS=y，仅由显式 provision --confirm 使用
+MMCSD_READONLY/BCH_DEVICE_READONLY 未设置
 ```
 
 ### 8.2 枚举

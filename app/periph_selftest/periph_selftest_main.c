@@ -22,6 +22,13 @@
 #include <nuttx/fs/ioctl.h>
 #include <arch/chip/bk7258_psram.h>
 
+#ifndef CONFIG_BK7258_SDNAND_MOUNTPOINT
+#  define CONFIG_BK7258_SDNAND_MOUNTPOINT "/mnt/sdnand"
+#endif
+
+int bk7258_mmcsd_initialize(void);
+int bk7258_mmcsd_mount(FAR const char *source);
+
 static unsigned int test_proc_file(const char *path)
 {
   char buffer[128];
@@ -132,10 +139,8 @@ static unsigned int test_storage(void)
   struct inode *inode;
   DIR *dir;
   struct dirent *entry;
-  const char *mountdev = "/dev/mmcsd0p0";
   int ret;
   ssize_t nsectors;
-  bool mounted = false;
   char first_name[NAME_MAX + 1];
 
   ret = open_blockdriver("/dev/mmcsd0", MS_RDONLY, &inode);
@@ -174,27 +179,17 @@ static unsigned int test_storage(void)
   printf("PASS storage geometry sector=%u count=%lu signature=55aa\n",
          (unsigned)geo.geo_sectorsize, (unsigned long)geo.geo_nsectors);
 
-  (void)mkdir("/mnt", 0777);
-  (void)mkdir("/mnt/sd", 0777);
-  ret = nx_mount(mountdev, "/mnt/sd", "vfat", MS_RDONLY, NULL);
+  ret = bk7258_mmcsd_mount(NULL);
   if (ret < 0)
     {
-      mountdev = "/dev/mmcsd0";
-      ret = nx_mount(mountdev, "/mnt/sd", "vfat", MS_RDONLY, NULL);
-    }
-
-  if (ret < 0)
-    {
-      printf("FAIL storage vfat mount dev=%s error=%d\n", mountdev, ret);
+      printf("FAIL storage persistent vfat mount error=%d\n", ret);
       return 1;
     }
 
-  mounted = true;
-  dir = opendir("/mnt/sd");
+  dir = opendir(CONFIG_BK7258_SDNAND_MOUNTPOINT);
   if (dir == NULL)
     {
       printf("FAIL storage directory errno=%d\n", errno);
-      (void)nx_umount2("/mnt/sd", 0);
       return 1;
     }
 
@@ -209,13 +204,10 @@ static unsigned int test_storage(void)
     }
   closedir(dir);
   ret = entry == NULL ? -EIO : 0;
-  printf("%s storage vfat mount dev=%s first=%s\n",
-         ret == 0 ? "PASS" : "FAIL", mountdev,
-         first_name[0] == '\0' ? "<empty>" : first_name);
-  if (mounted)
-    {
-      (void)nx_umount2("/mnt/sd", 0);
-    }
+  printf("%s storage persistent vfat mount=%s first=%s\n",
+          ret == 0 ? "PASS" : "FAIL",
+          CONFIG_BK7258_SDNAND_MOUNTPOINT,
+          first_name[0] == '\0' ? "<empty>" : first_name);
 
   return ret == 0 ? 0 : 1;
 }
