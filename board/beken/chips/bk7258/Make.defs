@@ -32,6 +32,7 @@ CHIP_CSRCS += bk7258_camera_imgdata.c
 CHIP_CSRCS += bk7258_aud.c
 CHIP_CSRCS += bk7258_cpuindex.c
 CHIP_CSRCS += bk7258_idle.c
+CHIP_CSRCS += bk7258_reset.c
 
 ifeq ($(CONFIG_BK7258_BLUETOOTH),y)
 CHIP_CSRCS += bk7258_bt_transport.c

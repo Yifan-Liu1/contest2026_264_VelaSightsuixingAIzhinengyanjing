@@ -28,7 +28,8 @@ set(SRCS
     bk7258_camera_imgdata.c
     bk7258_aud.c
     bk7258_cpuindex.c
-    bk7258_idle.c)
+    bk7258_idle.c
+    bk7258_reset.c)
 
 if(CONFIG_BK7258_TRNG)
   list(APPEND SRCS bk7258_trng.c)
