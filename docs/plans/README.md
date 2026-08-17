@@ -6,12 +6,11 @@
 | 文档 | 用途 |
 | --- | --- |
 | `BK7258_OPENVELA_AP_PORTING_PLAN.md` | AP 启动、SMP、内存、Mailbox/PWC 总体方案 |
+| `BK7258_OPENVELA_PSRAM_PORTING_PLAN.md` | PSRAM 地址、所有权、MPU 和 allocator |
 | `BK7258_OPENVELA_UART0_MAILBOX_V2_PORTING_PLAN.md` | 单 UART0 双向控制台和 Mailbox V2 |
 | `BK7258_OPENVELA_WIFI_PORTING_PLAN.md` | CP-backed Wi-Fi 与 NuttX `wlan0` |
 | `BK7258_OPENVELA_BLUETOOTH_PORTING_PLAN.md` | CP controller 与 NuttX BLE Host 方案 |
 | `BK7258_OPENVELA_SDIO_PORTING_PLAN.md` | SDIO、SD-NAND、MMCSD 和 VFAT |
 | `BK7258_OPENVELA_MIMO_NETWORK_PORTING_PLAN.md` | MiMo 多模态云端网络与 TLS |
-| `VelaSight_随行AI智能眼镜_报名方案.md` | 作品需求、里程碑和产品方案 |
-
 CPU2 SMP 的独立历史方案已归档到 `docs/archive/`；当前 SMP 结论已并入 AP 总体
 方案和实际代码，不再维护第二份活跃方案。
