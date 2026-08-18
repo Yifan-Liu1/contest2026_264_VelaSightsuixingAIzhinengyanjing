@@ -19,6 +19,8 @@
     <linkfile src="app/agent_camera" dest="packages/demos/contest2026_264_agent_camera"/>
     <linkfile src="app/social_cue" dest="packages/demos/contest2026_264_social_cue"/>
     <linkfile src="app/hello_screen" dest="packages/demos/contest2026_264_hello_screen"/>
+    <linkfile src="app/web_tool" dest="packages/demos/contest2026_264_web_tool"/>
+    <linkfile src="app/provisioning_web" dest="packages/demos/contest2026_264_provision_web"/>
     <linkfile src="board/beken/chips/bk7258"
               dest="vendor/beken/chips/bk7258"/>
     <linkfile src="board/beken/boards/bk7258"
