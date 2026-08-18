@@ -33,6 +33,7 @@ CHIP_CSRCS += bk7258_i2c_sim.c
 CHIP_CSRCS += bk7258_gc2145_i2c_bitbang.c
 CHIP_CSRCS += bk7258_yuv_buf.c
 CHIP_CSRCS += bk7258_jpeg_enc.c
+CHIP_CSRCS += bk7258_jpeg_entropy.c
 CHIP_CSRCS += bk7258_camera_imgdata.c
 CHIP_CSRCS += bk7258_aud.c
 CHIP_CSRCS += bk7258_cpuindex.c

@@ -15,6 +15,10 @@ if(CONFIG_BK7258_SDIO)
   list(APPEND SRCS bk7258_mmcsd.c)
 endif()
 
+if(CONFIG_BK7258_WIFI)
+  list(APPEND SRCS bk7258_wifi_config.c bk7258_net_autostart.c)
+endif()
+
 if(CONFIG_BK7258_AUDIO)
   list(APPEND SRCS bk7258_audio_bringup.c bk7258_audio_dev.c)
 endif()
