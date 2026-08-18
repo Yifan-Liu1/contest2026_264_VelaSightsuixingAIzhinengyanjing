@@ -57,13 +57,24 @@
 #define BK7258_RAMDISK_MINOR      0
 #define BK7258_RAMDISK_SECTOR     512u
 
-/* Where it gets mounted.  Keep this in step with
- * CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR in configs/ai_agent/defconfig, whose
- * value is "/mnt/ai_agent": the agent creates the ai_agent/ subtree itself,
- * but only if the mount point below is a real filesystem.
+/* Where it gets mounted.
+ *
+ * NOT "/mnt".  Mounting littlefs over /mnt itself makes /mnt a real
+ * filesystem, and NuttX cannot mount another filesystem inside one -- so
+ * SD-NAND's automount of /mnt/sdnand then failed with -ENOTDIR and the
+ * persistent store silently became unavailable.  It only appeared to work
+ * before because a bring-up that aborted early never reached this function,
+ * leaving /mnt as pseudo-filesystem.
+ *
+ * /mnt stays pseudo-filesystem so both can coexist: SD-NAND owns
+ * /mnt/sdnand (persistent, CONFIG_BK7258_SDNAND_MOUNTPOINT) and this RAM
+ * disk owns /mnt/ram (scratch, gone after every reset).  Persistent
+ * application data belongs on SD-NAND -- which is where
+ * CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR now points -- and this device
+ * remains for large temporary files such as a captured frame.
  */
 
-#define BK7258_RAMDISK_MOUNTPT    "/mnt"
+#define BK7258_RAMDISK_MOUNTPT    "/mnt/ram"
 
 /* 2MB: enough for three 640x480 YUYV frames plus FAT overhead, out of the
  * 2.9MB AP PSRAM heap (BK7258_AP_PSRAM_HEAP_*, bk7258_psram.c).  The V4L2
@@ -115,15 +126,11 @@ int bk7258_ramdisk_initialize(void)
 
   /* Mount it, rather than leaving the mount to whoever remembers to type it.
    *
-   * Applications that keep state ask for a path, not for a block device:
-   * ai_agent's config store, memory store and skill loader all write under
-   * CONFIG_EXAMPLES_AI_AGENT_VELA_DATA_DIR ("/mnt/ai_agent").  They do build
-   * their directory tree themselves -- config_store.c's mkdirs() and
-   * memory_store.c's ensure_dir() both walk the path -- but no amount of
-   * mkdir() helps while /mnt is still pseudo-filesystem, so without this the
-   * agent starts and then loses every skill and its whole config:
-   *
-   *   [skills] Cannot write skill: /mnt/ai_agent/skills/weather.md
+   * Applications that keep state ask for a path, not for a block device.
+   * Persistent state now lives on SD-NAND (/mnt/sdnand), so what this mount
+   * provides is a writable scratch area at /mnt/ram that is large enough for
+   * things tmpfs cannot hold: tmpfs lives in the ~300KB kernel heap and one
+   * 640x480 YUYV frame is 614400 bytes.
    *
    * littlefs with -o autoformat is what makes this a one-liner: it formats
    * the device when the mount finds no valid superblock, which is exactly
@@ -132,9 +139,7 @@ int bk7258_ramdisk_initialize(void)
    * reachable from board bring-up.
    *
    * This is not persistence.  The backing store is PSRAM, so the tree is
-   * rebuilt from scratch on each boot; what it buys is that the agent's
-   * paths are writable at all.  Real persistence needs a flash partition,
-   * and when it arrives only the device name below has to change.
+   * rebuilt from scratch on each boot.
    */
 
 #ifdef CONFIG_FS_LITTLEFS
