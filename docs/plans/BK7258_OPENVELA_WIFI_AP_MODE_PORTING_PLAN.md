@@ -18,7 +18,7 @@
 - CP 保留 EAPOL/hostapd，SoftAP ARP/IPv4 direct-push 给 OpenVela。
 - `CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4` 下 CP `g_uap` L3/DHCP 入口级禁用。
 - NuttX broadcast、DHCP server、地址池和最多 4 个 lease 配置。
-- WAPI MASTER 模式 `disconnect` 下发 ESSID-OFF，支持命令行停止 SoftAP。
+- `ifdown wlan0` 进入驱动角色停止路径，支持不修改公共 `nuttx-apps` 的 SoftAP 停止。
 
 构建门禁：
 
@@ -589,7 +589,7 @@ CONFIG_NETUTILS_DHCPD_MAXLEASES=4
 WPA2-PSK：
 
 ```sh
-wapi disconnect wlan0
+ifdown wlan0
 ifup wlan0
 wapi mode wlan0 3
 wapi freq wlan0 6 1
@@ -607,7 +607,6 @@ dhcpd_start wlan0
 
 ```sh
 dhcpd_stop
-wapi disconnect wlan0
 ifdown wlan0
 ```
 

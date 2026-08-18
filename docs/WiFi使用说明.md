@@ -60,7 +60,6 @@ SUCCESS! HTTP Status: 200
 以下配置已在 BK7258 实板验证手机可发现并连接热点：
 
 ```sh
-wapi disconnect wlan0
 ifdown wlan0
 ifup wlan0
 wapi mode wlan0 3
@@ -101,7 +100,6 @@ IP 设置: DHCP/自动
 
 ```sh
 dhcpd_stop
-wapi disconnect wlan0
 ifdown wlan0
 ```
 
