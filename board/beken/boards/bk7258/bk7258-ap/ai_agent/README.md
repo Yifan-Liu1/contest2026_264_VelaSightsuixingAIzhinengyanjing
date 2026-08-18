@@ -48,7 +48,7 @@ record.
 
 Two things make these numbers easy to get wrong, both worth checking before
 quoting them: whether the `app/` linkfiles are present (a missing one silently
-removes that app, `docs/local/reference/platform.md` §6), and whether the build
+removes that app, `docs/reference/platform.md` §6), and whether the build
 directory was wiped after a defconfig change.
 
 RAM here is the static footprint only, and it is the interesting half: those
@@ -70,7 +70,7 @@ What already matches:
   That is what makes a 160 KB × 2 buffer heap possible on a board whose AP
   kernel heap is smaller than that, and it is also required: YUV_BUF can
   only write into `0x60000000..0x61000000` (invariant 5 in
-  `docs/local/reference/camera.md`).
+  `docs/reference/camera.md`).
 - **`sizeimage` decides the buffer size.** For a compressed format
   `get_bufsize()` returns `sizeimage` rather than `width*height`, so the
   tool's 160 KB hint is what gets allocated per buffer.
@@ -117,7 +117,7 @@ sequence on hardware, and both are now measured rather than argued:
 
 ### Measured on hardware
 
-Firmware built from this config, packaged per `docs/local/reference/camera.md`
+Firmware built from this config, packaged per `docs/reference/camera.md`
 10.2 with the sha256 of `nuttx.bin`, `openvela-ap.bin` and `app1.bin`
 verified equal, flashed with `autoflash.sh -b 1500000`.
 
@@ -140,7 +140,7 @@ agent_camera: OK
 33-frame session: 29.78 fps, no dropped frames, no timeouts. **Every fps and
 millisecond figure in this file was measured before the 2026-08-13 timebase
 fix and is therefore roughly 2x too high** — the real rate at 480x480 is about
-16 fps (`docs/local/reference/camera.md` §6.8 and §14.1). The frame counts, byte
+16 fps (`docs/reference/camera.md` §6.8 and §14.1). The frame counts, byte
 counts and pass/fail results are unaffected; only the time axis was wrong.
 
 > **The bytes were not a decodable JPEG until the header was rebuilt, and
@@ -157,7 +157,7 @@ counts and pass/fail results are unaffected; only the time axis was wrong.
 > SOF0 and DQT (both correct). Zero-copy — the DMA writes 256 bytes into the
 > buffer and a COM segment absorbs the length difference, so the entropy data
 > is never moved and it runs in the ISR. Design and evidence:
-> `docs/local/reference/camera.md` 14.7-14.9.
+> `docs/reference/camera.md` 14.7-14.9.
 >
 > Verified from the board: `identify` reports
 > `JPEG 480x480 8-bit sRGB` with no warnings, PIL decodes, and the render is
@@ -206,7 +206,7 @@ is what matters here, because `camera_capture` takes exactly one frame.
 Waiting for a VSYNC boundary before enabling the encoder was tried and
 reverted: the premise is circular (in JPEG mode VSYNC events only start once
 the encoder is enabled), the wait timed out in all three sessions, and its
-only effect was cost — 29.72 → 25.99 fps. See `docs/local/reference/camera.md`
+only effect was cost — 29.72 → 25.99 fps. See `docs/reference/camera.md`
 14.4.
 
 ### `ai_agent` itself
@@ -231,7 +231,7 @@ smaller than the agent task's 32768-byte stack (`AGENT_AI_AGENT_STACK` in
 `help` lists it. `bk7258_psram_initialize()` now donates the unused tail of
 `PSRAM_SECTION` to the system heap (commit `b96373d`); the layout and what it
 costs -- PSRAM is non-cacheable, so some buffers that used to sit in SRAM got
-slower -- are in `docs/local/reference/platform.md` §4.
+slower -- are in `docs/reference/platform.md` §4.
 
 Flash, at 61%, is not the constraint, and since `b96373d` neither is the heap.
 
@@ -298,7 +298,7 @@ For your own application the sequence is the one in
 a complete JPEG file starting at byte 0 of the buffer: the driver has already
 written a standard header in front of the entropy data, so nothing needs to be
 added afterwards. Details, including why `sizeimage` matters, are in
-`docs/local/reference/camera.md` 14.3.
+`docs/reference/camera.md` 14.3.
 
 ### Reproducing any of this: `app/agent_camera`
 
@@ -320,7 +320,7 @@ agent_camera n=5 out=/mnt/cap.jpg # five frames, first saved (needs a mount)
 
 To get a frame onto the host and check it with a real decoder — which is the
 only way to catch what the marker check missed — see
-`docs/local/reference/camera.md` 14.5.
+`docs/reference/camera.md` 14.5.
 
 Its negotiation is the same algorithm as patch 0001, so `low` versus
 `low strict` is a before/after of that patch against the real driver.
@@ -412,7 +412,7 @@ quality, which a boot test cannot establish anyway.
 `CONFIG_CRYPTO=y` is the part that is easy to miss: `CRYPTO_RANDOM_POOL` sits
 inside `if CRYPTO`, so without it the line is silently dropped and the
 `/dev/urandom` choice falls back to xorshift128 -- the same class of trap as
-`docs/local/reference/platform.md` §6. Verified after each step: `net_test` stopped
+`docs/reference/platform.md` §6. Verified after each step: `net_test` stopped
 failing at seeding and now reaches a DNS lookup instead.
 
 Cost of both steps together: about 24 KB of flash (most of it littlefs, which

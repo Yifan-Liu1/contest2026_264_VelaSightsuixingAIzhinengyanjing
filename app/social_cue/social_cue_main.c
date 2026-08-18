@@ -80,7 +80,7 @@
 
 /* One frame, JPEG.  480x480 is the only geometry this sensor driver offers
  * that is square, and sizeimage is what decides the buffer size for a
- * compressed format (docs/local/reference/camera.md 14.2).
+ * compressed format (docs/reference/camera.md 14.2).
  */
 
 #define SC_WIDTH          480

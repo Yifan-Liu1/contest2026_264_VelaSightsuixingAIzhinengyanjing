@@ -207,4 +207,4 @@ socket，所以连 accept 循环、回调时序和 one-shot 都能在主机上�
 | `vp_server.c` | 监听线程、连接处理、生命周期与回调时序 |
 | `provisioning_web_main.c` | `provision_web` 命令 |
 
-设计文档：`docs/local/superpowers/specs/2026-08-18-ap-provisioning-web-design.md`
+设计文档：`docs/superpowers/specs/2026-08-18-ap-provisioning-web-design.md`

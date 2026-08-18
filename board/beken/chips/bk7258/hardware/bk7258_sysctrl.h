@@ -62,7 +62,7 @@
  * (register writes accepted, but cmd_start_done never asserts because the
  * controller's internal state machine has no clock) -- not yet confirmed
  * on real hardware as of this comment being written; see
- * docs/local/superpowers/plans/2026-07-31-gc9d01-qspi1-camera-v4l2-verification.md
+ * docs/superpowers/plans/2026-07-31-gc9d01-qspi1-camera-v4l2-verification.md
  * section 5.1 for the diagnostic trail this was found through. */
 #define BK7258_QSPI0_MODULE_CLK_EN (1u << 20)
 #define BK7258_QSPI1_MODULE_CLK_EN (1u << 21)

@@ -70,7 +70,7 @@ struct wt_io_s
  ****************************************************************************/
 
 /* Ciphersuite preference, and the one place in this project where the TLS
- * measurements in docs/local/2026-08-17-TLS性能核查.md are actually acted on.
+ * measurements in docs/2026-08-17-TLS性能核查.md are actually acted on.
  *
  * ECDHE first because the key exchange is what costs: a full handshake on this
  * part measured 541 ms with DHE-2048, of which at least ~460 ms was
@@ -385,7 +385,7 @@ struct wt_io_s *wt_io_tls_connect(const char *host, int port,
   /* Reported because it is the number the ciphersuite choice was made on.  For
    * comparison, the upstream agent's TLS path -- which offers everything and
    * lets the server choose, and ends up on DHE-2048 -- measured 541 ms on this
-   * board (docs/local/2026-08-17-TLS性能核查.md).
+   * board (docs/2026-08-17-TLS性能核查.md).
    */
 
   clock_gettime(CLOCK_MONOTONIC, &t_done);
@@ -448,7 +448,7 @@ struct wt_io_s *wt_io_tls_connect(const char *host, int port,
    * into it is how a measurement stops meaning anything.  For comparison the
    * upstream agent's path -- everything offered, server picks, ends on
    * DHE-2048 -- measured 541 ms of handshake alone to a public host
-   * (docs/local/2026-08-17-TLS性能核查.md).
+   * (docs/2026-08-17-TLS性能核查.md).
    */
 
   syslog(LOG_INFO, "web_tool: %s to %s:%d, certificate pinned "

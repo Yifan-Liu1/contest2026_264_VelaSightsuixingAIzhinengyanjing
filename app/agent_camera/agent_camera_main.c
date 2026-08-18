@@ -46,7 +46,7 @@
  *
  *   Options:
  *     out=<path>   write the frame (e.g. out=/mnt/cap.jpg; needs a mounted
- *                  filesystem -- see docs/local/reference/camera.md 9.3)
+ *                  filesystem -- see docs/reference/camera.md 9.3)
  *     b64          print the first frame as base64 between fence lines, to
  *                  retrieve it with no filesystem involved:
  *
@@ -55,7 +55,7 @@
  *                      | sed '1d;$d' | tr -d '\r\n' | base64 -d > cap.jpg
  *
  *                  Then check it with a real decoder, not just the markers:
- *                  `identify cap.jpg` / PIL.  See docs/local/reference/camera.md
+ *                  `identify cap.jpg` / PIL.  See docs/reference/camera.md
  *                  14.5-14.6 for why the marker check is not enough.
  *     n=<count>    capture <count> frames in one streaming session
  *                  (default 1, which is what the tool does)
@@ -495,7 +495,7 @@ static int agent_camera_set_format(int fd, int *width, int *height,
  *   segment**, so libjpeg rejects the file outright ("Invalid JPEG file
  *   structure: missing SOS marker") while SOI and EOI are both present.  A
  *   check both the driver and this tool agreed on was simply not sufficient
- *   -- see docs/local/reference/camera.md 14.6.
+ *   -- see docs/reference/camera.md 14.6.
  *
  *   So the segment chain is walked properly here.  Note that markers on this
  *   encoder are preceded by 0xFF fill bytes (three of them, e.g.
@@ -605,7 +605,7 @@ static void agent_camera_check_jpeg(const uint8_t *data, size_t len)
       printf("agent_camera: NOT a decodable JPEG -- no SOS segment, so the "
              "entropy data has no scan header.  A Vision LLM (or any "
              "standard decoder) will reject this.  See "
-             "docs/local/reference/camera.md 14.6\n");
+             "docs/reference/camera.md 14.6\n");
     }
 }
 
@@ -616,7 +616,7 @@ static void agent_camera_check_jpeg(const uint8_t *data, size_t len)
  *   Prints the frame as base64 between two fence lines, so it can be pulled
  *   off the board without a filesystem.
  *
- *   The alternative is `hexdump` plus docs/local/tools/hexdump2raw.py, which works
+ *   The alternative is `hexdump` plus docs/tools/hexdump2raw.py, which works
  *   (and is what first got a frame onto the host) but needs a mounted
  *   filesystem, costs 4.4 bytes of console per payload byte -- a 35KB frame
  *   became 170KB of serial output -- and has to be parsed with tolerance for
@@ -1406,7 +1406,7 @@ static int agent_camera_capture(struct agent_camera_s *cam,
 
       /* The driver completes a buffer with V4L2_BUF_FLAG_ERROR when its
        * watchdog fires rather than leaving DQBUF blocked forever (see
-       * invariant 8 in docs/local/reference/camera.md).  Such a buffer carries no
+       * invariant 8 in docs/reference/camera.md).  Such a buffer carries no
        * usable frame, so say so instead of validating its contents.
        */
 

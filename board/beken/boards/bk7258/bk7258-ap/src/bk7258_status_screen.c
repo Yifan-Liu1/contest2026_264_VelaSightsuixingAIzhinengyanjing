@@ -14,7 +14,7 @@
  * for audio.
  *
  * camera_preview stays in the tree as a *diagnostic*: it is how a byte-order
- * or geometry fault is made visible (docs/local/reference/display.md).  It is no
+ * or geometry fault is made visible (docs/reference/display.md).  It is no
  * longer what the product path draws.
  *
  * What it draws

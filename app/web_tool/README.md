@@ -12,12 +12,12 @@
 ```
 
 板子是**拨出**的一方，因为它在 AP 的 NAT 后面——实测出得去、进不来
-（`docs/local/2026-08-18-web_tool验收记录二-TLS.md` 第一节）。两端各按自己能做到的方式
+（`docs/2026-08-18-web_tool验收记录二-TLS.md` 第一节）。两端各按自己能做到的方式
 互相认证：板子钉住控制台证书的 SHA-256，控制台检查板子首帧里的共享 token。
 
-设计与决策依据：`docs/local/superpowers/specs/2026-08-17-web-tool-design.md`
+设计与决策依据：`docs/superpowers/specs/2026-08-17-web-tool-design.md`
 （TLS 原为非目标，后按需求加入，理由与代价见
-`docs/local/2026-08-17-TLS性能核查.md` 第七、八节）。
+`docs/2026-08-17-TLS性能核查.md` 第七、八节）。
 
 ---
 
@@ -111,7 +111,7 @@ web_tool selftest
 ```
 
 它存在的理由是环境：本机只有有线口，板子只能连开放客网，两者被策略隔离
-（双向实测不通，见 `docs/local/2026-08-17-web_tool验收记录.md` 第四节）。
+（双向实测不通，见 `docs/2026-08-17-web_tool验收记录.md` 第四节）。
 没有它，板上这半边代码就会在没跑过真硬件的情况下交付。
 它覆盖板上全部路径——accept、白名单、双向分帧、每条命令、syslog channel
 与日志环、摄像头线程与队列、shell 闸门；页面、WebSocket 桥和落盘不在板上，

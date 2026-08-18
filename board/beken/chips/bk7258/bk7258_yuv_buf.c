@@ -299,7 +299,7 @@ void bk7258_yuv_buf_init(void)
    * the module is left with soft_reset=1 (released) AND
    * clk_gate_bypass=1, final global_ctrl == 0x3.
    *
-   * History (docs/local/main/2026-08-07-global-ctrl-polarity-hang-and-further-
+   * History (docs/main/2026-08-07-global-ctrl-polarity-hang-and-further-
    * elimination.md): three earlier attempts at exactly this write hung
    * the AP core and were recorded as "polarity disproven on this
    * hardware", leaving the module parked at global_ctrl == 0 -- held in
