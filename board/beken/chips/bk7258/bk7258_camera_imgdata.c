@@ -53,6 +53,7 @@
 #include <nuttx/arch.h>
 #include <nuttx/clock.h>
 #include <nuttx/irq.h>
+#include <nuttx/kmalloc.h>
 #include <nuttx/spinlock.h>
 #include <nuttx/wdog.h>
 
@@ -146,6 +147,8 @@
  */
 
 #define BK7258_CAMERA_JPEG_RING_CHUNKS 24u
+#define BK7258_CAMERA_JPEG_RING_SLOTS  3u
+#define BK7258_CAMERA_JPEG_VALIDATE_BYTES (80u * 1024u)
 
 /* How far into a span to look for the frame's SOI.  The leftovers of the
  * previous frame measured a few dozen bytes; 256 is comfortable slack and
@@ -242,6 +245,7 @@ struct bk7258_camera_imgdata_s
   uint16_t height;
   uint32_t frame_bytes;            /* Buffer bytes one frame needs. */
   bool jpeg;                       /* Encoded output rather than raw YUV. */
+  bool jpeg_software;              /* This geometry uses software fallback. */
   volatile uint32_t jpeg_chunks;   /* DMA chunk interrupts, diagnostics. */
   volatile uint32_t jpeg_frame_chunks; /* Chunks since the channel was armed. */
   volatile uint32_t jpeg_short;    /* Frames completed without an EOI. */
@@ -272,14 +276,35 @@ struct bk7258_camera_imgdata_s
   volatile bool jpeg_encoding;     /* An encode is in flight */
   volatile bool jpeg_buf_armed;    /* The framework queued a buffer that has
                                     * not been completed yet */
+  volatile uint32_t set_buf_live;   /* set_buf calls made while streaming */
   volatile uint32_t jpeg_sw_frames;
   volatile uint32_t jpeg_sw_drops;    /* Unprocessed frames replaced */
   volatile uint32_t jpeg_sw_skipped;  /* Frames the 5fps sampler passed on */
+
+  /* jpeg_sw_drops used to count both "the encoder was still busy" and "the
+   * application had not queued a buffer", which made a stall impossible to
+   * attribute: the two have opposite causes and opposite fixes.  Split.
+   */
+
+  volatile uint32_t jpeg_sw_busy;      /* Skipped: an encode was in flight   */
+  volatile uint32_t jpeg_sw_nobuf;     /* Skipped: no queued V4L2 buffer     */
+  volatile uint32_t jpeg_hw_busy;      /* HW frames skipped while validating */
+  volatile clock_t  jpeg_last_now;     /* Ticks at the last sampler decision */
+  uint32_t jpeg_work_len;              /* Raw length ending after EOI */
+  bool jpeg_work_finish_pending;       /* DMA diagnostic for queued frame */
+  struct timeval jpeg_work_ts;         /* EOF time reported on completion */
   FAR uint8_t *jpeg_stage;         /* Encoder input staging area, PSRAM. */
   uint32_t jpeg_stage_bytes;
+  FAR uint8_t *jpeg_validate_scratch; /* Entropy parser input, internal RAM */
+  uint32_t jpeg_validate_scratch_bytes;
+  volatile uint32_t jpeg_validate_ticks;
+  volatile uint32_t jpeg_validate_runs;
   volatile int32_t jpeg_eoi_delta;  /* EOI offset minus byte_count_pfrm. */
   volatile uint32_t jpeg_hdr_fail;  /* Frames whose header could not be
                                      * rebuilt (bitstream not as expected). */
+  volatile uint32_t jpeg_bit_fixed; /* Frames repaired by dropping leading
+                                     * entropy bits. */
+  volatile uint32_t jpeg_bit_fail;  /* Frames with no valid bit alignment. */
   volatile uint8_t jpeg_tail[8];    /* Bytes around a rejected frame's end. */
   volatile uint32_t jpeg_tail_at;   /* Where jpeg_tail was sampled. */
   /* The drain ring.  The DMA writes into this continuously for the whole
@@ -289,11 +314,15 @@ struct bk7258_camera_imgdata_s
 
   FAR uint8_t *jpeg_ring;
   uint32_t jpeg_ring_bytes;
-  uint32_t jpeg_ring_read;            /* First byte of the next frame */
+  uint32_t jpeg_ring_read;            /* Offset within the current slot */
+  uint8_t jpeg_ring_slot;             /* Slot currently owned by DMA */
   volatile uint32_t jpeg_ring_chunks; /* Cumulative, never reset */
   volatile uint32_t jpeg_ring_over;   /* Spans longer than the ring */
   volatile uint32_t jpeg_resync;      /* Spans that needed SOI realignment */
   volatile uint32_t jpeg_no_soi;      /* Spans dropped for having no SOI */
+  volatile uint32_t jpeg_finish_pending; /* EOF snapshots with FINISH pending */
+  volatile uint32_t jpeg_pending_mask;   /* First 32 delivered frame indices */
+  volatile int32_t jpeg_pending_delta;   /* raw delivered - hw byte_count */
   volatile bool capturing;
   imgdata_capture_t capture_cb;
   FAR void *capture_cb_arg;
@@ -419,7 +448,10 @@ static void bk7258_camera_jpeg_dma_arm(
    * window shrinks by the same amount so it still cannot run past the buffer.
    */
 
-  uint32_t dest = (uint32_t)(uintptr_t)priv->jpeg_ring;
+  uint32_t slot_bytes = priv->jpeg_ring_bytes /
+                        BK7258_CAMERA_JPEG_RING_SLOTS;
+  uint32_t dest = (uint32_t)(uintptr_t)(
+    priv->jpeg_ring + (uint32_t)priv->jpeg_ring_slot * slot_bytes);
 
   cfg.channel         = BK7258_CAMERA_JPEG_DMA_CH;
   cfg.src_addr        = bk7258_jpeg_enc_get_fifo_addr();
@@ -431,7 +463,7 @@ static void bk7258_camera_jpeg_dma_arm(
   cfg.dest_inc        = true;
   cfg.repeat          = true;
   cfg.dest_loop_start = dest;
-  cfg.dest_loop_end   = dest + priv->jpeg_ring_bytes;
+  cfg.dest_loop_end   = dest + slot_bytes;
   cfg.data_width      = BK7258_DMA_WIDTH_32BITS;
 
   /* Cleared here because the delivered length of the next frame is counted
@@ -468,27 +500,40 @@ static void bk7258_camera_jpeg_dma_arm(
  ****************************************************************************/
 
 static uint32_t bk7258_camera_jpeg_ring_write_pos(
-    FAR struct bk7258_camera_imgdata_s *priv)
+    FAR struct bk7258_camera_imgdata_s *priv, FAR bool *finish_pending)
 {
   irqstate_t flags = up_irq_save();
   uint32_t chunks;
   uint32_t remain;
+  bool pending;
   uint64_t total;
 
-  remain = bk7258_dma_get_channel_remain_len(BK7258_CAMERA_JPEG_DMA_CH);
+  bk7258_dma_get_channel_progress(BK7258_CAMERA_JPEG_DMA_CH, &remain,
+                                  &pending);
   chunks = priv->jpeg_ring_chunks;
 
   up_irq_restore(flags);
+
+  if (finish_pending != NULL)
+    {
+      *finish_pending = pending;
+    }
 
   if (remain > BK7258_CAMERA_JPEG_CHUNK)
     {
       remain = BK7258_CAMERA_JPEG_CHUNK;
     }
 
+  /* Deliberately do not compensate for pending here in the diagnostic build.
+   * The pending mask and delta printed at stop_capture prove or falsify the
+   * one-chunk ownership hypothesis before the behavior is changed.
+   */
+
   total = (uint64_t)chunks * BK7258_CAMERA_JPEG_CHUNK +
           (BK7258_CAMERA_JPEG_CHUNK - remain);
 
-  return (uint32_t)(total % priv->jpeg_ring_bytes);
+  return (uint32_t)(total % (priv->jpeg_ring_bytes /
+                             BK7258_CAMERA_JPEG_RING_SLOTS));
 }
 
 /****************************************************************************
@@ -513,6 +558,116 @@ static void bk7258_camera_jpeg_chunk_done(FAR void *arg)
   priv->jpeg_chunks++;
   priv->jpeg_frame_chunks++;
   priv->jpeg_ring_chunks++;
+}
+
+/****************************************************************************
+ * Name: bk7258_camera_jpeg_validate_work
+ *
+ * Description:
+ *   Finish one hardware JPEG after the EOF handler copied it out of the DMA
+ *   ring.  Exact Huffman/MCU validation walks the complete entropy stream;
+ *   doing that in the JPEG ISR delayed DMA chunk accounting long enough to
+ *   lose the next ring position (measured as one delivered frame followed by
+ *   no_soi=151).  LPWORK keeps the ring's interrupt-side bookkeeping live.
+ *
+ *   The V4L2 buffer remains owned by the driver until capture_cb() runs, and
+ *   EOF drops newer frames while jpeg_encoding is true, so this task has
+ *   exclusive access to frame_buf without another allocation or copy.
+ ****************************************************************************/
+
+static void bk7258_camera_jpeg_validate_work(FAR void *arg)
+{
+  FAR struct bk7258_camera_imgdata_s *priv = arg;
+  uint32_t hdrlen;
+  uint32_t frame_len;
+  size_t entropy_len;
+  clock_t validate_start;
+  int bitshift;
+  int result = EIO;
+
+  if (!priv->capturing || priv->frame_buf == NULL)
+    {
+      priv->jpeg_encoding = false;
+      return;
+    }
+
+  hdrlen = (uint32_t)bk7258_jpeg_enc_write_header(priv->frame_buf,
+                                                   BK7258_JPEG_ENC_PAD);
+  if (hdrlen == 0)
+    {
+      priv->jpeg_hdr_fail++;
+    }
+  else
+    {
+      entropy_len = (size_t)BK7258_JPEG_ENC_PAD + priv->jpeg_work_len -
+                    2u - hdrlen;
+      validate_start = clock_systime_ticks();
+
+      if (entropy_len > priv->jpeg_validate_scratch_bytes)
+        {
+          bitshift = -ENOSPC;
+        }
+      else
+        {
+          memcpy(priv->jpeg_validate_scratch,
+                 priv->frame_buf + hdrlen, entropy_len);
+          bitshift = bk7258_jpeg_realign_entropy(
+            priv->jpeg_validate_scratch, &entropy_len,
+            priv->jpeg_validate_scratch_bytes, priv->width, priv->height);
+
+          if (bitshift > 0)
+            {
+              memcpy(priv->frame_buf + hdrlen,
+                     priv->jpeg_validate_scratch, entropy_len);
+            }
+        }
+
+      priv->jpeg_validate_ticks +=
+        (uint32_t)(clock_systime_ticks() - validate_start);
+      priv->jpeg_validate_runs++;
+
+      if (bitshift < 0)
+        {
+          priv->jpeg_bit_fail++;
+        }
+      else
+        {
+          frame_len = hdrlen + (uint32_t)entropy_len + 2u;
+          priv->frame_buf[frame_len - 2u] = 0xff;
+          priv->frame_buf[frame_len - 1u] = 0xd9;
+
+          if (bitshift > 0)
+            {
+              priv->jpeg_bit_fixed++;
+            }
+
+          if (priv->jpeg_work_finish_pending && priv->frames_done < 32u)
+            {
+              priv->jpeg_pending_mask |= 1u << priv->frames_done;
+            }
+
+          priv->frames_done++;
+          result = 0;
+        }
+    }
+
+  if (priv->capturing && priv->capture_cb != NULL)
+    {
+      priv->capture_cb(result, result == 0 ? frame_len : 0,
+                       &priv->jpeg_work_ts, priv->capture_cb_arg);
+    }
+
+  /* Keep the guard set through capture_cb(): complete_capture() synchronously
+   * supplies the next V4L2 buffer, and an EOF interrupt inside that handoff
+   * must still drop rather than write into the buffer being returned.
+   */
+
+  priv->jpeg_encoding = false;
+
+  if (priv->capturing)
+    {
+      bk7258_camera_watchdog_arm(priv);
+    }
 }
 
 /****************************************************************************
@@ -551,13 +706,15 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
 
   FAR uint8_t *buf = priv->frame_buf == NULL ? NULL :
                      priv->frame_buf + BK7258_JPEG_ENC_PAD;
+  FAR uint8_t *raw;
+  uint32_t slot_bytes;
   uint32_t capacity;
   uint32_t write_pos;
   struct timeval ts;
   uint32_t len = 0;
   uint32_t delivered;
-  uint32_t hdrlen;
   uint32_t i;
+  bool finish_pending;
 
   if (!priv->capturing || priv->frame_buf == NULL)
     {
@@ -588,24 +745,32 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
         }
     }
 
-  /* Flush the channel's partial word, but do NOT stop the channel.
-   *
-   * Stopping it per frame is what corrupted every frame before: the encoder
-   * does not stop with it, so the bytes produced between the stop and the
-   * re-arm were lost, and the re-arm reset the destination to the top of the
-   * buffer, so the next frame began mid-bitstream.  That is why the frames
-   * carried valid markers -- the header is synthesised and an EOI was always
-   * findable somewhere -- and still decoded to garbage.
-   *
-   * With the channel left running, a frame is simply a span of the ring, and
-   * no byte is ever dropped between frames.
+  /* Match the vendor frame boundary: flush the partial DMA word, stop the
+   * channel, snapshot its completed slot, and restart into a fresh slot
+   * before doing any copy or validation.  Earlier stop/re-arm attempts used
+   * the same destination and waited for V4L2, losing bytes produced in that
+   * gap; slot switching has neither failure mode.
    */
 
   bk7258_dma_flush_src_buffer(BK7258_CAMERA_JPEG_DMA_CH);
+  bk7258_dma_stop_channel(BK7258_CAMERA_JPEG_DMA_CH);
 
-  write_pos = bk7258_camera_jpeg_ring_write_pos(priv);
-  delivered = (write_pos + priv->jpeg_ring_bytes - priv->jpeg_ring_read) %
-              priv->jpeg_ring_bytes;
+  write_pos = bk7258_camera_jpeg_ring_write_pos(priv, &finish_pending);
+  slot_bytes = priv->jpeg_ring_bytes / BK7258_CAMERA_JPEG_RING_SLOTS;
+  raw = priv->jpeg_ring + (uint32_t)priv->jpeg_ring_slot * slot_bytes;
+  delivered = write_pos;
+  priv->jpeg_ring_read = 0;
+
+  priv->jpeg_ring_slot = (uint8_t)(
+    ((unsigned int)priv->jpeg_ring_slot + 1u) %
+    BK7258_CAMERA_JPEG_RING_SLOTS);
+  bk7258_camera_jpeg_dma_arm(priv);
+
+  if (finish_pending)
+    {
+      priv->jpeg_finish_pending++;
+      priv->jpeg_pending_delta = (int32_t)delivered - (int32_t)bytes;
+    }
 
   /* Resynchronise on the frame's own SOI.
    *
@@ -634,11 +799,7 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
 
       for (scan = 0; scan < limit; scan++)
         {
-          uint32_t at = (priv->jpeg_ring_read + scan) % priv->jpeg_ring_bytes;
-          uint32_t next = (at + 1u) % priv->jpeg_ring_bytes;
-
-          if (priv->jpeg_ring[at] == 0xffu &&
-              priv->jpeg_ring[next] == 0xd8u)
+          if (raw[scan] == 0xffu && raw[scan + 1u] == 0xd8u)
             {
               break;
             }
@@ -646,8 +807,7 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
 
       if (scan < limit)
         {
-          priv->jpeg_ring_read = (priv->jpeg_ring_read + scan) %
-                                 priv->jpeg_ring_bytes;
+          priv->jpeg_ring_read = scan;
           delivered -= scan;
           priv->jpeg_resync += scan != 0 ? 1u : 0u;
         }
@@ -697,6 +857,25 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
       return;
     }
 
+  if (priv->jpeg_encoding)
+    {
+      /* Exact entropy validation owns frame_buf until its LPWORK completion.
+       * The DMA ring is independent and must keep advancing; dropping this
+       * newest frame is cheaper and safer than queuing work behind an old
+       * V4L2 buffer.
+       */
+
+      priv->jpeg_ring_read = write_pos;
+      priv->jpeg_hw_busy++;
+
+      if (priv->capturing)
+        {
+          bk7258_camera_watchdog_arm(priv);
+        }
+
+      return;
+    }
+
   /* Fixed sampling rate, applied before the copy.
    *
    * The encoder runs at the sensor rate whatever we do, so pacing happens by
@@ -732,23 +911,13 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
   priv->jpeg_next_sample = clock_systime_ticks() +
     MSEC2TICK(1000u / CONFIG_BK7258_CAMERA_JPEG_FPS);
 
-  /* Copy the span out of the ring, in one or two pieces depending on whether
-   * it wrapped.
+  /* The completed slot is frozen and one frame is smaller than a slot, so
+   * this copy cannot wrap or race the DMA now writing the next slot.
    */
 
   if (delivered > 0)
     {
-      uint32_t first = priv->jpeg_ring_bytes - priv->jpeg_ring_read;
-
-      if (first >= delivered)
-        {
-          memcpy(buf, priv->jpeg_ring + priv->jpeg_ring_read, delivered);
-        }
-      else
-        {
-          memcpy(buf, priv->jpeg_ring + priv->jpeg_ring_read, first);
-          memcpy(buf + first, priv->jpeg_ring, delivered - first);
-        }
+      memcpy(buf, raw + priv->jpeg_ring_read, delivered);
     }
 
   priv->jpeg_ring_read = write_pos;
@@ -818,32 +987,25 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
     }
   else
     {
-      /* Replace the block's header with one standard decoders accept.  It is
-       * longer than the block's, which is why the bitstream was placed PAD
-       * bytes in; the returned offset is where the entropy data starts, so
-       * the file the application sees runs from the buffer's first byte to
-       * the end of what was delivered.
+      /* Keep the V4L2 buffer owned and hand the complete raw frame to
+       * task context.  All ring state was advanced before this point, so
+       * subsequent DMA/EOF interrupts can continue independently.
        */
 
-      hdrlen = (uint32_t)bk7258_jpeg_enc_write_header(priv->frame_buf,
-                                                      BK7258_JPEG_ENC_PAD);
-      if (hdrlen == 0)
+      priv->jpeg_work_len = len;
+      priv->jpeg_work_finish_pending = finish_pending;
+      priv->jpeg_work_ts = ts;
+      priv->jpeg_encoding = true;
+
+      if (work_queue(LPWORK, &priv->jpeg_work,
+                     bk7258_camera_jpeg_validate_work, priv, 0) < 0)
         {
-          priv->jpeg_hdr_fail++;
+          priv->jpeg_encoding = false;
+          priv->jpeg_bit_fail++;
 
           if (priv->capture_cb != NULL)
             {
               priv->capture_cb(EIO, 0, &ts, priv->capture_cb_arg);
-            }
-        }
-      else
-        {
-          priv->frames_done++;
-
-          if (priv->capture_cb != NULL)
-            {
-              priv->capture_cb(0, BK7258_JPEG_ENC_PAD + len, &ts,
-                               priv->capture_cb_arg);
             }
         }
     }
@@ -926,8 +1088,10 @@ static void bk7258_camera_jpeg_vsync(FAR void *arg)
  * Name: bk7258_camera_set_sw_jpeg
  *
  * Description:
- *   Register the software JPEG encoder used to serve V4L2_PIX_FMT_JPEG on
- *   this capture device, or NULL to fall back to the hardware block.
+ *   Register the software JPEG encoder used as the V4L2_PIX_FMT_JPEG
+ *   correctness fallback.  With CONFIG_BK7258_CAMERA_HW_JPEG, formats up to
+ *   640 pixels wide use validated hardware output and wider formats use this
+ *   encoder; without it, all JPEG formats use software.
  *
  *   Why a hook rather than a direct call: the encoder is libjpeg-turbo, which
  *   lives in the apps tree and is linked by the board layer
@@ -936,13 +1100,11 @@ static void bk7258_camera_jpeg_vsync(FAR void *arg)
  *   this tree follows (board calls chip).  The board registers itself at
  *   bring-up instead.
  *
- *   Why software at all: the hardware JPEG block delivers at 30fps but
- *   mis-assembles its bitstream -- on a static scene consecutive frames came
- *   back differing by 50 to 140 grey levels, with each picture ending in
- *   another frame's data, while every marker check passed.  Encoding a UYVY
- *   capture instead is ~3.3fps but correct, and correctness is what
- *   /dev/video0's JPEG format is for (packages/ai_agent's camera_capture
- *   takes one photo).
+ *   Why software remains registered: the repaired hardware path is decoded-
+ *   pixel verified at 480x480 and 640x480, and rejects structurally invalid
+ *   entropy fail-closed.  At 864x480 its syntax validated but decoded pixels
+ *   were unstable, so that width deliberately uses the slower, correct
+ *   software encoder.
  *
  ****************************************************************************/
 
@@ -971,6 +1133,7 @@ static void bk7258_camera_sw_jpeg_work(FAR void *arg)
   if (!priv->capturing || priv->frame_buf == NULL || g_sw_jpeg == NULL)
     {
       priv->jpeg_encoding = false;
+      priv->jpeg_buf_armed = priv->capturing && priv->frame_buf != NULL;
       return;
     }
 
@@ -982,9 +1145,23 @@ static void bk7258_camera_sw_jpeg_work(FAR void *arg)
    * "frame 0: bytesused=0 flags=0x00000040".
    */
 
+  /* Every exit from here that does not complete a buffer has to give the
+   * arm back.
+   *
+   * bk7258_camera_frame_done() clears jpeg_buf_armed when it queues this
+   * work, on the assumption that the work will consume the buffer -- either
+   * by delivering a frame or by completing it with an error.  An exit that
+   * does neither leaves the driver with armed == false and the framework
+   * with a buffer it believes is still being filled, and nothing ever
+   * re-arms: the framework only calls set_buf() after a completion.  The
+   * session then delivers exactly one frame and stalls, which is what
+   * "no frame within 5000 ms" was, with set_buf_live=1 armed=0 encoding=0.
+   */
+
   if (priv->frame_buf_size == 0)
     {
       priv->jpeg_encoding = false;
+      priv->jpeg_buf_armed = priv->capturing;
       return;
     }
 
@@ -992,6 +1169,7 @@ static void bk7258_camera_sw_jpeg_work(FAR void *arg)
       priv->jpeg_raw[priv->jpeg_raw_ready] == NULL)
     {
       priv->jpeg_encoding = false;
+      priv->jpeg_buf_armed = priv->capturing;
       return;
     }
 
@@ -1074,7 +1252,7 @@ static void bk7258_camera_frame_done(FAR void *arg)
        * and the newest frame is the one worth having.
        */
 
-      if (g_sw_jpeg != NULL)
+      if (priv->jpeg_software)
         {
           /* Encode only when the framework is actually waiting for a frame.
            * Encoding on every frame instead wasted most of the work: the
@@ -1111,9 +1289,15 @@ static void bk7258_camera_frame_done(FAR void *arg)
            * queue continuously.
            */
 
-          if (priv->jpeg_encoding || !priv->jpeg_buf_armed)
+          priv->jpeg_last_now = now;
+
+          if (priv->jpeg_encoding)
             {
-              priv->jpeg_sw_drops++;
+              priv->jpeg_sw_busy++;
+            }
+          else if (!priv->jpeg_buf_armed)
+            {
+              priv->jpeg_sw_nobuf++;
             }
           else if ((sclock_t)(now - priv->jpeg_next_sample) < 0)
             {
@@ -1121,6 +1305,12 @@ static void bk7258_camera_frame_done(FAR void *arg)
             }
           else
             {
+              /* Fixed period from the start of the encode, so the wait overlaps
+               * the encode rather than following it.  Measuring from the
+               * completion instead was tried and measured worse: 480x480 fell
+               * from 4.39 to 2.26 fps, because encode and wait then add up.
+               */
+
               priv->jpeg_next_sample = now +
                 MSEC2TICK(1000u / CONFIG_BK7258_CAMERA_JPEG_FPS);
               priv->jpeg_encoding = true;
@@ -1207,13 +1397,22 @@ static int bk7258_camera_imgdata_init(FAR struct imgdata_s *data)
   priv->set_buf_calls  = 0;
   priv->rejected_bufs  = 0;
   priv->jpeg           = false;
+  priv->jpeg_software  = false;
   priv->jpeg_chunks    = 0;
   priv->jpeg_short     = 0;
   priv->jpeg_err_seen  = 0;
   priv->jpeg_resets    = 0;
   priv->jpeg_stage     = NULL;
   priv->jpeg_stage_bytes = 0;
+  priv->jpeg_validate_scratch = NULL;
+  priv->jpeg_validate_scratch_bytes = 0;
+  priv->jpeg_validate_ticks = 0;
+  priv->jpeg_validate_runs = 0;
   priv->jpeg_hdr_fail  = 0;
+  priv->jpeg_bit_fixed = 0;
+  priv->jpeg_bit_fail  = 0;
+  priv->jpeg_hw_busy   = 0;
+  priv->jpeg_work_len  = 0;
 
   bk7258_yuv_buf_init();
   bk7258_yuv_buf_set_frame_callback(bk7258_camera_frame_done, priv);
@@ -1247,16 +1446,17 @@ static int bk7258_camera_imgdata_uninit(FAR struct imgdata_s *data)
   priv->capturing = false;
   wd_cancel(&priv->watchdog);
 
-  if (priv->jpeg && g_sw_jpeg != NULL)
+  if (priv->jpeg)
     {
-      /* Cancel before the framework can unmap the buffer: the work handler
-       * writes into priv->frame_buf.
+      /* Both JPEG paths use jpeg_work and retain frame_buf until it exits.
+       * Cancel before the framework can unmap that buffer.
        */
 
       work_cancel(LPWORK, &priv->jpeg_work);
       priv->jpeg_encoding = false;
     }
-  else if (priv->jpeg)
+
+  if (priv->jpeg && !priv->jpeg_software)
     {
       /* Encoder first, then the channel that drains it: stopping the drain
        * while the encoder still produced output would leave the FIFO
@@ -1378,6 +1578,19 @@ static int bk7258_camera_imgdata_set_buf(FAR struct imgdata_s *data,
   priv->frame_buf_size = priv->frame_bytes;
   priv->set_buf_calls++;
 
+  /* Separately count the calls that arrive while streaming.  set_buf_calls
+   * alone cannot answer the question that matters when a session delivers
+   * one frame and then stalls: whether the framework ever re-armed the
+   * driver after a completion, or whether it did and the sampling gate
+   * dropped the frame anyway.  The pre-STREAMON queueing is indis-
+   * tinguishable from a re-arm in the total.
+   */
+
+  if (priv->capturing)
+    {
+      priv->set_buf_live++;
+    }
+
   /* Point the hardware's frame writer at this buffer.  Done on every
    * call, which is also how the next frame gets re-armed from the
    * frame-done path (reference: dvp_camera_yuv_eof_handler()'s
@@ -1388,7 +1601,7 @@ static int bk7258_camera_imgdata_set_buf(FAR struct imgdata_s *data,
    * at the new buffer and restarting it.
    */
 
-  if (priv->jpeg && g_sw_jpeg != NULL)
+  if (priv->jpeg && priv->jpeg_software)
     {
       /* Software JPEG: the module's frame writer stays on the staging frame,
        * and the application's buffer only ever receives the encoded file
@@ -1489,6 +1702,12 @@ static int bk7258_camera_imgdata_validate_frame_setting(
   priv->jpeg = datafmts[IMGDATA_FMT_MAIN].pixelformat ==
                IMGDATA_PIX_FMT_JPEG;
 
+#ifdef CONFIG_BK7258_CAMERA_HW_JPEG
+  priv->jpeg_software = priv->jpeg && g_sw_jpeg != NULL && w > 640u;
+#else
+  priv->jpeg_software = priv->jpeg && g_sw_jpeg != NULL;
+#endif
+
   /* The buffer size the framework will hand to set_buf().
    *
    * For UYVY it is fixed by the geometry: the module writes width*height*2
@@ -1549,7 +1768,7 @@ static int bk7258_camera_imgdata_start_capture(
 
   bk7258_yuv_buf_configure(priv->width, priv->height);
 
-  if (priv->jpeg && g_sw_jpeg != NULL)
+  if (priv->jpeg && priv->jpeg_software)
     {
       /* Software JPEG: capture UYVY exactly as the raw path does, into a
        * staging frame of our own -- the application's buffer is sized for a
@@ -1581,6 +1800,9 @@ static int bk7258_camera_imgdata_start_capture(
       priv->jpeg_sw_frames = 0;
       priv->jpeg_sw_drops = 0;
       priv->jpeg_sw_skipped = 0;
+      priv->jpeg_sw_busy = 0;
+      priv->jpeg_sw_nobuf = 0;
+      priv->set_buf_live = 0;
       priv->jpeg_buf_armed = priv->frame_buf != NULL &&
                              priv->frame_buf_size != 0;
 
@@ -1641,9 +1863,35 @@ static int bk7258_camera_imgdata_start_capture(
           return -ENOMEM;
         }
 
+      if (priv->jpeg_validate_scratch == NULL)
+        {
+          priv->jpeg_validate_scratch =
+            kmm_malloc(BK7258_CAMERA_JPEG_VALIDATE_BYTES);
+          priv->jpeg_validate_scratch_bytes =
+            priv->jpeg_validate_scratch == NULL ? 0 :
+            BK7258_CAMERA_JPEG_VALIDATE_BYTES;
+        }
+
+      if (priv->jpeg_validate_scratch == NULL)
+        {
+          printf("bk7258_camera_imgdata: start_capture: no internal RAM for "
+                 "the %u-byte JPEG validator scratch\n",
+                 BK7258_CAMERA_JPEG_VALIDATE_BYTES);
+          return -ENOMEM;
+        }
+
+      priv->jpeg_validate_ticks = 0;
+      priv->jpeg_validate_runs = 0;
       priv->jpeg_ring_over = 0;
+      priv->jpeg_ring_slot = 0;
       priv->jpeg_resync = 0;
       priv->jpeg_no_soi = 0;
+      priv->jpeg_finish_pending = 0;
+      priv->jpeg_pending_mask = 0;
+      priv->jpeg_pending_delta = 0;
+      priv->jpeg_bit_fixed = 0;
+      priv->jpeg_bit_fail = 0;
+      priv->jpeg_hw_busy = 0;
       priv->jpeg_sw_skipped = 0;
       priv->jpeg_next_sample = clock_systime_ticks();
 
@@ -1728,6 +1976,13 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
       priv->jpeg_ring = NULL;
     }
 
+  if (priv->jpeg_validate_scratch != NULL && !up_interrupt_context())
+    {
+      kmm_free(priv->jpeg_validate_scratch);
+      priv->jpeg_validate_scratch = NULL;
+      priv->jpeg_validate_scratch_bytes = 0;
+    }
+
   if (!up_interrupt_context())
     {
       int slot;
@@ -1757,11 +2012,12 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
        */
 
       printf("bk7258_camera_imgdata: stop_capture: ring_over=%u resync=%u "
-             "no_soi=%u sampler_skipped=%u (target %u fps)\n",
+             "no_soi=%u sampler_skipped=%u hw_busy=%u (target %u fps)\n",
              (unsigned int)priv->jpeg_ring_over,
              (unsigned int)priv->jpeg_resync,
              (unsigned int)priv->jpeg_no_soi,
              (unsigned int)priv->jpeg_sw_skipped,
+             (unsigned int)priv->jpeg_hw_busy,
              CONFIG_BK7258_CAMERA_JPEG_FPS);
 
       printf("bk7258_camera_imgdata: stop_capture: frames=%u timeouts=%u "
@@ -1780,28 +2036,51 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
            * FIFO fills, YUV_BUF reports sen_full, and no EOF ever arrives.
            */
 
-          if (g_sw_jpeg != NULL)
+          if (priv->jpeg_software)
             {
               printf("bk7258_camera_imgdata: stop_capture: sw_jpeg "
                      "frames=%u dropped_oldest=%u sampler_skipped=%u "
+                     "busy=%u nobuf=%u due_in=%ld "
+                     "set_buf_live=%u armed=%d encoding=%d "
                      "(target %u fps)\n",
                      (unsigned int)priv->jpeg_sw_frames,
                      (unsigned int)priv->jpeg_sw_drops,
                      (unsigned int)priv->jpeg_sw_skipped,
+                     (unsigned int)priv->jpeg_sw_busy,
+                     (unsigned int)priv->jpeg_sw_nobuf,
+                     (long)((sclock_t)(priv->jpeg_next_sample -
+                                       priv->jpeg_last_now)),
+                     (unsigned int)priv->set_buf_live,
+                     (int)priv->jpeg_buf_armed,
+                     (int)priv->jpeg_encoding,
                      CONFIG_BK7258_CAMERA_JPEG_FPS);
             }
 
           printf("bk7258_camera_imgdata: stop_capture: jpeg chunks=%u "
-                 "short=%u resets=%u vsyncs=%u hdr_fail=%u eoi_delta=%d "
-                 "dma_remain=%u\n",
+                 "short=%u resets=%u vsyncs=%u hdr_fail=%u "
+                 "bit_fixed=%u bit_fail=%u eoi_delta=%d "
+                 "dma_remain=%u finish_pending=%u pending_mask=0x%08x "
+                 "pending_delta=%d\n",
                  (unsigned int)priv->jpeg_chunks,
                  (unsigned int)priv->jpeg_short,
                  (unsigned int)priv->jpeg_resets,
                  (unsigned int)priv->jpeg_vsyncs,
                  (unsigned int)priv->jpeg_hdr_fail,
+                 (unsigned int)priv->jpeg_bit_fixed,
+                 (unsigned int)priv->jpeg_bit_fail,
                  (int)priv->jpeg_eoi_delta,
                  (unsigned int)bk7258_dma_get_channel_remain_len(
-                     BK7258_CAMERA_JPEG_DMA_CH));
+                     BK7258_CAMERA_JPEG_DMA_CH),
+                 (unsigned int)priv->jpeg_finish_pending,
+                 (unsigned int)priv->jpeg_pending_mask,
+                 (int)priv->jpeg_pending_delta);
+          printf("bk7258_camera_imgdata: stop_capture: validator runs=%u "
+                 "total_ticks=%u avg=%u ms\n",
+                 (unsigned int)priv->jpeg_validate_runs,
+                 (unsigned int)priv->jpeg_validate_ticks,
+                 (unsigned int)(priv->jpeg_validate_runs ?
+                   TICK2MSEC(priv->jpeg_validate_ticks) /
+                   priv->jpeg_validate_runs : 0u));
           printf("bk7258_camera_imgdata: stop_capture: bytes[%u-4..+4] = "
                  "%02x %02x %02x %02x | %02x %02x %02x %02x\n",
                  (unsigned int)priv->jpeg_tail_at,

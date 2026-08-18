@@ -47,9 +47,9 @@ typedef CODE int (*bk7258_camera_sw_jpeg_t)(FAR uint8_t *src, size_t srclen,
  * Name: bk7258_camera_set_sw_jpeg
  *
  * Description:
- *   Register the encoder above, or NULL to leave JPEG capture to the
- *   hardware block.  The board registers one at bring-up because the
- *   hardware block mis-assembles its bitstream; see the implementation.
+ *   Register the encoder above as the correctness fallback.  The board keeps
+ *   it registered even when hardware JPEG is enabled: decoded-pixel-verified
+ *   widths through 640 use hardware, while wider JPEG formats use software.
  *
  ****************************************************************************/
 

@@ -101,14 +101,17 @@
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -159,6 +162,29 @@
 
 #define MAX_ENUM_SIZES     16
 
+/* base64 characters per output line.  Must be a multiple of 4 so a line never
+ * splits a quad, and <= 255 so one line is exactly one CP bridge log entry
+ * (AP_BRIDGE_LOG_LINE_SIZE = 256 in the CP's driver.c) -- see
+ * agent_camera_print_b64().
+ */
+
+#define B64_LINE_CHARS     252
+
+/* Bytes per second the console route is paced at.  The CP's UART0 runs at
+ * 115200 8N1 = 11520 B/s and the CP drops rather than blocks when its log
+ * queue backs up, so this has to stay under the drain rate with margin for
+ * the driver's own log lines.  Raise it only together with the CP's baud.
+ */
+
+#define B64_CONSOLE_BPS    9600
+
+/* TCP delivery: bytes handed to send() at a time, and how long to wait for
+ * the connect.
+ */
+
+#define TCP_SEND_CHUNK     1460
+#define TCP_CONNECT_MS     5000
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -205,6 +231,10 @@ static void agent_camera_usage(void)
          "  b64      print the last frame as base64 (retrieve without a\n"
          "           filesystem; see the file header)\n"
          "  b64all   print every frame as base64, one fenced block each\n"
+         "  tcp=<ip>:<port>  push the frame over TCP as raw JPEG, one\n"
+         "           connection per frame (host: nc -l -p <port> >f.jpg, or\n"
+         "           tools/tcpframes.py).  Needs wlan0 up; far faster than\n"
+         "           the console -- see agent_camera_send_tcp()\n"
          "  session=<id>  tag frames with a session id, sequence and\n"
          "           monotonic timestamp (the metadata an upload needs)\n"
          "  rec=<n>  record n frames at the sensor rate into memory, then\n"
@@ -594,9 +624,56 @@ static void agent_camera_check_jpeg(const uint8_t *data, size_t len)
  *   per byte and `base64 -d` is exact, so there is nothing to get wrong on
  *   the host side.
  *
- *   Written straight to stdout in 57-byte groups (76 base64 chars per line)
- *   with no intermediate buffer, because a second copy of a 160KB frame does
- *   not fit in the AP's kernel heap.
+ *   Written in 252-character lines straight to fd 1 with write(), not through
+ *   stdout's buffer, and with no intermediate copy of the frame: a second
+ *   copy of a 160KB frame does not fit in the AP's kernel heap.
+ *
+ *   Both the line size and the pacing are transport facts, not taste.
+ *   Measured 2026-08-17 on 640x480 (~36.4KB frames):
+ *
+ *     76-char lines via fwrite + usleep(30ms)/2 lines : 41.5s, 1.19KB/s
+ *     1024-char lines via write(), no pacing          :  2.5s, but LOSSY
+ *     252-char lines via write() + clock pacing       : see docs/, lossless
+ *
+ *   Two independent limits, found in that order:
+ *
+ *   1. Cost per write(), not per byte.  CONFIG_STDIO_LINEBUFFER with
+ *      CONFIG_STDIO_BUFFER_SIZE=64 turns every 76-char line into two flushes;
+ *      each flush becomes its own mailbox transaction, and
+ *      bk7258_mb_uart.c's worker advances on a 10ms tick
+ *      (MB_UART_WORK_INTERVAL) carrying at most 128 bytes
+ *      (BK7258_MB_UART_CHUNK_SIZE).  38 bytes per 10ms tick is ~4KB/s at any
+ *      baud rate.  One write() per line fixes that.
+ *
+ *   2. The CP drops instead of blocking.  With the pacing removed the run
+ *      finished in 2.5s but the payload was short, and the CP's own counter
+ *      says why: `ap_console status` went from qfail=158 to qfail=317 across
+ *      one frame, i.e. 159 discarded entries, while rx_bytes rose by the full
+ *      56659.  So the AP handed everything over and the CP threw part of it
+ *      away -- its bridge calls shell_log_raw_data_nonblock() and only bumps
+ *      a counter on failure (CP driver.c, ap_bridge_log_output()).  The
+ *      mailbox-level RTS the AP honours covers the CP's mailbox rx_buf, not
+ *      the shell log queue behind it, so there is no end-to-end backpressure
+ *      to lean on and the AP has to stay under the CP's drain rate itself.
+ *
+ *   Hence B64_CONSOLE_BPS and agent_camera_pace(): a clock-driven budget
+ *   rather than a fixed sleep every N lines.  The old code did have such a
+ *   sleep, but its comment described a "1024-byte bridge flushing half-lines
+ *   on a 50ms timer" -- which is not what any of this code does (8192-byte
+ *   ring, 128-byte chunks, 10ms worker) -- so the value could not be reasoned
+ *   about, only re-tuned by trial.
+ *
+ *   The single write() also removes an interleaving hazard rather than adding
+ *   one: uart_write() holds dev->xmit.lock for the whole call
+ *   (nuttx/drivers/serial/serial.c), so a driver log line from another thread
+ *   can land between payload lines but no longer inside one.  A log line
+ *   spliced into the middle of a payload line is what b64frames.py has to
+ *   discard, and discarding it loses the frame.
+ *
+ *   None of this makes the console fast.  11520 B/s is the ceiling and base64
+ *   inflates by 4/3, so ~4.3s per frame is the floor here and 5 fps is out of
+ *   reach by an order of magnitude.  Use tcp= when the network is up; this
+ *   path exists for when it is not.
  *
  ****************************************************************************/
 
@@ -669,10 +746,66 @@ static void agent_camera_copy32(FAR uint8_t *dst, FAR const uint8_t *src,
     }
 }
 
+static void agent_camera_write_all(FAR const char *buf, size_t len)
+{
+  while (len > 0)
+    {
+      ssize_t nwritten = write(STDOUT_FILENO, buf, len);
+
+      if (nwritten <= 0)
+        {
+          if (nwritten < 0 && (errno == EINTR || errno == EAGAIN))
+            {
+              continue;
+            }
+
+          return;
+        }
+
+      buf += nwritten;
+      len -= (size_t)nwritten;
+    }
+}
+
+/****************************************************************************
+ * Name: agent_camera_pace
+ *
+ * Description:
+ *   Hold the cumulative output rate at B64_CONSOLE_BPS by sleeping only when
+ *   we are ahead of that budget.  Paced against CLOCK_MONOTONIC and the total
+ *   byte count, not with a fixed sleep every N lines: a fixed sleep has to be
+ *   tuned for the worst case and then pays it always, and it silently becomes
+ *   wrong the moment the line length or the baud rate changes.
+ *
+ ****************************************************************************/
+
+static void agent_camera_pace(FAR const struct timespec *start,
+                              unsigned long emitted)
+{
+  struct timespec now;
+  unsigned long elapsed_ms;
+  unsigned long budget_ms;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  elapsed_ms = (unsigned long)((now.tv_sec - start->tv_sec) * 1000 +
+                               (now.tv_nsec - start->tv_nsec) / 1000000);
+  budget_ms = emitted * 1000ul / B64_CONSOLE_BPS;
+
+  if (budget_ms > elapsed_ms)
+    {
+      usleep((budget_ms - elapsed_ms) * 1000);
+    }
+}
+
 static void agent_camera_print_b64(const uint8_t *data, size_t len)
 {
   static const char tbl[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  static char line[B64_LINE_CHARS + 1];
+  struct timespec t_start;
+  unsigned long emitted = 0;
+  size_t used = 0;
   size_t i;
 
   printf("agent_camera: payload len=%zu fnv1a=0x%08" PRIx32 "\n",
@@ -680,11 +813,18 @@ static void agent_camera_print_b64(const uint8_t *data, size_t len)
 
   printf("-----BEGIN AGENT_CAMERA JPEG %zu-----\n", len);
 
+  /* Drain the fence line out of the stdio buffer before switching to raw
+   * write(): everything below bypasses stdout's buffer, so anything still
+   * sitting in it would surface after the payload.
+   */
+
+  fflush(stdout);
+  clock_gettime(CLOCK_MONOTONIC, &t_start);
+
   for (i = 0; i < len; i += 3)
     {
       size_t remain = len - i;
       uint32_t v = (uint32_t)data[i] << 16;
-      char quad[4];
 
       if (remain > 1)
         {
@@ -696,38 +836,250 @@ static void agent_camera_print_b64(const uint8_t *data, size_t len)
           v |= data[i + 2];
         }
 
-      quad[0] = tbl[(v >> 18) & 0x3f];
-      quad[1] = tbl[(v >> 12) & 0x3f];
-      quad[2] = remain > 1 ? tbl[(v >> 6) & 0x3f] : '=';
-      quad[3] = remain > 2 ? tbl[v & 0x3f] : '=';
+      line[used++] = tbl[(v >> 18) & 0x3f];
+      line[used++] = tbl[(v >> 12) & 0x3f];
+      line[used++] = remain > 1 ? tbl[(v >> 6) & 0x3f] : '=';
+      line[used++] = remain > 2 ? tbl[v & 0x3f] : '=';
 
-      fwrite(quad, 1, 4, stdout);
-
-      if ((i / 3) % 19 == 18)
+      if (used == B64_LINE_CHARS)
         {
-          fputc('\n', stdout);
-
-          /* Throttle every 2 lines (~114 payload bytes, ~3.5KB/s).
-           *
-           * The console is the CP's UART0 with the AP's output arriving over
-           * a mailbox bridge that holds 1024 bytes and flushes half-lines on
-           * a 50ms timer.  A 30KB burst of base64 overruns it and the host
-           * silently receives a truncated payload -- observed as 9111 of a
-           * declared 22703 bytes, with a length that still looks plausible.
-           * Pausing lets the bridge drain; the fnv1a line above is what
-           * proves whether it worked.
-           */
-
-          if (((i / 3) / 19) % 2 == 1)
-            {
-              fflush(stdout);
-              usleep(30000);
-            }
+          line[used++] = '\n';
+          agent_camera_write_all(line, used);
+          emitted += used;
+          used = 0;
+          agent_camera_pace(&t_start, emitted);
         }
     }
 
-  fputc('\n', stdout);
+  if (used > 0)
+    {
+      line[used++] = '\n';
+      agent_camera_write_all(line, used);
+    }
+
   printf("-----END AGENT_CAMERA JPEG-----\n");
+  fflush(stdout);
+}
+
+/****************************************************************************
+ * Name: agent_camera_connect_timeout
+ *
+ * Description:
+ *   connect() with an upper bound.  Returns true on success; on failure errno
+ *   holds the reason (ETIMEDOUT when the bound expired) and the socket is
+ *   left for the caller to close.
+ *
+ ****************************************************************************/
+
+static bool agent_camera_connect_timeout(int sock,
+                                         FAR const struct sockaddr_in *addr,
+                                         int timeout_ms)
+{
+  struct pollfd pfd;
+  int flags;
+  int error = 0;
+  socklen_t errlen = sizeof(error);
+  int ret;
+
+  flags = fcntl(sock, F_GETFL, 0);
+  if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+      return false;
+    }
+
+  ret = connect(sock, (FAR const struct sockaddr *)addr, sizeof(*addr));
+  if (ret < 0 && errno != EINPROGRESS)
+    {
+      return false;
+    }
+
+  if (ret < 0)
+    {
+      pfd.fd = sock;
+      pfd.events = POLLOUT;
+      pfd.revents = 0;
+
+      ret = poll(&pfd, 1, timeout_ms);
+      if (ret == 0)
+        {
+          errno = ETIMEDOUT;
+          return false;
+        }
+
+      if (ret < 0)
+        {
+          return false;
+        }
+
+      if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &errlen) < 0)
+        {
+          return false;
+        }
+
+      if (error != 0)
+        {
+          errno = error;
+          return false;
+        }
+    }
+
+  /* Back to blocking so the send() loop below does not have to spin. */
+
+  if (fcntl(sock, F_SETFL, flags) < 0)
+    {
+      return false;
+    }
+
+  return true;
+}
+
+/****************************************************************************
+ * Name: agent_camera_send_tcp
+ *
+ * Description:
+ *   Push one frame to <host>:<port> over TCP and close.  The close is the
+ *   frame delimiter, so the host side can be `nc -l -p 5000 > frame.jpg`
+ *   with nothing else involved; tools/tcpframes.py does the same thing for a
+ *   burst, one file per connection.
+ *
+ *   Why this exists next to 'b64': the console cannot carry a frame at any
+ *   useful rate.  115200 8N1 is 11.5KB/s and base64 inflates 36KB to 49KB,
+ *   so 4.3s is the floor there even with a perfect transport -- and 5 fps of
+ *   640x480 needs 125KB/s, which the console cannot reach at any baud this
+ *   board offers.  The Wi-Fi path does not have that problem: the AP hands
+ *   whole packets to the CP by reference over the mailbox
+ *   (bk7258_wifi.c: wifi_send_node_async(), a node descriptor rather than a
+ *   128-byte copy), so a frame is a few dozen packets, not a few hundred
+ *   mailbox chunks.
+ *
+ *   The payload is the raw JPEG.  No base64 (saves 33%), no fence lines, no
+ *   escaping: TCP already delivers bytes in order or not at all.  The
+ *   len/fnv1a line is still printed on the console so the host can prove the
+ *   file it received is the frame the board sent.
+ *
+ ****************************************************************************/
+
+static int agent_camera_send_tcp(FAR const char *target,
+                                 const uint8_t *data, size_t len)
+{
+  struct sockaddr_in addr;
+  struct timespec t_start;
+  struct timespec t_end;
+  unsigned long elapsed_ms;
+  FAR const char *colon;
+  char host[INET_ADDRSTRLEN];
+  size_t hostlen;
+  size_t sent = 0;
+  int port;
+  int sock;
+
+  colon = strrchr(target, ':');
+  if (colon == NULL)
+    {
+      printf("agent_camera: tcp=%s needs <ip>:<port>\n", target);
+      return -EINVAL;
+    }
+
+  hostlen = (size_t)(colon - target);
+  if (hostlen == 0 || hostlen >= sizeof(host))
+    {
+      printf("agent_camera: tcp=%s has an unusable address\n", target);
+      return -EINVAL;
+    }
+
+  memcpy(host, target, hostlen);
+  host[hostlen] = '\0';
+
+  port = atoi(colon + 1);
+  if (port <= 0 || port > 65535)
+    {
+      printf("agent_camera: tcp=%s has an unusable port\n", target);
+      return -EINVAL;
+    }
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)port);
+
+  /* Numeric addresses only.  A DNS lookup here would add a failure mode
+   * (and a timeout) to a path whose whole point is to be fast, and the host
+   * running the receiver is on the same LAN by construction.
+   */
+
+  if (inet_pton(AF_INET, host, &addr.sin_addr) != 1)
+    {
+      printf("agent_camera: tcp=%s is not a numeric IPv4 address\n", host);
+      return -EINVAL;
+    }
+
+  printf("agent_camera: payload len=%zu fnv1a=0x%08" PRIx32 "\n",
+         len, agent_camera_fnv1a(data, len));
+
+  sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0)
+    {
+      printf("agent_camera: socket failed: %d\n", errno);
+      return -errno;
+    }
+
+  clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+  /* Bounded connect.  A blocking connect() to an address that is routable but
+   * silently dropped -- a guest SSID with client isolation is the ordinary
+   * case -- retries SYNs for far longer than the capture session lasts, and
+   * because this runs inside the frame loop the whole command wedges with the
+   * sensor still streaming.  Observed exactly that before this existed.
+   */
+
+  if (!agent_camera_connect_timeout(sock, &addr, TCP_CONNECT_MS))
+    {
+      printf("agent_camera: connect %s:%d failed: %d\n", host, port, errno);
+      close(sock);
+      return -errno;
+    }
+
+  while (sent < len)
+    {
+      size_t chunk = len - sent;
+      ssize_t nsent;
+
+      if (chunk > TCP_SEND_CHUNK)
+        {
+          chunk = TCP_SEND_CHUNK;
+        }
+
+      nsent = send(sock, data + sent, chunk, 0);
+      if (nsent < 0)
+        {
+          if (errno == EINTR || errno == EAGAIN)
+            {
+              continue;
+            }
+
+          printf("agent_camera: send failed at %zu of %zu: %d\n",
+                 sent, len, errno);
+          close(sock);
+          return -errno;
+        }
+
+      sent += (size_t)nsent;
+    }
+
+  /* The close is the delimiter, and it is also what flushes the last
+   * segment, so its cost belongs inside the measurement.
+   */
+
+  close(sock);
+  clock_gettime(CLOCK_MONOTONIC, &t_end);
+
+  elapsed_ms = (unsigned long)
+    ((t_end.tv_sec - t_start.tv_sec) * 1000 +
+     (t_end.tv_nsec - t_start.tv_nsec) / 1000000);
+
+  printf("agent_camera: sent %zu bytes to %s:%d in %lu ms\n",
+         sent, host, port, elapsed_ms);
+
+  return OK;
 }
 
 /****************************************************************************
@@ -824,7 +1176,8 @@ static int agent_camera_capture(struct agent_camera_s *cam,
                                 unsigned int count, bool negotiate,
                                 const char *out_path, bool b64,
                                 bool b64_all, unsigned int rec,
-                                FAR const char *session)
+                                FAR const char *session,
+                                FAR const char *tcp_target)
 {
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   struct v4l2_requestbuffers req;
@@ -1135,6 +1488,12 @@ static int agent_camera_capture(struct agent_camera_s *cam,
               agent_camera_print_b64(data, dqbuf.bytesused);
             }
 
+          if (tcp_target != NULL && rec == 0 &&
+              (b64_all || frame + 1 == count))
+            {
+              agent_camera_send_tcp(tcp_target, data, dqbuf.bytesused);
+            }
+
           if (frame + 1 == count)
             {
               if (out_path != NULL)
@@ -1182,7 +1541,23 @@ static int agent_camera_capture(struct agent_camera_s *cam,
       for (stored = 0; stored < rec_stored; stored++)
         {
           printf("agent_camera: frame %u of %u\n", stored + 1, rec_stored);
-          agent_camera_print_b64(rec_frames[stored], rec_lens[stored]);
+
+          /* With a TCP target the console dump is redundant and costs
+           * seconds per frame, so tcp= replaces it rather than adding to it.
+           * Ask for both only by passing b64 explicitly.
+           */
+
+          if (tcp_target != NULL)
+            {
+              agent_camera_send_tcp(tcp_target, rec_frames[stored],
+                                    rec_lens[stored]);
+            }
+
+          if (tcp_target == NULL || b64)
+            {
+              agent_camera_print_b64(rec_frames[stored], rec_lens[stored]);
+            }
+
           free(rec_frames[stored]);
         }
 
@@ -1212,6 +1587,7 @@ int main(int argc, FAR char *argv[])
   bool b64_all = false;
   unsigned int rec = 0;
   FAR const char *session = NULL;
+  FAR const char *tcp_target = NULL;
   int width = 0;
   int height = 0;
   int nsizes;
@@ -1278,6 +1654,10 @@ int main(int argc, FAR char *argv[])
       else if (strncmp(arg, "out=", 4) == 0)
         {
           out_path = arg + 4;
+        }
+      else if (strncmp(arg, "tcp=", 4) == 0)
+        {
+          tcp_target = arg + 4;
         }
       else if (strncmp(arg, "n=", 2) == 0)
         {
@@ -1380,7 +1760,8 @@ int main(int argc, FAR char *argv[])
     }
 
   ret = agent_camera_capture(&cam, width, height, count, negotiate,
-                             out_path, b64, b64_all, rec, session);
+                             out_path, b64, b64_all, rec, session,
+                             tcp_target);
   agent_camera_teardown(&cam);
 
   if (ret < 0)
