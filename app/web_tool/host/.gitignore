@@ -1,0 +1,9 @@
+# Captured sessions are evidence from one run on one board, not source.
+captures/
+# The TLS identity of this console, and the token the board is told to expect.
+# Generated on first run; the fingerprint is pinned on the board, so these must
+# not be shared or regenerated casually.
+tls/
+# The address the bootstrap remembers between runs.
+.last_board.json
+__pycache__/

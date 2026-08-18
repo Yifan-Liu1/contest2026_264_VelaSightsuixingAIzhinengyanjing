@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<!--
+  web_tool console.
+
+  Layout: five cards across the top, then a command console, then the log.
+  The console and the log are separate on purpose: the console is what you
+  typed and what it answered, the log is everything the board decided to say.
+  Merging them makes it impossible to find your own command afterwards.
+
+  Plain HTML, CSS and one ES module.  No framework and no bundler: a page this
+  size does not repay a toolchain, and adding one would put `npm install`
+  between a fresh checkout and a working debug tool.
+
+  Both hops are TLS. The browser link is HTTPS/WSS terminated by console.py;
+  the board dials console.py over TLS 1.2 and pins its certificate.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>web_tool 开发板控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header id="statusbar">
+  <span class="lamp" id="lamp-tcp"></span>
+  <span id="tcp-text">等待板子接入</span>
+  <span class="sep">|</span>
+  <span class="lamp on" id="lamp-tls" title="两跳都是 TLS"></span>
+  <span id="tls-text">TLS</span>
+  <span class="sep">|</span>
+  <span class="lamp idle" id="lamp-serial"></span>
+  <span id="serial-text">串口已释放</span>
+  <button id="btn-serial-hold" class="mini">占用串口</button>
+  <button id="btn-serial-free" class="mini">释放串口</button>
+  <span class="sep">|</span>
+  <span id="fps-text">0.0 fps</span>
+  <span class="grow"></span>
+  <span id="degraded" class="warn"></span>
+</header>
+
+<main id="cards">
+
+  <!-- 预览 -->
+  <section class="card" id="card-preview">
+    <h2>预览</h2>
+    <div class="previewbox">
+      <img id="preview" alt="尚无帧">
+      <div id="preview-none">未开始</div>
+    </div>
+    <div class="row">
+      <select id="cam-size">
+        <option value="640x480" selected>640x480（硬件 JPEG，已验证）</option>
+        <option value="864x480">864x480（软件 JPEG 回退）</option>
+        <option value="480x480">480x480（硬件 JPEG，已验证）</option>
+      </select>
+    </div>
+    <div class="row">
+      <button id="btn-cam-start">开始</button>
+      <button id="btn-cam-stop">停止</button>
+      <button id="btn-grab">抓一帧</button>
+    </div>
+    <div class="row">
+      <button id="btn-rec-start">录一段</button>
+      <button id="btn-rec-stop">停止录制</button>
+    </div>
+    <div class="meta" id="cam-meta">seq -, 校验 -</div>
+    <div class="meta">
+      帧率由驱动决定，web_tool 不做节流也不丢帧（<code>frames_dropped</code> 可核对）。
+      当前 <code>/dev/video0</code> 按分辨率选路：480x480 / 640x480 使用经过
+      完整熵校验的硬件 JPEG，864x480 自动回退到软件 JPEG；结构异常的硬件帧不会作为有效帧交付
+      （板上日志 <code>camera poll timeout</code>），尽管同尺寸用
+      <code>agent_camera</code> 单独跑能到 4.4 fps。这条通路正在被改，详见验收记录。
+    </div>
+  </section>
+
+  <!-- LLM -->
+  <section class="card" id="card-llm">
+    <h2>LLM 配置</h2>
+    <div class="row">
+      <input id="llm-host" placeholder="llm.host" size="18">
+    </div>
+    <div class="row">
+      <input id="llm-model" placeholder="llm.model" size="18">
+    </div>
+    <div class="row">
+      <input id="llm-key" placeholder="llm.key（sk-… / tp-…）" size="18"
+             type="password" autocomplete="off">
+      <button id="btn-key-show" class="mini" title="看一眼">👁</button>
+    </div>
+    <div class="row">
+      <button id="btn-llm-push">写入板子</button>
+      <button id="btn-llm-pull">读回</button>
+    </div>
+
+    <h3>本机记住 API key</h3>
+    <div class="row">
+      <input id="pin" placeholder="6 位以上数字 PIN" size="12"
+             type="password" inputmode="numeric" autocomplete="off">
+      <button id="btn-key-save">加密保存</button>
+    </div>
+    <div class="row">
+      <button id="btn-key-unlock">解锁并填入</button>
+      <button id="btn-key-forget">清除</button>
+    </div>
+    <div class="meta" id="key-meta"></div>
+    <div class="meta warn" id="key-warn"></div>
+  </section>
+
+  <!-- Wi-Fi -->
+  <section class="card" id="card-wifi">
+    <h2>Wi-Fi</h2>
+    <div class="row">
+      <input id="wifi-ssid" placeholder="SSID（2.4G）" size="16" value="AIPC">
+    </div>
+    <div class="row">
+      <input id="wifi-psk" placeholder="密码（开放热点留空）" size="16"
+             type="password" autocomplete="off">
+    </div>
+    <div class="row">
+      <button id="btn-wifi-connect">连接并保存</button>
+      <button id="btn-wifi-status">查看状态</button>
+    </div>
+    <div class="meta" id="wifi-meta"></div>
+    <div class="meta">
+      这颗芯片没有 5GHz 射频，SSID 必须是 2.4G 的那一个。
+    </div>
+  </section>
+
+  <!-- 控制 -->
+  <section class="card" id="card-control">
+    <h2>控制</h2>
+    <div class="row wrap">
+      <button data-cmd="agent_camera 640x480">拍一张</button>
+      <button data-cmd="periph_selftest">跑自检</button>
+      <button data-cmd="social_cue mock case 0">social_cue</button>
+      <button data-cmd="free">free</button>
+      <button data-cmd="ps">ps</button>
+      <button data-cmd="ifconfig">ifconfig</button>
+    </div>
+    <div class="row">
+      <button id="btn-status">系统状态</button>
+      <button id="btn-reboot" class="danger">重启</button>
+    </div>
+    <pre class="meta" id="sys-meta"></pre>
+  </section>
+
+  <!-- 配对与导出 -->
+  <section class="card" id="card-pair">
+    <h2>连接板子</h2>
+    <div class="meta" id="pair-state">板子未接入</div>
+    <div class="row">
+      <input id="pair-ssid" placeholder="SSID（2.4G）" size="12" value="AIPC">
+    </div>
+    <div class="row">
+      <input id="pair-psk" placeholder="Wi-Fi 密码" size="12" type="password"
+             autocomplete="off">
+    </div>
+    <div class="row">
+      <button id="btn-pair">一键配对（走串口）</button>
+    </div>
+    <div class="meta">
+      本机通过串口替你配网并启动 <code>web_tool</code>，然后板子主动拨回来——
+      它在 AP 的 NAT 后面，本机连不进去。配对期间会短暂占用串口，之后立刻释放。
+      <strong>当前固件使用 flash kvdb；首次配对后，Wi-Fi 与 web.* 配置会跨重启保留。</strong>
+    </div>
+    <details>
+      <summary class="meta">或者自己在串口粘这些</summary>
+      <pre class="meta pick" id="pair-cmds">…</pre>
+    </details>
+    <h3>导出</h3>
+    <div class="meta" id="cap-meta">未在录制</div>
+    <div class="row">
+      <button id="btn-cap-start">开始落盘</button>
+      <button id="btn-cap-stop">停止落盘</button>
+    </div>
+    <table id="sessions"><tbody></tbody></table>
+  </section>
+
+</main>
+
+<!-- 控制台：输入指令，看它自己的回显 -->
+<section id="consolepane">
+  <div id="consolebar">
+    <strong>控制台</strong>
+    <span class="meta">↑/↓ 翻历史，回车执行；命令走板上 NSH</span>
+    <span class="grow"></span>
+    <span class="meta" id="console-state"></span>
+    <button id="btn-console-kill" class="mini">停止当前命令</button>
+    <button id="btn-console-clear" class="mini">清屏</button>
+  </div>
+  <pre id="consoleout"></pre>
+  <div id="consoleinputrow">
+    <span class="prompt">nsh&gt;</span>
+    <input id="console-input" placeholder="输入命令，例如 free / ps / ls /dev"
+           autocomplete="off" spellcheck="false">
+  </div>
+</section>
+
+<div id="dragger" title="拖动改变日志高度"></div>
+
+<section id="logpane">
+  <div id="logbar">
+    <strong>日志</strong>
+    <input id="log-filter" placeholder="过滤（子串）" size="16">
+    <button id="btn-log-sub">订阅</button>
+    <button id="btn-log-unsub">取消订阅</button>
+    <button id="btn-log-pause">暂停</button>
+    <button id="btn-log-clear">清屏</button>
+    <span class="grow"></span>
+    <span id="dropped" class="warn"></span>
+  </div>
+  <pre id="log"></pre>
+</section>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
