@@ -1260,7 +1260,7 @@ static const struct imgsensor_ops_s g_bk7258_gc2145_ops =
  *
  *  1. A command recorded in a document is not a measurement.  An earlier
  *     round flipped this to YUYV citing `ffmpeg -pix_fmt yuyv422` from
- *     docs/main/2026-08-10-capture-success-and-prior-doc-limitations.md
+ *     docs/local/main/2026-08-10-capture-success-and-prior-doc-limitations.md
  *     §4.1, while §4.2 of that same document lists "YUYV 字节序" as NOT yet
  *     verified.
  *  2. This descriptor and the application must agree or VIDIOC_S_FMT fails,

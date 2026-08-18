@@ -1,4 +1,4 @@
-> **2026-08-18 最终策略更新：** 本文中“仅软件 JPEG”“480x480 多帧失败”以及“硬件 JPEG 普遍不可用”的段落是修复前的历史测量。当前固件在 480x480/640x480 使用完整熵校验、fail-closed 的硬件 JPEG；864x480 因解码像素不稳定自动回退软件。最终证据见 `docs/2026-08-18-三项修复实测记录.md`。
+> **2026-08-18 最终策略更新：** 本文中“仅软件 JPEG”“480x480 多帧失败”以及“硬件 JPEG 普遍不可用”的段落是修复前的历史测量。当前固件在 480x480/640x480 使用完整熵校验、fail-closed 的硬件 JPEG；864x480 因解码像素不稳定自动回退软件。最终证据见 `docs/local/2026-08-18-三项修复实测记录.md`。
 
 # Camera / Display / AI Agent 使用说明
 
@@ -380,7 +380,7 @@ kvdb: associating with <SSID> (WPA2) -- run `renew wlan0` for an address
 控制。`nsh` 配置**已打开**，`ai_agent` 配置仍关闭，等 `nsh` 上板验证过再打开。本轮修掉了
 四处（payload CRC-32 变体与服务端不一致、写请求把 AP 堆指针交给 CP、共享窗口没有 MPU
 region、`MB_CHNL_FLASH` 通知通道没注册），细节见
-`docs/superpowers/plans/2026-08-14-vela-kvdb-persistent-config.md` 第 6 节。
+`docs/local/superpowers/plans/2026-08-14-vela-kvdb-persistent-config.md` 第 6 节。
 
 关掉时 `kvdb set` 会明确告知，开机日志也会说明当前模式：
 

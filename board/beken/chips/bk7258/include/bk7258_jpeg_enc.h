@@ -258,7 +258,7 @@ int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
  * The block's own AC Huffman table does not match the table it encodes with,
  * and it emits neither a chroma AC table nor an SOS segment, so its header
  * cannot be used as-is; see the function comment and
- * docs/reference/camera.md 14.7.  Interrupt-context safe.
+ * docs/local/reference/camera.md 14.7.  Interrupt-context safe.
  */
 
 size_t bk7258_jpeg_enc_write_header(FAR uint8_t *buf, size_t pad);

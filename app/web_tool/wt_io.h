@@ -21,7 +21,7 @@
  * Authentication is a pinned SHA-256 of the server certificate, held in kvdb
  * as `web.fp`.  Chain verification is deliberately not used: there is no CA
  * bundle and no RTC, so a chain check would either fail or be theatre (see
- * docs/2026-08-17-TLS性能核查.md, and note that the upstream agent works
+ * docs/local/2026-08-17-TLS性能核查.md, and note that the upstream agent works
  * around the missing clock by forcing the year to 2026, which makes validity
  * checking meaningless).  A pinned fingerprint needs neither a clock nor a CA
  * and is a real decision about who is on the other end.

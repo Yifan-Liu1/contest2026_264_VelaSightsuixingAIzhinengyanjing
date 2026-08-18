@@ -360,7 +360,7 @@ void board_late_initialize(void)
    * configuration (no CONFIG_BOARDCTL_FINALINIT, no apps/nshlib start-up
    * script caller), so the test entry point is invoked here instead, from
    * the unconditionally-called CONFIG_BOARD_LATE_INITIALIZE hook.  See
-   * docs/superpowers/plans/2026-07-29-gc9d01-lcd-bringup.md Task 3 Step 3.
+   * docs/local/superpowers/plans/2026-07-29-gc9d01-lcd-bringup.md Task 3 Step 3.
    */
 #ifdef CONFIG_BK7258_GC9D01_FB
   /* GC9D01 framebuffers, one per populated panel: fb_register() calls
@@ -438,7 +438,7 @@ void board_late_initialize(void)
    * to make directly.  The old bk7258_gc2145_test() bare entry point is
    * kept as an independent NSH command (see bk7258_appinit.c) for
    * side-by-side diagnostic comparison, per design discussion in
-   * docs/superpowers/plans/2026-07-30-gc2145-camera-bringup.md -- it is
+   * docs/local/superpowers/plans/2026-07-30-gc2145-camera-bringup.md -- it is
    * intentionally NOT called from here anymore, so a bug in this new V4L2
    * driver cannot be masked by (or confused with) the old direct-call
    * path still running unconditionally at boot. */

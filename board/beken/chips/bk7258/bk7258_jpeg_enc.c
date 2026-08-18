@@ -772,7 +772,7 @@ void bk7258_jpeg_enc_stop(void)
  *   segment at all.  libjpeg's verdict on the raw stream is "Invalid JPEG
  *   file structure: missing SOS marker"; substituting the four standard
  *   tables plus an SOS decodes to a correct picture.  Evidence and the
- *   table-by-table comparison are in docs/reference/camera.md 14.7.
+ *   table-by-table comparison are in docs/local/reference/camera.md 14.7.
  *
  *   Layout.  The caller has the block write its bitstream at buf + pad rather
  *   than at buf, which buys the room the longer header needs:

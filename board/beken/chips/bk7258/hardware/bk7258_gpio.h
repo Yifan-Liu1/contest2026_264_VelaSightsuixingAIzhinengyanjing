@@ -27,7 +27,7 @@
  * BK7258_GPIO_OUTPUT_ENABLE with normal-polarity semantics turned out
  * to be based on gpio_struct.h's field name alone, without checking
  * gpio_ll.h's inverting wrapper -- see
- * docs/superpowers/plans/2026-07-31-gc9d01-qspi1-camera-v4l2-verification.md
+ * docs/local/superpowers/plans/2026-07-31-gc9d01-qspi1-camera-v4l2-verification.md
  * section 5.0 for that dead-end and how it was caught before being
  * committed as a real fix.) */
 #define BK7258_GPIO_OUTPUT_DISABLE    (1u << 3)

@@ -23,7 +23,7 @@ needs neither a clock nor a CA.
 The key is EC P-256, not RSA.  Two measured reasons: RSA-2048 key generation
 does not finish on this part, and ECDHE-ECDSA is the cheap key exchange (a full
 DHE-2048 handshake measured 541 ms on this board, of which ~460 ms was
-computation).  See docs/2026-08-17-TLS性能核查.md.
+computation).  See docs/local/2026-08-17-TLS性能核查.md.
 
 The key is generated once into host/tls/ and reused, so the fingerprint the
 operator pins stays valid across restarts.  Delete that directory to roll it,

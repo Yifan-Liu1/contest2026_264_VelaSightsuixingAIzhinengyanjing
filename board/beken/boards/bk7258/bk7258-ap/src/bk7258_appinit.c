@@ -13,7 +13,7 @@
  * GC9D01 bring-up test is instead invoked from board_late_initialize() in
  * bk7258_bringup.c, which is unconditionally called via
  * CONFIG_BOARD_LATE_INITIALIZE.  See
- * docs/superpowers/plans/2026-07-29-gc9d01-lcd-bringup.md Task 3 Step 3.
+ * docs/local/superpowers/plans/2026-07-29-gc9d01-lcd-bringup.md Task 3 Step 3.
  */
 
 int board_app_finalinitialize(uintptr_t arg)
