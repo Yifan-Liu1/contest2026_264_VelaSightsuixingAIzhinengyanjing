@@ -28,15 +28,6 @@ music.flac
 board/beken/chips/bk7258/sim_tests
 
 # Local scratch notes, not for submission
-#
-# 本机的调查记录、验收流水、skill 的 plans/specs 工作副本都放在 docs/local/，
-# 整个目录不提交。docs/ 其余部分（reference/、plans/、archive/、使用说明类）
-# 是交付内容，照常跟踪。
-#
-# 不要把这条写成 `docs/`：docs/ 下有 25 个已跟踪文件，整目录忽略之后**已跟踪
-# 的照旧可见、新建的全部静默消失**，于是同一个 docs/reference/ 里 README.md
-# 是跟踪的、camera.md 却进不了仓；更新已跟踪的 docs 文件还得 `git add -f`。
-# 2026-08-18 实测有 26 个文件被那条规则挡在仓外。
 docs/local/
 
 # ============================================================
@@ -81,30 +72,6 @@ agent_secrets.h
 *.raw
 *.bin
 *.rbl
-
-# 例外：logs/ 是参赛必交的 AI Coding 日志目录（见 logs/README.md）。上面的
-# *.log 是为串口抓取产物写的，不能顺手把交付日志也挡掉——本文件开头就写着
-# 「logs/ 下最终导出的 AI Coding 日志必须提交」，这里把它落实为规则。
-# logs/runtime/ 例外之外的一次性烧录日志由 logs/runtime/.gitignore 自己忽略。
-!logs/**
-
-# 主机侧单元测试编译出的可执行文件（无扩展名，逃过上面所有规则）。
-# 各测试目录另有自己的 .gitignore 逐个列名，这里只兜住新增的测试。
-app/*/tests/test_*
-!app/*/tests/test_*.c
-app/*/host/tests/test_*
-!app/*/host/tests/test_*.c
-
-# 仓内构建（正常在仓外，但 -b 可以指到任何地方）
-cmake_out*/
-
-# 崩溃与临时文件
-*.core
-core.[0-9]*
-*.tmp
-
-# 上板测试用的凭据，绝不能进仓（正常放在仓外）
-.board-secrets/
 
 # Python 工具的缓存（tools/ 下有脚本，在仓内直接跑会生成）
 __pycache__/
