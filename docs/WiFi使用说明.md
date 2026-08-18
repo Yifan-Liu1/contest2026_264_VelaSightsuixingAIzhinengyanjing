@@ -5,7 +5,22 @@
 
 ## STA 模式
 
-连接 2.4 GHz 热点：
+### 存一次，之后开机自动关联（推荐）
+
+```sh
+kvdb set wifi.ssid <2.4G_SSID>
+kvdb set wifi.psk  <密码>          # 开放热点跳过这行
+kvdb wifi                          # 立即关联
+renew wlan0                        # 首次 DHCP 可能需要重试一次
+```
+
+凭据存在 AP 自己的 flash 分区里（`CONFIG_BK7258_KVDB_FLASH`，见
+`使用说明-camera-display-ai_agent.md`），复位和掉电都不丢。当前 ai_agent 固件开机会
+自动关联并申请地址；上面的 `kvdb wifi` / `renew wlan0` 用于修改凭据后立即生效或手工救援。
+
+### 手工配网（不用 kvdb 时）
+
+进入 AP 的 NSH 后执行：
 
 ```sh
 ifup wlan0

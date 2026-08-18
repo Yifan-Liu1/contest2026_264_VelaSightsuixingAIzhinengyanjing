@@ -491,11 +491,20 @@ work tree; patches here are archived copies, not a fork.
 | File | Defect | Status |
 |---|---|---|
 | `src/tools/tool_camera.c` | Hardcoded geometry with no negotiation; 6 `%u` conversions applied to `uint32_t` (wrong on this ABI, and fatal under `-Werror=format`) | patch 0001 |
-| `src/core/agent_loop.c:665` | `-Wformat-truncation`: `%s` may write up to 511 bytes into a 473..483 byte region | not patched |
-| `src/core/agent_loop.c` (`calc_elapsed_ms`) | **The LLM watchdog times calls with `gettimeofday()`, and `vela_tls.c` sets the wall clock forward during the first handshake** (`Clock too old, forcing to 2026`). The first `ask` after boot therefore measures ~2.7e9 ms and is declared timed out even when the answer arrives. The helper already guards against the clock going *backwards*; forwards is the case that actually happens here. Should use `CLOCK_MONOTONIC` | not patched -- workaround: make one HTTPS call (`net_test`) before the first `ask` |
+| `src/core/agent_loop.c:665` | `-Wformat-truncation`: `%s` may write up to 511 bytes into a 473..483 byte region. A cut would land mid-message, i.e. mid UTF-8 sequence, putting an invalid byte on the wire to the channel | patch 0003 |
+| `src/core/agent_loop.c` (`calc_elapsed_ms`) | **The LLM watchdog times calls with `gettimeofday()`, and `vela_tls.c` sets the wall clock forward during the first handshake** (`Clock too old, forcing to 2026`). The first `ask` after boot therefore measures ~2.7e9 ms and is declared timed out even when the answer arrives. The helper already guards against the clock going *backwards*; forwards is the case that actually happens here. Should use `CLOCK_MONOTONIC` | patch 0004 -- the `net_test`-first workaround is no longer needed |
 | `src/llm/llm_proxy.c` (endpoint + diagnostics) | `AGENT_LLM_API_HOST` is an unconditional `#define`, so `agent_secrets.h` can supply a key and model but not a host -- a board configured entirely at build time has nowhere to send the request. Also, "Failed to parse API JSON" logged nothing about what arrived, which hid a captive-portal redirect page behind what looked like a model problem | patch 0002 |
 | agent response cache | An identical question replays the cached answer, including a cached *error* string: after a failed call, re-asking the same question prints the old failure with `Cache hit, skipping LLM call` and never retries. Cost us a wrong conclusion once | not patched -- vary the question when retesting |
-| `src/tools/skill_loader.c:448` | `%x` applied to `uint32_t` | not patched |
+| `src/tools/skill_loader.c:448` | `%x` applied to `uint32_t` (wrong on this ABI, fatal under `-Werror=format`) | patch 0003 |
 
-The two unpatched ones only block `-Werror`; they are reported here so the
-next person does not rediscover them.
+| `include/agent_config.h` | `AGENT_LLM_TIMEOUT_SEC` was an unconditional `#define`, so `agent_secrets.h` could not raise it for a slow link. This change existed in the work tree but was **not archived as a patch**, so a fresh checkout plus `apply.sh` did not reproduce the tree that had been built and flashed | patch 0005 |
+
+With 0003-0005 in place `configs/ai_agent` **builds clean under `-Werror`**;
+the note elsewhere that it cannot is obsolete. The remaining unpatched entry is
+the response cache, which is a design question rather than a defect: vary the
+question when retesting.
+
+`apply.sh --revert` now leaves `packages/ai_agent` pristine (verified: empty
+`git diff` over `src` and `include`), and re-applying restores all five. That
+round trip is the check that the archive is complete -- patch 0005 exists
+because it was not.
