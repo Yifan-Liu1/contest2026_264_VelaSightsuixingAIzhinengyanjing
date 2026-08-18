@@ -466,9 +466,9 @@ static void bk7258_jpeg_deinterleave(
  *   Encode one frame.  Returns the encoded length, or a negated errno.
  *
  *   Public, and deliberately free of this driver's device context, because
- *   the capture path needs the same encoder: the hardware JPEG block on
- *   /dev/video0 mis-assembles its bitstream (see the capture driver), so
- *   camera-to-JPEG is served by capturing UYVY and encoding it here.  Both
+ *   the capture path uses this encoder as its correctness fallback above
+ *   640 pixels.  Widths through 640 use the hardware block with exact
+ *   entropy validation; wider modes capture VYUY and encode it here.  Both
  *   users pass their own geometry, quality and de-interleave scratch.
  *
  *   Runs for a long time by driver standards -- 252 to 286ms for 640x480 at
@@ -1516,7 +1516,6 @@ static void bk7258_jpeg_process(struct bk7258_jpeg_enc_s *enc)
  * Public Functions
  ****************************************************************************/
 
-#ifdef CONFIG_BK7258_CAMERA_JPEG_SW
 /****************************************************************************
  * Name: bk7258_camera_sw_jpeg_encode
  *
@@ -1580,7 +1579,6 @@ static int bk7258_camera_sw_jpeg_encode(FAR uint8_t *src, size_t srclen,
 
   return bk7258_jpeg_sw_encode(&req);
 }
-#endif
 
 /****************************************************************************
  * Name: bk7258_jpeg_enc_initialize
@@ -1603,20 +1601,21 @@ int bk7258_jpeg_enc_initialize(void)
          "buffers from PSRAM)\n",
          CONFIG_BK7258_JPEG_ENC_DEV_PATH, CONFIG_BK7258_JPEG_ENC_QUALITY);
 
-  /* Serve /dev/video0's JPEG format from here too.  The hardware JPEG block
-   * delivers at 30fps but mis-assembles its bitstream, so a camera-to-JPEG
-   * capture comes back as parts of two frames; encoding a UYVY capture is
-   * slower and correct.  See bk7258_camera_set_sw_jpeg().
+  /* Always register the software encoder as a correctness fallback.
+   * CONFIG_BK7258_CAMERA_HW_JPEG selects the hardware block only for widths
+   * through 640, where decoded-pixel tests passed.  Hardware output is fully
+   * Huffman/MCU validated and invalid scans fail closed.  The 864x480 hardware
+   * stream was syntactically valid but pixel-incorrect, so wider captures use
+   * this software implementation.
    */
 
-#ifdef CONFIG_BK7258_CAMERA_JPEG_SW
   bk7258_camera_set_sw_jpeg(bk7258_camera_sw_jpeg_encode);
-#endif
 
-#ifdef CONFIG_BK7258_CAMERA_JPEG_SW
-  printf("bk7258_jpeg: /dev/video0 JPEG served by the software encoder\n");
+#ifdef CONFIG_BK7258_CAMERA_HW_JPEG
+  printf("bk7258_jpeg: /dev/video0 JPEG uses hardware through 640px, "
+         "software above 640px\n");
 #else
-  printf("bk7258_jpeg: /dev/video0 JPEG served by the hardware encoder\n");
+  printf("bk7258_jpeg: /dev/video0 JPEG served by the software encoder\n");
 #endif
 
   return 0;
