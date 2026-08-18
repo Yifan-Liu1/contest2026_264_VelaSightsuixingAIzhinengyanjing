@@ -311,37 +311,6 @@ endif
 
 endif
 
-config BK7258_KVDB_FLASH
-	bool "Back the key-value store with flash"
-	default n
-	---help---
-		Persists the store in the AP's own flash partition by asking the
-		CP's flash service over the mailbox, so an API key or Wi-Fi
-		passphrase survives a reset.
-
-		Off by default until the whole path has been through a board test.
-		Four things were wrong with it and are fixed; each was found by
-		reading the CP's own sources, and none of them can be seen from
-		this side because the console is tunnelled over the same mailbox
-		the failure takes down:
-
-		  - the payload CRC-32 was the seeded, complemented variant while
-		    the server computes calc_crc32(0, ...), so a read could only
-		    ever fail its check and a write could only ever be rejected;
-		  - a write handed the server a pointer into the AP's heap, which
-		    it cannot read -- the bytes now go through a staging window in
-		    SWAP, as the descriptor already did;
-		  - that staging window and the descriptor were not covered by any
-		    MPU region, reachable only through the default memory map,
-		    which calls them cacheable;
-		  - MB_CHNL_FLASH was unregistered, so the CP got no answer to the
-		    notification it raises before and after every flash access and
-		    spent 5ms per edge waiting for one.
-
-		With this off the store works normally for the current boot and
-		simply does not persist, which is what the board did before it
-		existed.
-
 config BK7258_CAMERA_JPEG_FPS
 	int "Maximum JPEG sampling rate on /dev/video0 (frames per second)"
 	default 30

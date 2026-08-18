@@ -40,27 +40,22 @@ typedef CODE void (*bk7258_kvdb_cb_t)(FAR const char *key,
  * Name: bk7258_kvdb_init
  *
  * Description:
- *   Load the store from flash.  Call from a thread once the mailbox link is
- *   up.  Returns OK when the store was read (empty counts), or a negated
- *   errno when flash is unavailable -- in which case the store still works
- *   for this boot but forgets on reset, and every accessor below keeps
- *   working.  Idempotent.
+ *   Bring the store up empty and usable.  Safe from board bring-up: it
+ *   touches nothing outside this core.  Idempotent.
  *
  ****************************************************************************/
 
 int bk7258_kvdb_init(void);
 
-/* Attach the flash backend and load the stored image.  Must be called from a
- * task, never from board bring-up: the request blocks on the CP, and blocking
- * bring-up starves the mailbox heartbeat until the CP resets the chip.
- * Until this succeeds the store works but does not survive a reset, which
- * bk7258_kvdb_persistent() reports.
+/* Kept as the place a backend would be attached from a task.  There is no
+ * backend today -- the AP has no flash controller of its own -- so this only
+ * reports that the store is memory-only and returns -ENOTSUP.
  */
 
 int bk7258_kvdb_load(void);
 
-/* Whether writes outlive a reset.  False means the store works for this boot
- * only -- see CONFIG_BK7258_KVDB_FLASH.
+/* Whether writes outlive a reset.  Always false: the store is memory-only,
+ * so it works for this boot and no longer.
  */
 
 bool bk7258_kvdb_persistent(void);

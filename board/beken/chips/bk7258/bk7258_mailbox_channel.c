@@ -22,7 +22,7 @@
 #include "hardware/bk7258_mbox.h"
 
 #define MB_CHANNEL_COUNT       7u
-#define MB_RX_CHANNEL_COUNT    7u
+#define MB_RX_CHANNEL_COUNT    6u
 #define MB_ACK_SLOT_COUNT      8u
 #define MB_ACK_HIGH_WATER      3u
 #define MB_TIMEOUT             MSEC2TICK(200)
@@ -120,7 +120,6 @@ static const uint8_t g_rx_channel_ids[MB_RX_CHANNEL_COUNT] =
   BK7258_MB_CHAN_WIFI_CMD_RX,
   BK7258_MB_CHAN_WIFI_DATA_RX,
   BK7258_MB_CHAN_UART0_RX,
-  BK7258_MB_CHAN_FLASH_RX,
   BK7258_MB_CHAN_SARADC_RX
 };
 

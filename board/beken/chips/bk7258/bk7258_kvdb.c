@@ -50,7 +50,6 @@
 
 #include <nuttx/mutex.h>
 
-#include "bk7258_flash_client.h"
 #include "bk7258_kvdb.h"
 
 /****************************************************************************
@@ -60,9 +59,13 @@
 #define KVDB_MAGIC        "VKVDB\0\0"
 #define KVDB_MAGIC_LEN    8u
 #define KVDB_VERSION      1u
-#define KVDB_SECTOR       BK7258_FLASH_AP_ENV_BASE
-#define KVDB_CAPACITY     BK7258_FLASH_SECTOR_SIZE
-#define KVDB_LOAD_CHUNK   BK7258_FLASH_CHUNK_SIZE
+
+/* The store is memory-only, so this is just how much of it there can be.  It
+ * keeps the flash sector size it was chosen for, so an image written by an
+ * older build still fits if the flash backend ever comes back.
+ */
+
+#define KVDB_CAPACITY     0x00001000u
 
 /****************************************************************************
  * Private Types
@@ -76,10 +79,6 @@ begin_packed_struct struct kvdb_header_s
   uint32_t bytes;      /* Record area length */
   uint32_t crc;        /* CRC-32 over the record area */
 } end_packed_struct;
-
-_Static_assert(KVDB_LOAD_CHUNK <= KVDB_CAPACITY &&
-               KVDB_LOAD_CHUNK >= sizeof(struct kvdb_header_s),
-               "kvdb load chunk must hold the header and fit the store");
 
 /****************************************************************************
  * Private Data
@@ -182,32 +181,15 @@ static bool g_kvdb_persistent;
 static int kvdb_flush(void)
 {
   FAR struct kvdb_header_s *hdr = kvdb_hdr();
-  int ret;
 
   hdr->crc = kvdb_crc32(kvdb_records(), hdr->bytes);
 
-  /* Nothing to write to when the store is memory-only.  Reporting an error
-   * here would be wrong: the value *was* stored, it just will not outlive the
+  /* Nothing to write to: the store is memory-only.  Reporting an error here
+   * would be wrong: the value *was* stored, it just will not outlive the
    * boot, and bk7258_kvdb_init() already said so once.
    */
 
-  if (!g_kvdb_persistent)
-    {
-      return OK;
-    }
-
-  ret = bk7258_flash_erase_sector(KVDB_SECTOR);
-  if (ret < 0)
-    {
-      return ret;
-    }
-
-  /* Only the part in use is written back.  The rest of the sector stays
-   * erased, which costs nothing and makes a truncated write obvious.
-   */
-
-  return bk7258_flash_write(KVDB_SECTOR, g_kvdb_image,
-                            sizeof(struct kvdb_header_s) + hdr->bytes);
+  return OK;
 }
 
 /****************************************************************************
@@ -234,16 +216,11 @@ int bk7258_kvdb_init(void)
         }
     }
 
-  /* Start empty and usable.  No flash access here on purpose: this runs from
-   * board bring-up, and talking to the CP's flash server from there wedged
-   * the AP -- the request never completed, not even into its own timeout, so
-   * the mailbox stopped being serviced, the heartbeat lapsed and the CP's
-   * 8-second watchdog reset the chip.  Measured as a reboot loop printing
-   * "connected to the CP flash server" every ~9 s, ending in
-   * "ap_bridg: link down" every time.
-   *
-   * The flash side is done later from a task (bk7258_kvdb_load()), where a
-   * blocking cross-core request is just a blocked task.
+  /* Start empty and usable.  There is no flash backend: the AP has no flash
+   * controller of its own, and reaching the CP's flash service over the
+   * mailbox is not something this board does -- that client was removed
+   * along with the CP-side changes it depended on.  Values live for the
+   * boot, and bk7258_kvdb_persistent() says so.
    */
 
   kvdb_reset_image();
@@ -255,84 +232,8 @@ int bk7258_kvdb_init(void)
 
 int bk7258_kvdb_load(void)
 {
-#ifndef CONFIG_BK7258_KVDB_FLASH
-  printf("kvdb: in-memory only (flash backend disabled)\n");
+  printf("kvdb: in-memory only (no flash backend)\n");
   return -ENOTSUP;
-#else
-  FAR struct kvdb_header_s *hdr;
-  int ret;
-
-  ret = bk7258_flash_client_init();
-  if (ret < 0)
-    {
-      printf("kvdb: in-memory only (no flash service: %d)\n", ret);
-      return ret;
-    }
-
-  nxmutex_lock(&g_kvdb_lock);
-
-  /* One chunk first, not the whole sector.  A stored configuration is a few
-   * hundred bytes, so this is almost always the entire store: reading 4KB
-   * blind costs eight chunks and sixteen cross-core frames to fetch mostly
-   * erased flash, and every one of those frames is exposure.  What the first
-   * chunk cannot hold, the header's own length tells us to go back for.
-   */
-
-  ret = bk7258_flash_read(KVDB_SECTOR, g_kvdb_image, KVDB_LOAD_CHUNK);
-  if (ret < 0)
-    {
-      /* Keep whatever is in memory rather than clearing it: a value set
-       * before the load finished is more useful than an empty store.
-       */
-
-      nxmutex_unlock(&g_kvdb_lock);
-      printf("kvdb: flash read failed (%d), staying in memory only\n", ret);
-      return ret;
-    }
-
-  memset(g_kvdb_image + KVDB_LOAD_CHUNK, 0, KVDB_CAPACITY - KVDB_LOAD_CHUNK);
-
-  hdr = kvdb_hdr();
-
-  if (memcmp(hdr->magic, KVDB_MAGIC, KVDB_MAGIC_LEN) == 0 &&
-      hdr->version == KVDB_VERSION &&
-      hdr->bytes <= KVDB_CAPACITY - sizeof(struct kvdb_header_s) &&
-      sizeof(struct kvdb_header_s) + hdr->bytes > KVDB_LOAD_CHUNK)
-    {
-      size_t used = sizeof(struct kvdb_header_s) + hdr->bytes;
-
-      ret = bk7258_flash_read(KVDB_SECTOR + KVDB_LOAD_CHUNK,
-                              g_kvdb_image + KVDB_LOAD_CHUNK,
-                              used - KVDB_LOAD_CHUNK);
-      if (ret < 0)
-        {
-          nxmutex_unlock(&g_kvdb_lock);
-          printf("kvdb: flash read failed (%d) past the first %u bytes, "
-                 "staying in memory only\n", ret,
-                 (unsigned int)KVDB_LOAD_CHUNK);
-          return ret;
-        }
-    }
-
-  if (memcmp(hdr->magic, KVDB_MAGIC, KVDB_MAGIC_LEN) != 0 ||
-      hdr->version != KVDB_VERSION ||
-      hdr->bytes > KVDB_CAPACITY - sizeof(struct kvdb_header_s) ||
-      hdr->crc != kvdb_crc32(kvdb_records(), hdr->bytes))
-    {
-      printf("kvdb: no valid store at 0x%08x, starting empty\n",
-             (unsigned int)KVDB_SECTOR);
-      kvdb_reset_image();
-    }
-  else
-    {
-      printf("kvdb: %lu key(s) loaded from flash, %lu bytes used\n",
-             (unsigned long)hdr->count, (unsigned long)hdr->bytes);
-    }
-
-  g_kvdb_persistent = true;
-  nxmutex_unlock(&g_kvdb_lock);
-  return OK;
-#endif
 }
 
 bool bk7258_kvdb_persistent(void)
