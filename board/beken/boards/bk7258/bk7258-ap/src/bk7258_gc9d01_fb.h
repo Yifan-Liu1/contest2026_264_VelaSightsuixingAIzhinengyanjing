@@ -105,4 +105,15 @@ int bk7258_gc9d01_fb_hello(int display);
 
 int bk7258_gc9d01_fb_hello_animate(int displays, int steps);
 
+/* Draw one word (with a colour) or two lines, and push once.  Used by the
+ * event-driven status screen; see bk7258_status_screen.c for why the product
+ * path draws these instead of a live preview.  Returns OK, -EINVAL for text
+ * the stroke font cannot draw, or -ENODEV if the panel is not up.
+ */
+
+int bk7258_gc9d01_fb_text(int display, FAR const char *text,
+                          uint16_t colour);
+int bk7258_gc9d01_fb_two_lines(int display, FAR const char *line1,
+                               FAR const char *line2);
+
 #endif /* __BOARDS_BEKEN_BK7258_AP_SRC_BK7258_GC9D01_FB_H */

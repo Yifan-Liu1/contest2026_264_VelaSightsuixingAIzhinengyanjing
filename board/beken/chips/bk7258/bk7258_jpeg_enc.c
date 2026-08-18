@@ -912,12 +912,63 @@ size_t bk7258_jpeg_enc_write_header(FAR uint8_t *buf, size_t pad)
 
       marker = buf[i + 1];
 
-      if (marker == 0xda || marker == 0xd9)
+      if (marker == 0xd9)
+        {
+          break;                     /* End of image: no entropy data. */
+        }
+
+      /* Only a length-bearing header segment may be walked over.  "Starts
+       * with FF" does not distinguish one: entropy data writes every FF as
+       * FF 00, so when the block emits no SOS of its own (the 480x480 path,
+       * camera.md 14.6) a picture whose first byte is FF presents an FF here
+       * too.  Reading a segment length out of that entropy data put the
+       * start 685 -> 17136 on the desktop fixture, and the frame still
+       * decoded -- as a displaced picture with the wrong DC and chroma,
+       * because every marker was nonetheless present.
+       *
+       * Anything not on this list ends the header, and `entropy` already
+       * points at the FF that begins the picture.
+       */
+
+      if (marker != 0xc0 && marker != 0xc4 && marker != 0xdb &&
+          marker != 0xda && marker != 0xdd && marker != 0xfe &&
+          (marker < 0xe0 || marker > 0xef))
         {
           break;
         }
 
       seglen = ((size_t)buf[i + 2] << 8) | buf[i + 3];
+
+      if (marker == 0xda)
+        {
+          /* The block does emit an SOS, and the entropy data begins after
+           * it -- not at it.  Consume the segment and stop.
+           *
+           * Treating SOS as "not a segment" and breaking here reported the
+           * entropy data as starting 16 bytes early, so the header the
+           * application received declared its scan to begin inside the
+           * block's own SOS.  Every frame then decoded to noise while
+           * carrying a perfectly valid marker structure, which is why the
+           * fault survived so long: SOF/DQT/DHT/SOS/EOI all check out.
+           *
+           * Measured on this board: the block's SOS sits at buf+870 with
+           * length 12, entropy at 884, and this function returned 868.
+           * Re-assembling a captured frame on the host with the payload
+           * shifted by those 16 bytes was the confirmation -- three frames
+           * of a static scene then agreed to within 2.8 grey levels, in the
+           * same range as the software encoder (1.5-11), while every other
+           * shift gave 3.6 or worse with wildly inconsistent pairs.
+           */
+
+          if (seglen >= 2)
+            {
+              i += 2 + seglen;
+              entropy = i;
+            }
+
+          break;
+        }
+
       if (seglen < 2)
         {
           break;
@@ -942,6 +993,16 @@ size_t bk7258_jpeg_enc_write_header(FAR uint8_t *buf, size_t pad)
     {
       return 0;
     }
+
+  /* The parser fallback may be before, after, or already inside the block's
+   * own SOS.  Search the complete bounded raw-header window rather than only
+   * forward from that fallback.  Captured failures declared entropy at
+   * 820-864 instead of 884 and began with tails of the old SOS; searching
+   * only forward can never see a marker that started behind the fallback.
+   */
+
+  entropy = bk7258_jpeg_find_sos_entropy(
+    buf, pad, pad + BK7258_JPEG_ENC_HDR_SCAN_MAX, entropy);
 
   fixed = 2 + stagelen + sizeof(g_std_dht);
 

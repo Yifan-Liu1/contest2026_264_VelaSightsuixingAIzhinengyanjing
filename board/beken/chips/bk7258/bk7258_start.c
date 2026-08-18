@@ -67,8 +67,22 @@ static const struct mpu_region_s g_bk7258_mpu_regions[] =
     MPU_RLAR_NONCACHEABLE
   },
   {
-    BK7258_IPC_TX_ADDRESS,
-    BK7258_IPC_TX_SIZE,
+    /* One region for the whole run of SWAP this core writes and the CP reads:
+     * the IPC TX frame, the flash service descriptor and the flash payload
+     * staging buffer.  Covered as one rather than three because the part's
+     * MPU region count is checked against this table at boot and a table that
+     * does not fit leaves the AP spinning in wfi with no output.
+     *
+     * It has to be covered at all: mpu_initialize() below is called with
+     * privdefena, so an unmapped address here would still work -- as
+     * cacheable Normal memory, per the ARMv8-M default map -- and the CP
+     * would then read whatever the AP's cache had not written back yet.  Only
+     * the I-Cache is on today, which is the only reason the gap that used to
+     * sit over the flash descriptor never showed up as corruption.
+     */
+
+    BK7258_MB_SHARED_RW_START,
+    BK7258_MB_SHARED_RW_SIZE,
     MPU_RBAR_XN | MPU_RBAR_AP_RWRW | MPU_RBAR_SH_INNER,
     MPU_RLAR_NONCACHEABLE
   },

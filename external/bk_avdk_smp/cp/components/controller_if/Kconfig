@@ -12,6 +12,14 @@ menu "Controller IF"
 		help
 		  Forward STA ARP and IPv4 traffic to the application core. The
 		  controller retains radio, association, security and EAPOL handling.
+	config WIFI_VNET_OPENVELA_SOFTAP_IPV4
+		bool "OpenVela owns SoftAP VNET IPv4"
+		depends on WIFI_VNET_CONTROLLER && CONTROLLER_RX_DIRECT_PSH
+		default n
+		help
+		  Forward ordinary SoftAP ARP and IPv4 traffic to the application
+		  core. EAPOL, hostapd, radio and station association remain on the
+		  controller core.
 	config CONTROLLER_WAR
 		bool "Controller RX Buf Directly push to AP"
 		default y

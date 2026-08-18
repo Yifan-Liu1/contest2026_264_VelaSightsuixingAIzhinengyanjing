@@ -1,0 +1,275 @@
+/* web_tool console styling.
+ *
+ * Layout C: four cards in a row, a permanent log pane below that can be
+ * dragged taller.  The point of the shape is that pressing a button and seeing
+ * what it did in the log are visible at the same time -- a log on another tab
+ * turns every action into two steps and an act of memory.
+ *
+ * Narrow screens fall back to a single column rather than shrinking the cards
+ * until the tables overflow.
+ *
+ * Degraded mode greys the cards that cannot work over serial alone instead of
+ * hiding them: a control that disappears looks like a bug, and one that is
+ * present but dead is worse.  Greyed out and labelled is the honest option.
+ */
+
+:root {
+  --bg: #12151a;
+  --card: #1b2028;
+  --edge: #2b323d;
+  --fg: #d8dee9;
+  --dim: #8b96a5;
+  --ok: #7ec87e;
+  --bad: #e06c75;
+  --warn: #e5c07b;
+  --accent: #61afef;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+#statusbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #0d1014;
+  border-bottom: 1px solid var(--edge);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.sep { color: var(--dim); }
+.grow { flex: 1 1 auto; }
+.warn { color: var(--warn); }
+
+.lamp {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--bad);
+  display: inline-block;
+}
+.lamp.on { background: var(--ok); }
+.lamp.idle { background: var(--dim); }
+
+#cards {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px;
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow: auto;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+  overflow: auto;
+}
+
+.card.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.card h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--accent);
+}
+
+.card h3 {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin: 4px 0;
+}
+.row.wrap { flex-wrap: wrap; }
+
+button, select, input {
+  background: #232a34;
+  color: var(--fg);
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font: inherit;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.mini { padding: 1px 6px; font-size: 12px; }
+button.danger { border-color: #6b3238; color: #f0a0a6; }
+input { min-width: 0; }
+
+.meta {
+  color: var(--dim);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 4px 0 0;
+}
+
+table { width: 100%; border-collapse: collapse; }
+td {
+  padding: 1px 3px;
+  vertical-align: top;
+  word-break: break-all;
+}
+td.k { color: var(--accent); white-space: nowrap; }
+td.masked { color: var(--warn); }
+
+.previewbox {
+  position: relative;
+  background: #05070a;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  min-height: 110px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.previewbox img { max-width: 100%; display: none; }
+#preview-none { color: var(--dim); }
+
+#dragger {
+  height: 6px;
+  cursor: row-resize;
+  background: var(--edge);
+  flex: 0 0 auto;
+}
+#dragger:hover { background: var(--accent); }
+
+#logpane {
+  display: flex;
+  flex-direction: column;
+  height: 260px;
+  flex: 0 0 auto;
+  min-height: 60px;
+  border-top: 1px solid var(--edge);
+}
+
+#logbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+  background: #0d1014;
+  flex: 0 0 auto;
+}
+
+#log {
+  margin: 0;
+  padding: 6px 8px;
+  overflow: auto;
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+#log .drop { color: var(--warn); }
+#log .err { color: var(--bad); }
+#log .me { color: var(--accent); }
+
+@media (max-width: 1500px) {
+  #cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 1100px) {
+  #cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 640px) {
+  #cards { grid-template-columns: 1fr; }
+}
+
+
+/* ---- console pane -----------------------------------------------------
+ * Separate from the log on purpose: this is what you typed and what it
+ * answered.  Merged into the log, your own command becomes impossible to find
+ * a second after you pressed enter.
+ */
+
+#consolepane {
+  display: flex;
+  flex-direction: column;
+  height: 200px;
+  flex: 0 0 auto;
+  min-height: 90px;
+  border-top: 1px solid var(--edge);
+}
+
+#consolebar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 8px;
+  background: #0d1014;
+  flex: 0 0 auto;
+}
+
+#consoleout {
+  margin: 0;
+  padding: 6px 8px;
+  overflow: auto;
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+  background: #06080b;
+}
+
+#consoleout .me { color: var(--accent); }
+#consoleout .err { color: var(--bad); }
+#consoleout .exit { color: var(--ok); }
+
+#consoleinputrow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 8px;
+  background: #0d1014;
+  flex: 0 0 auto;
+}
+
+#consoleinputrow .prompt { color: var(--ok); }
+
+#console-input {
+  flex: 1 1 auto;
+  background: #06080b;
+}
+
+#console-input:disabled { opacity: 0.4; }
+
+/* Pairing commands are meant to be selected and pasted, so make that easy and
+ * make it obvious that is what they are for. */
+.pick {
+  user-select: all;
+  background: #06080b;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  padding: 4px 6px;
+  color: var(--fg);
+}

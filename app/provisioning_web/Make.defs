@@ -1,0 +1,7 @@
+############################################################################
+# AP-mode provisioning web entry
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_264_PROVISION_WEB),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_264_provision_web
+endif

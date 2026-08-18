@@ -8,10 +8,15 @@ set(SRCS
     bk7258_gc9d01.c
     bk7258_ramdisk.c
     bk7258_camera_imgsensor.c
-    bk7258_camera_bringup.c)
+    bk7258_camera_bringup.c
+    bk7258_agent_config.c)
 
 if(CONFIG_BK7258_SDIO)
   list(APPEND SRCS bk7258_mmcsd.c)
+endif()
+
+if(CONFIG_BK7258_WIFI)
+  list(APPEND SRCS bk7258_wifi_config.c bk7258_net_autostart.c)
 endif()
 
 if(CONFIG_BK7258_AUDIO)
@@ -20,6 +25,7 @@ endif()
 
 if(CONFIG_BK7258_GC9D01_FB)
   list(APPEND SRCS bk7258_gc9d01_fb.c
+    bk7258_status_screen.c
     hello_paint.c
     hello_font.c)
 endif()

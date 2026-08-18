@@ -1,0 +1,43 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LVX_USE_DEMO_CONTEST2026_264_WEB_TOOL
+	bool "development-machine web console service"
+	default n
+	depends on NET_TCP && NETUTILS_CJSON && SYSLOG_REGISTER
+	select SYSTEM_POPEN
+	---help---
+		A TCP service the development machine's browser talks to through
+		host/console.py: read and write kvdb, configure Wi-Fi, start apps,
+		stream the syslog, stream JPEG frames from /dev/video0.
+
+		It replaces the "type a serial command, then run b64frames.py on
+		the transcript" loop.  Nothing about HTTP lives on the board: the
+		page and the WebSocket are the development machine's job, so the
+		page can be edited and reloaded without reflashing.
+
+		Access control is the kvdb key 'web.allow' -- one IPv4 address or
+		CIDR block, or several separated by commas.  With that key unset
+		the service does not listen at all, so the first setup has to go
+		through the serial console once.  A permissive default would make
+		the whitelist decoration and would allow the state where someone
+		believes it is in force while the board is open to the subnet.
+
+		Needs CONFIG_SYSLOG_MAX_CHANNELS >= 2: the log stream is a second
+		syslog channel, and registering one with a single slot replaces
+		the console channel, which is the boot log and the rescue path.
+		The build fails rather than let that happen silently.
+
+if LVX_USE_DEMO_CONTEST2026_264_WEB_TOOL
+
+config LVX_USE_DEMO_CONTEST2026_264_WEB_TOOL_PORT
+	int "TCP port"
+	default 8888
+	---help---
+		The port web_tool listens on.  8888 was checked against the
+		ports the CP-side firmware already uses.  Change it here and in
+		host/console.py together.
+
+endif # LVX_USE_DEMO_CONTEST2026_264_WEB_TOOL

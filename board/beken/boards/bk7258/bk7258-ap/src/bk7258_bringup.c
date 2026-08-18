@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include <nuttx/board.h>
+#include <nuttx/kthread.h>
 #include <nuttx/fs/fs.h>
 #include <nuttx/video/fb.h>
 
@@ -21,6 +22,10 @@
 #include "bk7258_gc9d01_fb.h"
 #include "hardware/bk7258_mbox.h"
 #include "bk7258_wifi.h"
+#include "bk7258_flash_client.h"
+#include "bk7258_kvdb.h"
+#include "bk7258_status_screen.h"
+#include "bk7258_net_autostart.h"
 
 #ifdef CONFIG_BK7258_TRNG
 #  include "bk7258_trng.h"
@@ -163,6 +168,19 @@ int bk7258_bringup(void)
       return ret;
     }
 
+  /* Answer the CP when it says it is about to touch flash.  Independent of
+   * whether this core ever asks for a flash write of its own: the CP raises
+   * the same notification around its own accesses and spins 5ms per edge
+   * waiting for the acknowledgement, which it was not getting.  Registering a
+   * callback does not talk to the CP, so it is safe this early.
+   */
+
+  ret = bk7258_flash_notify_init();
+  if (ret < 0)
+    {
+      printf("flash: operation notifications unavailable, error=%d\n", ret);
+    }
+
 #ifdef CONFIG_BK7258_SDIO
   ret = bk7258_mmcsd_schedule(CONFIG_BK7258_SDIO_AUTOINIT_DELAY_MS);
   if (ret < 0)
@@ -225,6 +243,53 @@ int bk7258_bringup(void)
     {
       return ret;
     }
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name: kvdb_loader
+ *
+ * Description:
+ *   Attaches the flash backend to the configuration store, injects the stored
+ *   LLM settings into the agent's config file and joins the stored Wi-Fi
+ *   network.
+ *
+ *   A task rather than part of bring-up because every step blocks on the CP.
+ *   Doing the flash read from bring-up stopped the AP from servicing the
+ *   mailbox, so the heartbeat lapsed and the CP's 8-second watchdog reset the
+ *   chip: a reboot loop that printed "connected to the CP flash server" every
+ *   ~9 s and ended each round in "ap_bridg: link down".  Here a slow or
+ *   missing flash service only delays this one task.
+ *
+ *   Failure is not fatal: the store still works, it just does not survive a
+ *   reset, and bk7258_kvdb_persistent() reports that.
+ *
+ ****************************************************************************/
+
+static int kvdb_loader(int argc, FAR char *argv[])
+{
+  UNUSED(argc);
+  UNUSED(argv);
+
+  if (bk7258_kvdb_load() >= 0)
+    {
+      bk7258_kvdb_seed_agent_config();
+    }
+
+#ifdef CONFIG_BK7258_WIFI
+  /* Whether or not the load worked: credentials typed during this boot are
+   * just as usable as credentials read back from flash.
+   *
+   * Association, DHCP and the console service, in that order and from this
+   * task -- see bk7258_net_autostart().  It replaced a bare
+   * bk7258_kvdb_apply_wifi() call here: associating without asking for an
+   * address left the interface RUNNING at NuttX's default 10.0.0.2, which
+   * looks configured and routes nowhere.
+   */
+
+  bk7258_net_autostart();
+#endif
 
   return 0;
 }
@@ -401,6 +466,28 @@ void board_late_initialize(void)
   (void)bk7258_jpeg_enc_initialize();
 #endif
 
+  /* Configuration that survives a reset.  Deliberately after the display and
+   * the camera: it talks to the CP's flash service over the mailbox and can
+   * wait up to a second if that service does not answer, which is not
+   * something the boot screen should queue behind.  A failure here is
+   * reported and ignored -- the board still runs, it just forgets settings on
+   * reset, which is what it did before this existed.
+   */
+
+  /* In-memory store now; the flash side is done by kvdb_loader below.
+   * Nothing here may block on the CP -- see bk7258_kvdb_init().
+   */
+
+  (void)bk7258_kvdb_init();
+
+  /* Leave the panels showing the product's own idle state rather than the
+   * boot greeting.  From here on the screen is event driven: it is repainted
+   * when a state or a result changes and at no other time, which is what the
+   * spec requires ("屏幕仅事件触发刷新，不运行实时 Camera Preview").
+   */
+
+  (void)bk7258_status_screen_state(BK7258_STATUS_IDLE);
+
 #ifdef CONFIG_BK7258_BLUETOOTH
   /* Last, so that nothing a user can see waits on the radio.  See
    * bk7258_bt_bringup() above for why this is not part of bk7258_bringup().
@@ -408,4 +495,13 @@ void board_late_initialize(void)
 
   bk7258_bt_bringup();
 #endif
+
+  /* Last, and detached: see kvdb_loader(). */
+
+  if (kthread_create("kvdb_loader", SCHED_PRIORITY_DEFAULT, 3072,
+                     kvdb_loader, NULL) < 0)
+    {
+      printf("bk7258_bringup: kvdb_loader not started; settings will not "
+             "survive a reset\n");
+    }
 }

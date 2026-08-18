@@ -14,11 +14,11 @@ CSRCS += bk7258_leds.c
 CSRCS += bk7258_gc9d01.c
 
 ifeq ($(CONFIG_BK7258_GC9D01_FB),y)
-CSRCS += bk7258_gc9d01_fb.c hello_paint.c hello_font.c
+CSRCS += bk7258_gc9d01_fb.c bk7258_status_screen.c hello_paint.c hello_font.c
 endif
 CSRCS += bk7258_ramdisk.c
 CSRCS += bk7258_camera_imgsensor.c
-CSRCS += bk7258_camera_bringup.c
+CSRCS += bk7258_camera_bringup.c bk7258_agent_config.c
 
 ifeq ($(CONFIG_BK7258_SDIO),y)
 CSRCS += bk7258_mmcsd.c
@@ -27,6 +27,11 @@ endif
 ifeq ($(CONFIG_BK7258_AUDIO),y)
 CSRCS += bk7258_audio_bringup.c
 CSRCS += bk7258_audio_dev.c
+endif
+
+ifeq ($(CONFIG_BK7258_WIFI),y)
+CSRCS += bk7258_wifi_config.c
+CSRCS += bk7258_net_autostart.c
 endif
 
 ifeq ($(CONFIG_BK7258_JPEG_ENC),y)

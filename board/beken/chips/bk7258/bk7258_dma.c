@@ -431,6 +431,54 @@ uint32_t bk7258_dma_get_channel_remain_len(uint8_t channel)
          BK7258_DMA_STATUS_REMAIN_LEN_MASK;
 }
 
+void bk7258_dma_get_channel_progress(uint8_t channel,
+                                     uint32_t *remain_len,
+                                     bool *finish_pending)
+{
+  uint32_t status = 0;
+
+  if (channel < BK7258_DMA_NCHANNELS)
+    {
+      status = getreg32(BK7258_DMA_CH_STATUS(channel));
+    }
+
+  if (remain_len != NULL)
+    {
+      *remain_len = status & BK7258_DMA_STATUS_REMAIN_LEN_MASK;
+    }
+
+  if (finish_pending != NULL)
+    {
+      *finish_pending =
+        (status & BK7258_DMA_STATUS_FINISH_INT) != 0;
+    }
+}
+
+/****************************************************************************
+ * Name: bk7258_dma_get_channel_dest_addr
+ *
+ * Description:
+ *   The channel's destination address register.  On this DMA word 1 is not a
+ *   latched copy of what was programmed: the channel advances it as it
+ *   writes, so in REPEAT mode it is the ring's write pointer and can be read
+ *   at any time without disturbing the transfer.
+ *
+ *   That matters for the JPEG drain, which needs to know where one frame's
+ *   bitstream ends without stopping the channel -- stopping it is what loses
+ *   the bytes of the following frame.
+ *
+ ****************************************************************************/
+
+uint32_t bk7258_dma_get_channel_dest_addr(uint8_t channel)
+{
+  if (channel >= BK7258_DMA_NCHANNELS)
+    {
+      return 0;
+    }
+
+  return getreg32(BK7258_DMA_CH_DEST_ADDR(channel));
+}
+
 /****************************************************************************
  * Name: bk7258_dma_flush_src_buffer
  *

@@ -25,11 +25,14 @@ set(SRCS
     bk7258_gc2145_i2c_bitbang.c
     bk7258_yuv_buf.c
     bk7258_jpeg_enc.c
+    bk7258_jpeg_entropy.c
     bk7258_camera_imgdata.c
     bk7258_aud.c
     bk7258_cpuindex.c
     bk7258_idle.c
-    bk7258_reset.c)
+    bk7258_reset.c
+    bk7258_flash_client.c
+    bk7258_kvdb.c)
 
 if(CONFIG_BK7258_SDIO)
   list(APPEND SRCS bk7258_sdio.c)

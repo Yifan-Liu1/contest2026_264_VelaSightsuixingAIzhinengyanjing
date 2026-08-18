@@ -1,7 +1,9 @@
 # SD-NAND 使用说明
 
 板载 SD-NAND 是持久存储，默认挂载到 `/mnt/sdnand`。系统启动约 5 秒后会自动
-挂载已有 FAT 文件系统；`/mnt` 本身是 PSRAM 临时盘，重启后内容会丢失。
+挂载已有 FAT 文件系统。`/mnt` 本身保持伪文件系统——NuttX 不允许在一个真实文件
+系统内部再挂载，所以把 PSRAM 临时盘挂在 `/mnt` 上会让 `/mnt/sdnand` 挂载失败
+（`error=-20`）。临时盘现在挂在 `/mnt/ram`，重启后内容会丢失。
 
 进入 AP 的 NSH 后查看状态和容量：
 
@@ -21,11 +23,23 @@ ls -l /mnt/sdnand
 常用文件操作：
 
 ```sh
-printf "hello\n" > /mnt/sdnand/test.txt
+echo hello > /mnt/sdnand/test.txt
 cat /mnt/sdnand/test.txt
 mv /mnt/sdnand/test.txt /mnt/sdnand/demo.txt
 rm /mnt/sdnand/demo.txt
 ```
+
+当前精简 NSH 的 `printf` 默认不追加换行。例如
+`printf hellon > /mnt/sdnand/test.txt` 写入的是字面值 `hellon`，不是 `hello` 加
+换行。通过 `printf` 生成的无末尾换行文件使用 `cat` 时，内容可能在下一次 `nsh>`
+提示符刷新时显示为空白；这是控制台显示现象，不影响文件内容或 SD-NAND 读写。
+普通文本行建议使用 `echo` 写入；需要核对实际字节时使用：
+
+```sh
+hexdump /mnt/sdnand/test.txt
+```
+
+该 NSH 的 `hexdump` 不支持 GNU/Linux 的 `-C` 参数。
 
 手工挂载或卸载：
 

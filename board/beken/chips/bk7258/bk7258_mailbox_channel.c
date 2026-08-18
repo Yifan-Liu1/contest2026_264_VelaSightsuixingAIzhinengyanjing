@@ -21,8 +21,8 @@
 #include "bk7258_driver.h"
 #include "hardware/bk7258_mbox.h"
 
-#define MB_CHANNEL_COUNT       6u
-#define MB_RX_CHANNEL_COUNT    5u
+#define MB_CHANNEL_COUNT       7u
+#define MB_RX_CHANNEL_COUNT    7u
 #define MB_ACK_SLOT_COUNT      8u
 #define MB_ACK_HIGH_WATER      3u
 #define MB_TIMEOUT             MSEC2TICK(200)
@@ -105,6 +105,7 @@ struct transport_stats
 static const uint8_t g_channel_ids[MB_CHANNEL_COUNT] =
 {
   BK7258_MB_CHAN_HW_CTRL_TX,
+  BK7258_MB_CHAN_IPC_TX,
   BK7258_MB_CHAN_PWC_TX,
   BK7258_MB_CHAN_BT_TX,
   BK7258_MB_CHAN_WIFI_CMD_TX,
@@ -114,10 +115,12 @@ static const uint8_t g_channel_ids[MB_CHANNEL_COUNT] =
 
 static const uint8_t g_rx_channel_ids[MB_RX_CHANNEL_COUNT] =
 {
+  BK7258_MB_CHAN_IPC_RX,
   BK7258_MB_CHAN_BT_RX,
   BK7258_MB_CHAN_WIFI_CMD_RX,
   BK7258_MB_CHAN_WIFI_DATA_RX,
   BK7258_MB_CHAN_UART0_RX,
+  BK7258_MB_CHAN_FLASH_RX,
   BK7258_MB_CHAN_SARADC_RX
 };
 
@@ -125,6 +128,7 @@ static struct logical_channel g_channels[MB_CHANNEL_COUNT];
 static struct active_transaction g_active;
 static struct recovery_epoch g_recovery[MB_RECOVERY_SLOT_COUNT];
 static struct ack_slot g_ack_slots[MB_ACK_SLOT_COUNT];
+
 static struct transport_stats g_stats;
 static bk7258_mb_channel_rx_t g_rx_callbacks[MB_RX_CHANNEL_COUNT];
 static void *g_rx_args[MB_RX_CHANNEL_COUNT];
@@ -802,10 +806,49 @@ static int handle_command(const struct bk7258_mb_wire_message *message)
     }
 
   memset(&slot->message, 0, sizeof(slot->message));
-  slot->message.header = bk7258_mb_make_header(
-    bk7258_mb_header_cmd(message), state, BK7258_MB_CTRL_ACK_BOX,
-    bk7258_mb_header_seq(message), channel);
-  slot->message.payload_address = ack_flags;
+  slot->message.header = bk7258_mb_make_ack_header(message,
+                                                   state != 0);
+  /* On the socket channels the peer reinterprets the whole ack box as the
+   * command it sent -- ipc_router_tx_cmpl_isr() in the CP's mb_ipc.c does a
+   * plain cast, `ipc_cmd = (mb_ipc_cmd_t *)ack_buf`, and then checks that
+   * param1 still matches what it queued (masked with IPC_PARAM1_MASK,
+   * 0x00FFFFFF).  So param1 has to be echoed, not replaced by our ack flags.
+   *
+   * Sending our own value instead made that check fail as "tx2 error @440!
+   * 150 != 0": the CP had queued 0x150 and got back 0.  A failed check makes
+   * the CP drop the frame without dequeuing it, and the router then takes the
+   * link down -- 200 ms after the request, every time.  That also destroys
+   * the only way to watch this from the AP, since the console is tunnelled
+   * over the same mailbox; the diagnosis had to come from the CP's own log
+   * plus its sources.
+   *
+   * param2 (payload_length and crc8) is echoed for the same reason.  The CP
+   * only compares it when built with DEBUG_MB_IPC, but echoing costs nothing
+   * and keeps the ack a faithful copy.
+   */
+
+  if (channel == BK7258_MB_CHAN_IPC_RX)
+    {
+      slot->message.payload_address = message->payload_address;
+      slot->message.payload_length = message->payload_length;
+      slot->message.crc8 = message->crc8;
+    }
+  else
+    {
+      slot->message.payload_address = ack_flags;
+    }
+
+  /* ack_state as well, not just ack_data1.  mb_chnl_ack_t's third word is the
+   * state field (its union names it ack_state), and that is the one the peer
+   * tests -- this port's own heartbeat does the same when it checks an ack
+   * (bk7258_ipc_heartbeat.c ipc_ack_result() reads ->reserved).  Leaving it
+   * zero while answering a command made the CP's mb_ipc socket stay in
+   * "receive in process" forever: every later request to its flash server
+   * came back with route and api status both RX_BUSY (ack byte 0x52) and no
+   * reply.  Callers that pass 0 are unaffected.
+   */
+
+  slot->message.reserved = ack_flags;
 
   if (ack_slots_used() >= MB_ACK_HIGH_WATER)
     {
@@ -922,23 +965,39 @@ static int mailbox_tx_worker(int argc, char **argv)
       flags = up_irq_save();
 
       probe = busy_probe();
-      if ((g_active.busy &&
-           clock_systime_ticks() - g_active.started >= MB_TIMEOUT) ||
-          (probe != NULL &&
-           clock_systime_ticks() - probe->started >= MB_TIMEOUT))
+      if (probe != NULL &&
+          clock_systime_ticks() - probe->started >= MB_TIMEOUT)
         {
+          /* A probe going unanswered really does mean the link is down: the
+           * probe is the thing that establishes it.  Recovery is right here.
+           */
+
           g_stats.timeout++;
-          if (probe != NULL)
-            {
-              probe->quarantine = true;
-              complete_transaction(probe, NULL, -ETIMEDOUT);
-              g_stats.probe_fail++;
-              set_link_state(BK7258_MB_LINK_DOWN);
-            }
-          else
-            {
-              begin_abort(-ETIMEDOUT);
-            }
+          probe->quarantine = true;
+          complete_transaction(probe, NULL, -ETIMEDOUT);
+          g_stats.probe_fail++;
+          set_link_state(BK7258_MB_LINK_DOWN);
+        }
+      else if (g_active.busy &&
+               clock_systime_ticks() - g_active.started >= MB_TIMEOUT)
+        {
+          /* An ordinary message going unanswered does not.  Fail that one
+           * transaction and carry on.
+           *
+           * This used to call begin_abort(), which quarantined the link and
+           * started a recovery epoch -- and while the link is PROBING, dispatch
+           * only lets probe frames out, so the console and the CP heartbeat
+           * were both blocked.  The CP's 8-second watchdog then reset the chip.
+           * Measured 2026-08-18: one unanswered flash read turned into an
+           * endless boot loop ("IPC[1]heartbeat timeout", "Assert at:
+           * mb_ipc_task:297"), because the transport treated a single
+           * application-level non-reply as evidence that the whole link was
+           * broken.  It is not: the console and the heartbeat were working up
+           * to that moment, and they are what recovery then destroyed.
+           */
+
+          g_stats.timeout++;
+          complete_transaction(&g_active, NULL, -ETIMEDOUT);
         }
 
       if (g_link_state == BK7258_MB_LINK_DOWN &&

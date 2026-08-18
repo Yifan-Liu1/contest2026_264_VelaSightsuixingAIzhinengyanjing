@@ -3,7 +3,9 @@
 #include "bk_wifi_types.h"
 #include "modules/wifi.h"
 #include "bk_wifi.h"
+#include "wifi_v2.h"
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 //#include "time/time.h"
 //#include "utils_httpc.h"
@@ -22,6 +24,10 @@ extern void stack_mem_dump(uint32_t stack_top, uint32_t stack_bottom);
 wifi_sta_config_t cif_sta_config = {0};
 
 #define OPENVELA_SCAN_PAGE_RECORDS 4
+#define OPENVELA_AP_ABI_VERSION 1
+#define OPENVELA_AP_SECURITY_OPEN 0
+#define OPENVELA_AP_SECURITY_WPA2 1
+#define OPENVELA_AP_MAX_CLIENTS 4
 
 static volatile bool s_openvela_scan_pending;
 static wifi_scan_result_t s_openvela_scan_result;
@@ -79,6 +85,29 @@ struct openvela_country_response {
     struct openvela_country country;
 };
 
+struct openvela_ap_start_request {
+    uint8_t version;
+    uint8_t channel;
+    uint8_t security;
+    uint8_t hidden;
+    uint8_t max_clients;
+    uint8_t ssid_length;
+    uint8_t password_length;
+    uint8_t reserved;
+    uint8_t ssid[32];
+    uint8_t password[64];
+};
+
+struct openvela_ap_status_response {
+    int32_t status;
+    uint8_t started;
+    uint8_t channel;
+    uint8_t security;
+    uint8_t client_count;
+    uint8_t mac[6];
+    uint8_t reserved[2];
+};
+
 _Static_assert(sizeof(struct openvela_scan_page_request) == 4,
                "OpenVela scan page request ABI");
 _Static_assert(sizeof(struct openvela_scan_record) == 48,
@@ -91,6 +120,16 @@ _Static_assert(sizeof(struct openvela_country) == 8,
                "OpenVela country ABI");
 _Static_assert(sizeof(struct openvela_country_response) == 12,
                "OpenVela country response ABI");
+_Static_assert(sizeof(struct openvela_ap_start_request) == 104,
+               "OpenVela AP start ABI");
+_Static_assert(offsetof(struct openvela_ap_start_request, ssid) == 8,
+               "OpenVela AP SSID offset");
+_Static_assert(offsetof(struct openvela_ap_start_request, password) == 40,
+               "OpenVela AP password offset");
+_Static_assert(sizeof(struct openvela_ap_status_response) == 16,
+               "OpenVela AP status ABI");
+_Static_assert(offsetof(struct openvela_ap_status_response, mac) == 8,
+               "OpenVela AP MAC offset");
 
 int cif_sta_app_init(char *oob_ssid, char *connect_key)
 {
@@ -458,6 +497,129 @@ bk_err_t cif_handle_bk_cmd_stop_ap_ind(uint8_t status)
     cfm.status = status;
 
     return cif_bk_send_event(BK_EVT_STOP_AP_IND, (uint8_t *)&cfm, sizeof(cfm));
+}
+
+static int32_t cif_openvela_ap_validate(
+    const struct openvela_ap_start_request *request)
+{
+    wifi_country_t country = {0};
+    bk_err_t ret;
+
+    if (request->version != OPENVELA_AP_ABI_VERSION ||
+        request->reserved != 0 || request->hidden > 1 ||
+        request->ssid_length == 0 || request->ssid_length > 32 ||
+        request->channel < 1 || request->channel > 14 ||
+        request->max_clients == 0 ||
+        request->max_clients > OPENVELA_AP_MAX_CLIENTS)
+    {
+        return BK_ERR_PARAM;
+    }
+
+    if (request->security == OPENVELA_AP_SECURITY_OPEN)
+    {
+        if (request->password_length != 0)
+            return BK_ERR_PARAM;
+    }
+    else if (request->security == OPENVELA_AP_SECURITY_WPA2)
+    {
+        if (request->password_length < 8 || request->password_length > 63)
+            return BK_ERR_PARAM;
+    }
+    else
+    {
+        return BK_ERR_NOT_SUPPORT;
+    }
+
+    ret = bk_wifi_get_country(&country);
+    if (ret == BK_OK && (request->channel < country.schan ||
+        request->channel >= country.schan + country.nchan))
+    {
+        return BK_ERR_PARAM;
+    }
+
+    return BK_OK;
+}
+
+static bk_err_t cif_handle_openvela_ap_start(struct bk_msg_hdr *msg)
+{
+    const struct openvela_ap_start_request *request =
+        (const struct openvela_ap_start_request *)(msg + 1);
+    wifi_ap_config_t config = WIFI_DEFAULT_AP_CONFIG();
+    int32_t status;
+
+    if (msg->len != sizeof(*request))
+    {
+        status = BK_ERR_PARAM;
+    }
+    else
+    {
+        status = cif_openvela_ap_validate(request);
+        if (status == BK_OK)
+        {
+            os_memcpy(config.ssid, request->ssid, request->ssid_length);
+            config.ssid[request->ssid_length] = '\0';
+            os_memcpy(config.password, request->password,
+                      request->password_length);
+            config.password[request->password_length] = '\0';
+            config.channel = request->channel;
+            config.hidden = request->hidden;
+            config.max_con = request->max_clients;
+            config.security = request->security == OPENVELA_AP_SECURITY_OPEN ?
+                              WIFI_SECURITY_NONE : WIFI_SECURITY_WPA2_AES;
+            config.disable_dns_server = 1;
+            status = bk_wifi_ap_set_config(&config);
+            if (status == BK_OK)
+                status = bk_wifi_ap_start();
+            if (status == BK_OK)
+                cif_handle_bk_cmd_start_ap_ind(CONTROLLER_AP_START);
+        }
+    }
+
+    return cif_bk_cmd_confirm(msg, (uint8_t *)&status, sizeof(status));
+}
+
+static bk_err_t cif_handle_openvela_ap_stop(struct bk_msg_hdr *msg)
+{
+    int32_t status = msg->len == 0 ? bk_wifi_ap_stop() : BK_ERR_PARAM;
+
+    if (status == BK_OK)
+        cif_handle_bk_cmd_stop_ap_ind(CONTROLLER_AP_CLOSE);
+
+    return cif_bk_cmd_confirm(msg, (uint8_t *)&status, sizeof(status));
+}
+
+static bk_err_t cif_handle_openvela_ap_status(struct bk_msg_hdr *msg)
+{
+    struct openvela_ap_status_response response = {0};
+    wifi_ap_config_t config = {0};
+    wlan_ap_stas_t stas = {0};
+
+    if (msg->len != 0)
+    {
+        response.status = BK_ERR_PARAM;
+    }
+    else
+    {
+        response.status = bk_wifi_ap_get_config(&config);
+        if (response.status == BK_OK)
+        {
+            response.started = wifi_ap_is_started();
+            response.channel = config.channel;
+            response.security = config.security == WIFI_SECURITY_NONE ?
+                                OPENVELA_AP_SECURITY_OPEN :
+                                OPENVELA_AP_SECURITY_WPA2;
+            response.status = bk_wifi_ap_get_mac(response.mac);
+            if (response.status == BK_OK &&
+                bk_wifi_ap_get_sta_list(&stas) == BK_OK)
+            {
+                if (stas.num >= 0 && stas.num <= OPENVELA_AP_MAX_CLIENTS)
+                    response.client_count = stas.num;
+                bk_wifi_free_get_sta_list_memory(&stas);
+            }
+        }
+    }
+
+    return cif_bk_cmd_confirm(msg, (uint8_t *)&response, sizeof(response));
 }
 
 bk_err_t cif_handle_bk_cmd_scan_wifi_req(struct bk_msg_hdr *msg)
@@ -960,6 +1122,22 @@ bk_err_t cif_handle_wifi_ctrnl_cmd(struct bk_msg_hdr *msg)
         case BK_CMD_OPENVELA_COUNTRY_SET:
         {
             ret = cif_handle_openvela_country_set(msg);
+            break;
+        }
+        case BK_CMD_OPENVELA_AP_START:
+        {
+            cif_env.host_wifi_init = true;
+            ret = cif_handle_openvela_ap_start(msg);
+            break;
+        }
+        case BK_CMD_OPENVELA_AP_STOP:
+        {
+            ret = cif_handle_openvela_ap_stop(msg);
+            break;
+        }
+        case BK_CMD_OPENVELA_AP_STATUS:
+        {
+            ret = cif_handle_openvela_ap_status(msg);
             break;
         }
 

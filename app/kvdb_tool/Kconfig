@@ -1,0 +1,18 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LVX_USE_DEMO_CONTEST2026_264_KVDB_TOOL
+	bool "Persistent configuration (kvdb)"
+	default n
+	---help---
+		Reads and writes the key-value store that lives in the AP's own
+		flash partition (easyflash_ap, 8KB at 0x007FC000), so an API key or
+		a Wi-Fi passphrase is typed once and survives a reset.
+
+		Before this existed the key had to be compiled in through
+		packages/ai_agent/include/agent_secrets.h -- a header in a public
+		repository, which put the key into the .bin -- and Wi-Fi
+		credentials had to be re-entered after every reset because /mnt is
+		a PSRAM ramdisk.

@@ -1,0 +1,62 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LVX_USE_DEMO_CONTEST2026_264_PROVISION_WEB
+	bool "AP-mode provisioning web entry"
+	default n
+	depends on NET_TCP && NET_TCPBACKLOG
+	---help---
+		A minimal HTTP server that serves one form, accepts an SSID and a
+		passphrase, and writes them to persistent storage.  Meant to be
+		started by the application through
+		velasight_provisioning_start() once the radio is already in
+		SoftAP; it never changes the Wi-Fi role itself, so the
+		application stays in control of when the network may drop.
+
+		NET_TCPBACKLOG is required, not merely nice to have.  Without it
+		NuttX reports no poll event for a pending connection on a
+		listening socket (TCP_BACKLOG is the only source of POLLIN
+		there), and accept() blocks with no timeout, so a listener that
+		can still be stopped is impossible.  The observed symptom of
+		building without it is a service that reports "listening" and
+		then never answers a request.
+
+		The provision_web command is the manual front end for bringing
+		it up over the console.
+
+		The page is plain HTTP with no authentication, which is the usual
+		trade-off for a provisioning page on an access point.  Run it
+		only while provisioning.
+
+if LVX_USE_DEMO_CONTEST2026_264_PROVISION_WEB
+
+config VELASIGHT_PROVISION_STORE
+	string "Provisioning record path"
+	default "/mnt/sdnand/prov/wifi.bin"
+	---help---
+		Where the credential record is written.  The default is on
+		SD-NAND because that is the only persistent filesystem: /mnt is
+		pseudo-filesystem and /mnt/ram is a PSRAM ramdisk.  The parent
+		directory is created on demand.
+
+		Every path component must fit 8.3.  That SD-NAND is VFAT without
+		long-name support (CONFIG_FAT_LFN is not set), which rejects a
+		"velasight" directory or a "wifi-provision.bin" file with
+		-EINVAL rather than shortening it.
+
+		The passphrase is stored in the clear: VFAT has no permission
+		model to rely on and this part has no confirmed device key.  It
+		is never logged and never echoed back over HTTP, but physical
+		access to the SD-NAND reveals it.
+
+config VELASIGHT_PROVISION_PORT
+	int "Provisioning HTTP port"
+	default 80
+	range 1 65535
+	---help---
+		The port used when the caller passes 0.  80 means a phone can
+		open http://<board-ip>/ with no port in the URL.
+
+endif

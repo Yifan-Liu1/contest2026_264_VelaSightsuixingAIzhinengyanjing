@@ -437,12 +437,10 @@ static void preview_release_ctty(void)
  *   Emit an encoded frame on the console in the same fenced base64 form
  *   agent_camera uses, so tools/b64frames.py rebuilds either one and the two
  *   paths can be compared byte for byte.  It exists here because the two
- *   paths do not agree: the hardware JPEG path (agent_camera, /dev/video0 in
- *   JPEG mode) mis-assembles its bitstream -- consecutive frames of a static
- *   scene came back differing by 50 to 140 grey levels, the tail of each
- *   picture belonging to a different frame, while every marker check passed
- *   -- whereas this path encodes a frame that came through the verified UYVY
- *   capture, so it is the one to trust for evidence.
+ *   paths intentionally differ by geometry: /dev/video0 uses exact-validated
+ *   hardware JPEG at 480x480 and 640x480, and software JPEG above 640 pixels.
+ *   This diagnostic path always encodes a verified raw capture, so it remains
+ *   useful as an independent decoded-pixel reference.
  *
  ****************************************************************************/
 
