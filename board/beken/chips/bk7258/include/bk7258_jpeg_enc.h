@@ -10,6 +10,7 @@
 #define __VENDOR_BEKEN_CHIPS_BK7258_INCLUDE_BK7258_JPEG_ENC_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <nuttx/compiler.h>
@@ -175,6 +176,79 @@ bool bk7258_jpeg_enc_fifo_empty(void);
  */
 
 #define BK7258_JPEG_ENC_HDR_SCAN_MAX  1024u
+
+/* How far past the end of the block's last header segment to look for the
+ * block's own SOS.  The block pads with a run of FF fill whose length varies
+ * from frame to frame, so the SOS does not sit at a fixed offset; 48 bytes
+ * covers every run measured on this board with room to spare.  FF DA cannot
+ * occur inside entropy data, so a wider window cannot cause a false hit.
+ */
+
+#define BK7258_JPEG_ENC_SOS_SCAN      48u
+
+/* Find the hardware block's real SOS anywhere in its bounded raw-header
+ * window.  The parser fallback can lie before, after, or inside this segment:
+ * captured bad frames exposed suffixes such as 11 00 3f 00 at the declared
+ * entropy start.  JPEG byte-stuffs FF in entropy as FF 00, so a validated
+ * FF DA / length 12 / three-component segment cannot be entropy data.
+ */
+
+static inline size_t bk7258_jpeg_find_sos_entropy(
+    FAR const uint8_t *buf, size_t begin, size_t end, size_t fallback)
+{
+  size_t scan_begin;
+  size_t scan_end;
+  size_t i;
+
+  if (buf == NULL || begin >= end)
+    {
+      return fallback;
+    }
+
+  scan_begin = fallback > BK7258_JPEG_ENC_SOS_SCAN ?
+               fallback - BK7258_JPEG_ENC_SOS_SCAN : begin;
+  if (scan_begin < begin)
+    {
+      scan_begin = begin;
+    }
+
+  scan_end = fallback + BK7258_JPEG_ENC_SOS_SCAN;
+  if (scan_end > end)
+    {
+      scan_end = end;
+    }
+
+  for (i = scan_begin; i + 4u < scan_end; i++)
+    {
+      if (buf[i] == 0xffu && buf[i + 1u] == 0xdau)
+        {
+          size_t seglen = ((size_t)buf[i + 2u] << 8) | buf[i + 3u];
+          size_t entropy = i + 2u + seglen;
+          size_t components = seglen >= 6u ? (seglen - 6u) / 2u : 0u;
+
+          if (seglen >= 8u && ((seglen - 6u) & 1u) == 0u &&
+              components == buf[i + 4u] && entropy <= scan_end)
+            {
+              return entropy;
+            }
+        }
+    }
+
+  return fallback;
+}
+
+/* Validate one baseline 4:2:2 entropy scan against its exact MCU count.
+ * An aligned scan is left untouched and returns 0.  If the hardware inserted
+ * 1-7 leading bits, remove the smallest structurally valid count in place,
+ * update *len for changed byte stuffing, and return that count.  Return a
+ * negated errno without mutation when no alignment validates or capacity is
+ * insufficient for the overlap-safe repair.  `capacity` starts at `buf`.
+ */
+
+int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
+                                size_t capacity, uint16_t width,
+                                uint16_t height);
+
 
 /* Rewrites the header in front of an encoded frame so that standard decoders
  * accept it, in place and without moving the entropy data.  Returns the

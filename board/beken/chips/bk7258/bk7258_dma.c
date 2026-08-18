@@ -431,6 +431,29 @@ uint32_t bk7258_dma_get_channel_remain_len(uint8_t channel)
          BK7258_DMA_STATUS_REMAIN_LEN_MASK;
 }
 
+void bk7258_dma_get_channel_progress(uint8_t channel,
+                                     uint32_t *remain_len,
+                                     bool *finish_pending)
+{
+  uint32_t status = 0;
+
+  if (channel < BK7258_DMA_NCHANNELS)
+    {
+      status = getreg32(BK7258_DMA_CH_STATUS(channel));
+    }
+
+  if (remain_len != NULL)
+    {
+      *remain_len = status & BK7258_DMA_STATUS_REMAIN_LEN_MASK;
+    }
+
+  if (finish_pending != NULL)
+    {
+      *finish_pending =
+        (status & BK7258_DMA_STATUS_FINISH_INT) != 0;
+    }
+}
+
 /****************************************************************************
  * Name: bk7258_dma_get_channel_dest_addr
  *

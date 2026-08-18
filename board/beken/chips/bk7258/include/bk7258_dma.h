@@ -114,6 +114,15 @@ void bk7258_dma_start_channel(uint8_t channel);
 void bk7258_dma_stop_channel(uint8_t channel);
 uint32_t bk7258_dma_get_channel_remain_len(uint8_t channel);
 
+/* Read remain_len and the finish-pending bit from one status-register
+ * snapshot.  This matters at a REPEAT boundary: reading them separately can
+ * combine two different chunks.  Safe in interrupt context.
+ */
+
+void bk7258_dma_get_channel_progress(uint8_t channel,
+                                     uint32_t *remain_len,
+                                     bool *finish_pending);
+
 /* The channel's live destination pointer; see the implementation for why it
  * can be read while the channel runs.
  */
