@@ -21,9 +21,18 @@
 #define BK7258_WIFI_CMD_OPENVELA_SCAN_PAGE 0x20du
 #define BK7258_WIFI_CMD_OPENVELA_COUNTRY_GET 0x20eu
 #define BK7258_WIFI_CMD_OPENVELA_COUNTRY_SET 0x20fu
+#define BK7258_WIFI_CMD_OPENVELA_AP_START 0x210u
+#define BK7258_WIFI_CMD_OPENVELA_AP_STOP 0x211u
+#define BK7258_WIFI_CMD_OPENVELA_AP_STATUS 0x212u
 #define BK7258_WIFI_CFM_OFFSET            0x8000u
 
 #define BK7258_WIFI_EVT_IPV4_IND          1u
+#define BK7258_WIFI_EVT_DISCONNECT_IND    3u
+#define BK7258_WIFI_EVT_START_AP_IND      4u
+#define BK7258_WIFI_EVT_ASSOC_AP_IND      5u
+#define BK7258_WIFI_EVT_DISASSOC_AP_IND   6u
+#define BK7258_WIFI_EVT_STOP_AP_IND       7u
+#define BK7258_WIFI_EVT_SCAN_WIFI_IND     8u
 #define BK7258_WIFI_EVT_WIFI_EVENT_IND    0x12u
 #define BK7258_WIFI_EVENT_CONNECTED       2u
 #define BK7258_WIFI_EVENT_DISCONNECTED    4u
@@ -36,6 +45,50 @@
 #define BK7258_WIFI_CMD_PATTERN_BUSY      0xcafebabeu
 #define BK7258_WIFI_TX_HEADROOM           708u
 #define BK7258_WIFI_SCAN_PAGE_RECORDS      4u
+#define BK7258_WIFI_WIRE_VIF_STA          0u
+#define BK7258_WIFI_WIRE_VIF_SOFTAP       1u
+#define BK7258_WIFI_CPDU_VIF_SHIFT        2u
+#define BK7258_WIFI_CPDU_VIF_MASK         0x0cu
+#define BK7258_WIFI_AP_ABI_VERSION        1u
+#define BK7258_WIFI_AP_SECURITY_OPEN      0u
+#define BK7258_WIFI_AP_SECURITY_WPA2      1u
+#define BK7258_WIFI_AP_MAX_CLIENTS        4u
+
+struct bk7258_wifi_ap_start_request
+{
+  uint8_t version;
+  uint8_t channel;
+  uint8_t security;
+  uint8_t hidden;
+  uint8_t max_clients;
+  uint8_t ssid_length;
+  uint8_t password_length;
+  uint8_t reserved;
+  uint8_t ssid[32];
+  uint8_t password[64];
+};
+
+struct bk7258_wifi_ap_status_response
+{
+  int32_t status;
+  uint8_t started;
+  uint8_t channel;
+  uint8_t security;
+  uint8_t client_count;
+  uint8_t mac[6];
+  uint8_t reserved[2];
+};
+
+static inline uint8_t bk7258_wifi_cpdu_get_vif(uint8_t flags)
+{
+  return (flags & BK7258_WIFI_CPDU_VIF_MASK) >> BK7258_WIFI_CPDU_VIF_SHIFT;
+}
+
+static inline uint8_t bk7258_wifi_cpdu_set_vif(uint8_t flags, uint8_t vif)
+{
+  return (flags & (uint8_t)~BK7258_WIFI_CPDU_VIF_MASK) |
+         ((vif << BK7258_WIFI_CPDU_VIF_SHIFT) & BK7258_WIFI_CPDU_VIF_MASK);
+}
 
 struct bk7258_wifi_scan_page_request
 {
@@ -170,5 +223,15 @@ _Static_assert(sizeof(struct bk7258_wifi_country) == 8,
                "Wi-Fi country ABI must be 8 bytes");
 _Static_assert(sizeof(struct bk7258_wifi_country_response) == 12,
                "Wi-Fi country response ABI must be 12 bytes");
+_Static_assert(sizeof(struct bk7258_wifi_ap_start_request) == 104,
+               "Wi-Fi AP start request ABI must be 104 bytes");
+_Static_assert(offsetof(struct bk7258_wifi_ap_start_request, ssid) == 8,
+               "Wi-Fi AP SSID offset");
+_Static_assert(offsetof(struct bk7258_wifi_ap_start_request, password) == 40,
+               "Wi-Fi AP password offset");
+_Static_assert(sizeof(struct bk7258_wifi_ap_status_response) == 16,
+               "Wi-Fi AP status response ABI must be 16 bytes");
+_Static_assert(offsetof(struct bk7258_wifi_ap_status_response, mac) == 8,
+               "Wi-Fi AP MAC offset");
 
 #endif

@@ -440,12 +440,19 @@ bool cif_rx_local_packet_check(struct pbuf **p_ptr, struct eth_hdr * ethhdr,void
     bool upload2ctrl = true;
     struct pbuf *p = *p_ptr;
     bk_err_t ret = BK_OK;
+    const bool ordinary_vif = !cif_vif_is_p2p(vif);
+    const netif_if_t vif_type = wifi_netif_vif_to_netif_type(vif);
 #if CONFIG_WIFI_VNET_AP_IPV4
-    const bool ap_owns_ipv4 = (wifi_netif_vif_to_netif_type(vif) == NETIF_IF_STA) &&
-                              !cif_vif_is_p2p(vif);
+    const bool sta_owns_ipv4 = ordinary_vif && vif_type == NETIF_IF_STA;
 #else
-    const bool ap_owns_ipv4 = false;
+    const bool sta_owns_ipv4 = false;
 #endif
+#if CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4
+    const bool softap_owns_ipv4 = ordinary_vif && vif_type == NETIF_IF_AP;
+#else
+    const bool softap_owns_ipv4 = false;
+#endif
+    const bool ap_owns_ipv4 = sta_owns_ipv4 || softap_owns_ipv4;
 
     CIF_LOGV("%s p:%x next:0x%x payload:0x%x sizeof:%d\r\n",__func__, p, p->next, p->payload, sizeof(struct pbuf));
 

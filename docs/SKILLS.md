@@ -121,7 +121,8 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 | 16 MiB PSRAM MPU、AP heap、四个媒体 pool | 已实现基线，器件容量查询、DMA lease、恢复和完整实测未闭环 |
 | Camera GC2145 / LCD | 驱动和框架代码存在，完整显示链仍在开发 |
 | CPU2 NuttX SMP | 已实现基础启动、IPI 和双逻辑 CPU 运行基线 |
-| Wi-Fi wlan0 | 已实现并通过关联、DHCP、DNS、TCP/TLS/HTTPS 实板门禁 |
+| Wi-Fi wlan0 STA | 已实现并通过关联、DHCP、DNS、TCP/TLS/HTTPS 实板门禁 |
+| Wi-Fi wlan0 SoftAP | WPA2 beacon、手机关联和 NuttX DHCP 启动已实板通过；双向数据面、反复切换和稳定性门禁待完成 |
 | Bluetooth NuttX Host | 方案阶段，未实现 |
 | SDIO / MMCSD / FAT | 可写 1-bit PIO、CMD24、MMCSD、FAT32、自动挂载和重启持久化实板通过；DMA/4-bit/CMD25 未启用，压力与断电门禁未完成 |
 | 量产 secure boot | 未建立 |
@@ -139,7 +140,8 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 | PSRAM、allocator、媒体内存 | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_AP_PORTING_PLAN.md` |
 | CPU2 / NuttX SMP | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_AP_PORTING_PLAN.md`；历史独立方案在 `docs/archive/` |
 | UART0 / Mailbox V2 控制台 | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_UART0_MAILBOX_V2_PORTING_PLAN.md` |
-| Wi-Fi | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_WIFI_PORTING_PLAN.md` |
+| Wi-Fi STA | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_WIFI_PORTING_PLAN.md` |
+| Wi-Fi SoftAP、DHCP 和 STA/AP 切换 | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_WIFI_AP_MODE_PORTING_PLAN.md`；操作命令见 `docs/WiFi使用说明.md` |
 | Bluetooth | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_BLUETOOTH_PORTING_PLAN.md` |
 | SDIO / SD-NAND / FAT | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_SDIO_PORTING_PLAN.md` |
 | MiMo 多模态网络、TLS、ASR/TTS | `contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/BK7258_OPENVELA_MIMO_NETWORK_PORTING_PLAN.md` |

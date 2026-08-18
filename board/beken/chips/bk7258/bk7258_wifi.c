@@ -33,9 +33,11 @@
 #define WIFI_RECYCLE_QUEUE       16u
 #define WIFI_PACKET_QUEUE        4u
 #define WIFI_COMMAND_TIMEOUT     MSEC2TICK(2000)
+#define WIFI_ROLE_STOP_TIMEOUT   MSEC2TICK(3000)
 #define WIFI_WORK_INTERVAL       MSEC2TICK(20)
 #define WIFI_PBUF_TYPE_RAM       0x80u
 #define WIFI_EVENT_DATA_OFFSET   12u
+#define WIFI_STA_STATUS_CONNECTED 3u
 #if defined(CONFIG_WIRELESS_WAPI_SCAN_MAX_DATA) && \
     CONFIG_WIRELESS_WAPI_SCAN_MAX_DATA < 4096
 #  define WIFI_SCAN_CACHE_LIMIT CONFIG_WIRELESS_WAPI_SCAN_MAX_DATA
@@ -62,18 +64,46 @@ struct wifi_tx_slot
   bool active;
   bool transport_pending;
   bool transport_rejected;
+  uint8_t vif;
+  uint32_t role_epoch;
 } __attribute__((aligned(32)));
 
 struct wifi_rx_packet
 {
   uint8_t frame[BK7258_WIFI_MAX_FRAME];
   uint16_t length;
+  uint32_t role_epoch;
+};
+
+enum wifi_role
+{
+  WIFI_ROLE_NONE = 0,
+  WIFI_ROLE_STA,
+  WIFI_ROLE_SOFTAP
+};
+
+enum wifi_role_state
+{
+  WIFI_ROLE_IDLE = 0,
+  WIFI_ROLE_STARTING,
+  WIFI_ROLE_ACTIVE,
+  WIFI_ROLE_STOPPING
+};
+
+struct wifi_role_config
+{
+  char ssid[33];
+  char password[64];
+  int32_t wpa_version;
+  int32_t cipher;
+  uint8_t channel;
 };
 
 struct wifi_pending_node
 {
   struct bk7258_wifi_ipc_node node;
   uint32_t generation;
+  uint32_t role_epoch;
   uint8_t recycle_index;
   bool recycle_reserved;
 };
@@ -108,6 +138,7 @@ struct wifi_driver
   mutex_t packet_lock;
   mutex_t scan_lock;
   sem_t command_sem;
+  sem_t role_sem;
   sem_t work_sem;
   sem_t ready_sem;
   struct wifi_pending_node nodes[WIFI_NODE_QUEUE];
@@ -132,12 +163,21 @@ struct wifi_driver
   uint8_t command_data[256];
   uint8_t *scan_cache;
   uint16_t scan_cache_length;
-  char ssid[33];
-  char password[64];
-  uint32_t mode;
-  int32_t auth;
+  struct wifi_role_config sta_config;
+  struct wifi_role_config ap_config;
+  enum wifi_role_state role_state;
+  bool admin_up;
+  enum wifi_role configured_role;
+  enum wifi_role active_role;
+  bool ap_started;
+  uint8_t ap_client_count;
+  uint8_t sta_mac[6];
+  uint8_t ap_mac[6];
+  uint32_t role_epoch;
+  bool tx_gate;
   bool initialized;
   bool carrier;
+  bool carrier_notified;
   bool scan_running;
   bool scan_cached;
   uint32_t reset_generation;
@@ -388,20 +428,264 @@ static int wifi_command(uint16_t command, const void *payload,
   return ret;
 }
 
+static int wifi_ap_status_query(
+  struct bk7258_wifi_ap_status_response *response)
+{
+  uint16_t result_length = 0;
+  int ret;
+
+  memset(response, 0, sizeof(*response));
+  ret = wifi_command(BK7258_WIFI_CMD_OPENVELA_AP_STATUS, NULL, 0,
+                     response, sizeof(*response), &result_length);
+  if (ret < 0)
+    {
+      return ret;
+    }
+  if (result_length != sizeof(*response) ||
+      response->reserved[0] != 0 || response->reserved[1] != 0 ||
+      response->started > 1 ||
+      response->client_count > BK7258_WIFI_AP_MAX_CLIENTS ||
+      response->security > BK7258_WIFI_AP_SECURITY_WPA2)
+    {
+      return -EPROTO;
+    }
+
+  return response->status;
+}
+
+static int wifi_sta_status_connected(bool *connected)
+{
+  uint8_t status = 0;
+  uint16_t result_length = 0;
+  int ret;
+
+  ret = wifi_command(BK7258_WIFI_CMD_GET_WLAN_STATUS, NULL, 0,
+                     &status, sizeof(status), &result_length);
+  if (ret < 0)
+    {
+      return ret;
+    }
+  if (result_length < sizeof(status))
+    {
+      return -EPROTO;
+    }
+
+  *connected = status == WIFI_STA_STATUS_CONNECTED;
+  return OK;
+}
+
 static void wifi_set_carrier(bool carrier)
 {
-  if (carrier != g_wifi.carrier)
+  bool wake = false;
+  irqstate_t flags;
+
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (g_wifi.carrier != carrier)
     {
       g_wifi.carrier = carrier;
-      if (g_wifi.initialized && carrier)
+      wake = true;
+    }
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  if (wake)
+    {
+      nxsem_post(&g_wifi.work_sem);
+    }
+}
+
+static void wifi_notify_carrier(void)
+{
+  bool carrier;
+  irqstate_t flags;
+
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (!g_wifi.initialized || g_wifi.carrier_notified == g_wifi.carrier)
+    {
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      return;
+    }
+  carrier = g_wifi.carrier;
+  g_wifi.carrier_notified = carrier;
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+
+  if (carrier)
+    {
+      netdev_lower_carrier_on(&g_wifi.lower);
+    }
+  else
+    {
+      netdev_lower_carrier_off(&g_wifi.lower);
+    }
+}
+
+static uint8_t wifi_role_vif(enum wifi_role role)
+{
+  return role == WIFI_ROLE_SOFTAP ? BK7258_WIFI_WIRE_VIF_SOFTAP :
+                                    BK7258_WIFI_WIRE_VIF_STA;
+}
+
+static bool wifi_tx_busy(void)
+{
+  unsigned int i;
+
+  for (i = 0; i < CONFIG_BK7258_WIFI_TX_SLOTS; i++)
+    {
+      if (g_wifi.tx[i].active || g_wifi.tx[i].transport_pending)
         {
-          netdev_lower_carrier_on(&g_wifi.lower);
-        }
-      else if (g_wifi.initialized)
-        {
-          netdev_lower_carrier_off(&g_wifi.lower);
+          return true;
         }
     }
+
+  return false;
+}
+
+static void wifi_role_deactivate(enum wifi_role role)
+{
+  bool deactivated = false;
+  irqstate_t flags;
+
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (role == WIFI_ROLE_NONE || g_wifi.active_role == role)
+    {
+      g_wifi.active_role = WIFI_ROLE_NONE;
+      g_wifi.role_state = WIFI_ROLE_IDLE;
+      g_wifi.tx_gate = false;
+      g_wifi.ap_started = false;
+      g_wifi.ap_client_count = 0;
+      g_wifi.role_epoch++;
+      g_wifi.packet_head = 0;
+      g_wifi.packet_tail = 0;
+      g_wifi.packet_count = 0;
+      deactivated = true;
+    }
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+  if (deactivated)
+    {
+      nxsem_post(&g_wifi.role_sem);
+      wifi_set_carrier(false);
+    }
+}
+
+static void wifi_sta_event(bool connected)
+{
+  bool carrier = false;
+  bool handled = false;
+  bool stopped = false;
+  irqstate_t flags;
+
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (g_wifi.active_role == WIFI_ROLE_STA)
+    {
+      handled = true;
+      if (connected && g_wifi.role_state != WIFI_ROLE_STOPPING)
+        {
+          g_wifi.role_state = WIFI_ROLE_ACTIVE;
+          g_wifi.tx_gate = g_wifi.admin_up;
+          carrier = g_wifi.admin_up;
+        }
+      else if (!connected)
+        {
+          g_wifi.tx_gate = false;
+          g_wifi.role_epoch++;
+          g_wifi.packet_head = 0;
+          g_wifi.packet_tail = 0;
+          g_wifi.packet_count = 0;
+          if (g_wifi.role_state == WIFI_ROLE_STOPPING)
+            {
+              g_wifi.active_role = WIFI_ROLE_NONE;
+              g_wifi.role_state = WIFI_ROLE_IDLE;
+              stopped = true;
+            }
+          else
+            {
+              /* CP auto-reconnect keeps the STA role alive after a transient
+               * link loss.  The next connected event can restore carrier. */
+
+              g_wifi.role_state = WIFI_ROLE_STARTING;
+            }
+        }
+    }
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+  if (stopped)
+    {
+      nxsem_post(&g_wifi.role_sem);
+    }
+  if (handled)
+    {
+      wifi_set_carrier(carrier);
+    }
+}
+
+static void wifi_ap_start_event(bool started)
+{
+  bool carrier = false;
+  bool handled = false;
+  bool stopped = false;
+  irqstate_t flags;
+
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (g_wifi.active_role == WIFI_ROLE_SOFTAP)
+    {
+      handled = true;
+      if (started && g_wifi.role_state != WIFI_ROLE_STOPPING)
+        {
+          g_wifi.role_state = WIFI_ROLE_ACTIVE;
+          g_wifi.ap_started = true;
+          g_wifi.ap_client_count = 0;
+          g_wifi.tx_gate = g_wifi.admin_up;
+          carrier = g_wifi.admin_up;
+        }
+      else if (!started)
+        {
+          g_wifi.active_role = WIFI_ROLE_NONE;
+          g_wifi.role_state = WIFI_ROLE_IDLE;
+          g_wifi.ap_started = false;
+          g_wifi.ap_client_count = 0;
+          g_wifi.tx_gate = false;
+          g_wifi.role_epoch++;
+          g_wifi.packet_head = 0;
+          g_wifi.packet_tail = 0;
+          g_wifi.packet_count = 0;
+          stopped = true;
+        }
+    }
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+  if (stopped)
+    {
+      nxsem_post(&g_wifi.role_sem);
+    }
+  if (handled)
+    {
+      wifi_set_carrier(carrier);
+    }
+}
+
+static void wifi_ap_client_event(bool associated)
+{
+  irqstate_t flags;
+
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (g_wifi.active_role == WIFI_ROLE_SOFTAP && g_wifi.ap_started &&
+      g_wifi.role_state == WIFI_ROLE_ACTIVE)
+    {
+      if (associated &&
+          g_wifi.ap_client_count < BK7258_WIFI_AP_MAX_CLIENTS)
+        {
+          g_wifi.ap_client_count++;
+        }
+      else if (!associated && g_wifi.ap_client_count != 0)
+        {
+          g_wifi.ap_client_count--;
+        }
+    }
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
 }
 
 static void wifi_scan_cache_clear(void)
@@ -430,7 +714,7 @@ static void wifi_link_down_state(void)
       nxsem_post(&g_wifi.command_sem);
     }
 
-  wifi_set_carrier(false);
+  wifi_role_deactivate(WIFI_ROLE_NONE);
   nxmutex_lock(&g_wifi.scan_lock);
   wifi_scan_cache_clear();
   g_wifi.scan_running = false;
@@ -465,7 +749,7 @@ static bool wifi_sync_reset_generation(void)
       nxsem_post(&g_wifi.command_sem);
     }
 
-  wifi_set_carrier(false);
+  wifi_role_deactivate(WIFI_ROLE_NONE);
   nxmutex_lock(&g_wifi.scan_lock);
   wifi_scan_cache_clear();
   g_wifi.scan_running = false;
@@ -791,7 +1075,7 @@ static void wifi_handle_command(uint32_t cpdu_address,
     }
   else if (event.id == BK7258_WIFI_EVT_IPV4_IND)
     {
-      wifi_set_carrier(true);
+      wifi_sta_event(true);
     }
   else if (event.id == BK7258_WIFI_EVT_WIFI_EVENT_IND && copied >= 4)
     {
@@ -800,18 +1084,34 @@ static void wifi_handle_command(uint32_t cpdu_address,
       memcpy(&event_id, data, sizeof(event_id));
       if (event_id == BK7258_WIFI_EVENT_CONNECTED)
         {
-          wifi_set_carrier(true);
+          wifi_sta_event(true);
         }
       else if (event_id == BK7258_WIFI_EVENT_DISCONNECTED)
         {
-          wifi_set_carrier(false);
+          wifi_sta_event(false);
         }
     }
-  else if (event.id == 3u)
+  else if (event.id == BK7258_WIFI_EVT_DISCONNECT_IND)
     {
-      wifi_set_carrier(false);
+      wifi_sta_event(false);
     }
-  else if (event.id == 8u)
+  else if (event.id == BK7258_WIFI_EVT_START_AP_IND && copied >= 1)
+    {
+      wifi_ap_start_event(data[0] == 0);
+    }
+  else if (event.id == BK7258_WIFI_EVT_ASSOC_AP_IND && copied >= 6)
+    {
+      wifi_ap_client_event(true);
+    }
+  else if (event.id == BK7258_WIFI_EVT_DISASSOC_AP_IND && copied >= 6)
+    {
+      wifi_ap_client_event(false);
+    }
+  else if (event.id == BK7258_WIFI_EVT_STOP_AP_IND)
+    {
+      wifi_role_deactivate(WIFI_ROLE_SOFTAP);
+    }
+  else if (event.id == BK7258_WIFI_EVT_SCAN_WIFI_IND)
     {
       g_wifi.scan_running = false;
     }
@@ -993,7 +1293,8 @@ static void wifi_collect_rejected_tx(
 }
 
 static bool wifi_copy_rx_frame(uint32_t cpdu_address,
-                               struct wifi_rx_packet *packet)
+                               struct wifi_rx_packet *packet,
+                               uint8_t *vif)
 {
   struct bk7258_wifi_cpdu cpdu;
   struct bk7258_wifi_pbuf pbuf;
@@ -1025,6 +1326,10 @@ static bool wifi_copy_rx_frame(uint32_t cpdu_address,
     {
       memcpy(packet->frame, (const void *)(uintptr_t)pbuf.payload, pbuf.len);
       packet->length = pbuf.len;
+    }
+  if (vif != NULL)
+    {
+      *vif = bk7258_wifi_cpdu_get_vif(cpdu.flags);
     }
   return true;
 }
@@ -1207,10 +1512,16 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
           struct bk7258_wifi_cpdu *ap_cpdu =
             (struct bk7258_wifi_cpdu *)tx->headroom;
 
-          if (!tx->active || (ap_cpdu->flags & 1u) == 0)
+          if (!tx->active || (ap_cpdu->flags & 1u) == 0 ||
+              bk7258_wifi_cpdu_get_vif(ap_cpdu->flags) != tx->vif)
             {
               goto invalid;
             }
+
+          /* Completion is accepted by slot address even after role_epoch
+           * changes.  A role cannot start while any TX slot is busy, and
+           * rejecting a late completion here would leak the retained packet.
+           */
 
           cp_owned[count] = false;
           next = ap_cpdu->next;
@@ -1221,7 +1532,7 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
           if (pending->generation !=
                 bk7258_mailbox_peer_reset_generation() ||
               !wifi_cp_pointer(address, sizeof(cpdu)) ||
-              !wifi_copy_rx_frame(address, NULL))
+              !wifi_copy_rx_frame(address, NULL, NULL))
             {
               rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
               goto invalid;
@@ -1248,12 +1559,19 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
         {
           unsigned int index = (g_wifi.packet_tail + packet_added) %
                                WIFI_PACKET_QUEUE;
+          uint8_t vif;
 
           flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
           if (pending->generation ==
                 bk7258_mailbox_peer_reset_generation() &&
-              wifi_copy_rx_frame(addresses[count], &g_wifi.packets[index]))
+              pending->role_epoch == g_wifi.role_epoch &&
+              g_wifi.role_state == WIFI_ROLE_ACTIVE &&
+              g_wifi.active_role != WIFI_ROLE_NONE &&
+              wifi_copy_rx_frame(addresses[count], &g_wifi.packets[index],
+                                 &vif) &&
+              vif == wifi_role_vif(g_wifi.active_role))
             {
+              g_wifi.packets[index].role_epoch = pending->role_epoch;
               packet_added++;
             }
           rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
@@ -1344,6 +1662,7 @@ static int wifi_mailbox_rx(const struct bk7258_mb_wire_message *message,
   memset(pending, 0, sizeof(*pending));
   pending->node = node;
   pending->generation = bk7258_mailbox_peer_reset_generation();
+  pending->role_epoch = g_wifi.role_epoch;
   if (node.channel == 2)
     {
       struct wifi_recycle_entry *entry =
@@ -1441,6 +1760,7 @@ static int wifi_worker(int argc, char **argv)
 
       wifi_flush_recycle();
       wifi_notify_network(&notifications);
+      wifi_notify_carrier();
     }
 
   return OK;
@@ -1448,28 +1768,158 @@ static int wifi_worker(int argc, char **argv)
 
 static int wifi_ifup(struct netdev_lowerhalf_s *lower)
 {
+  bool carrier;
+  irqstate_t flags;
+
   (void)lower;
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  g_wifi.admin_up = true;
+  carrier = g_wifi.role_state == WIFI_ROLE_ACTIVE &&
+            (g_wifi.active_role == WIFI_ROLE_STA || g_wifi.ap_started);
+  g_wifi.tx_gate = carrier;
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_set_carrier(carrier);
   return OK;
+}
+
+static int wifi_stop_active_role(void)
+{
+  struct bk7258_wifi_ap_status_response ap_status;
+  enum wifi_role role;
+  enum wifi_role_state previous_state;
+  int32_t status = 0;
+  uint16_t result_length = 0;
+  irqstate_t flags;
+  int ret;
+
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  role = g_wifi.active_role;
+  if (role == WIFI_ROLE_NONE)
+    {
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      nxmutex_unlock(&g_wifi.packet_lock);
+      wifi_set_carrier(false);
+      return OK;
+    }
+  if (g_wifi.role_state == WIFI_ROLE_STOPPING)
+    {
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      nxmutex_unlock(&g_wifi.packet_lock);
+      return -EBUSY;
+    }
+
+  previous_state = g_wifi.role_state;
+  g_wifi.role_state = WIFI_ROLE_STOPPING;
+  g_wifi.tx_gate = false;
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_set_carrier(false);
+  while (nxsem_trywait(&g_wifi.role_sem) == OK)
+    {
+    }
+
+  if (role == WIFI_ROLE_STA)
+    {
+      ret = wifi_command(BK7258_WIFI_CMD_DISCONNECT, NULL, 0,
+                         NULL, 0, NULL);
+    }
+  else
+    {
+      ret = wifi_command(BK7258_WIFI_CMD_OPENVELA_AP_STOP, NULL, 0,
+                         &status, sizeof(status), &result_length);
+      if (ret >= 0 && result_length != sizeof(status))
+        {
+          ret = -EPROTO;
+        }
+      else if (ret >= 0 && status != 0)
+        {
+          ret = status;
+        }
+      if (ret >= 0)
+        {
+          ret = wifi_ap_status_query(&ap_status);
+          if (ret >= 0 && !ap_status.started)
+            {
+              wifi_role_deactivate(WIFI_ROLE_SOFTAP);
+              return OK;
+            }
+        }
+    }
+
+  if (ret >= 0)
+    {
+      ret = nxsem_tickwait_uninterruptible(&g_wifi.role_sem,
+                                            WIFI_ROLE_STOP_TIMEOUT);
+    }
+  if (ret == -ETIMEDOUT && role == WIFI_ROLE_STA)
+    {
+      bool connected;
+
+      if (wifi_sta_status_connected(&connected) == OK && !connected)
+        {
+          wifi_role_deactivate(WIFI_ROLE_STA);
+          return OK;
+        }
+    }
+  if (ret < 0)
+    {
+      bool carrier;
+
+      nxmutex_lock(&g_wifi.packet_lock);
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      if (g_wifi.active_role == role &&
+          g_wifi.role_state == WIFI_ROLE_STOPPING && ret != -ETIMEDOUT)
+        {
+          g_wifi.role_state = previous_state;
+          g_wifi.tx_gate = previous_state == WIFI_ROLE_ACTIVE &&
+                           g_wifi.admin_up &&
+                           (role == WIFI_ROLE_STA || g_wifi.ap_started);
+        }
+      carrier = g_wifi.tx_gate;
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      nxmutex_unlock(&g_wifi.packet_lock);
+      wifi_set_carrier(carrier);
+    }
+
+  return ret;
 }
 
 static int wifi_ifdown(struct netdev_lowerhalf_s *lower)
 {
+  irqstate_t flags;
+  int ret;
+
   (void)lower;
+  ret = wifi_stop_active_role();
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  g_wifi.admin_up = false;
+  g_wifi.tx_gate = false;
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
   wifi_set_carrier(false);
-  return OK;
+  return ret;
 }
 
 static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
 {
   struct wifi_tx_slot *tx = NULL;
   struct bk7258_wifi_cpdu *cpdu;
+  uint8_t vif;
+  uint32_t role_epoch;
   unsigned int length;
   unsigned int i;
   int ret;
 
   nxmutex_lock(&g_wifi.packet_lock);
   length = netpkt_getdatalen(lower, packet);
-  if (!g_wifi.carrier || !bk7258_mailbox_link_ready())
+  if (!g_wifi.carrier || !g_wifi.tx_gate ||
+      g_wifi.role_state != WIFI_ROLE_ACTIVE ||
+      g_wifi.active_role == WIFI_ROLE_NONE ||
+      !bk7258_mailbox_link_ready())
     {
       nxmutex_unlock(&g_wifi.packet_lock);
       return -ENETDOWN;
@@ -1497,6 +1947,8 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
   memset(&tx->pbuf, 0, sizeof(tx->pbuf));
   cpdu = (struct bk7258_wifi_cpdu *)tx->headroom;
   memset(cpdu, 0, sizeof(*cpdu));
+  vif = wifi_role_vif(g_wifi.active_role);
+  role_epoch = g_wifi.role_epoch;
   tx->pbuf.payload = (uint32_t)(uintptr_t)tx->frame;
   tx->pbuf.tot_len = length;
   tx->pbuf.len = length;
@@ -1504,6 +1956,7 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
   tx->pbuf.ref = 1;
   cpdu->length = sizeof(*cpdu) + length;
   cpdu->type_dst = 2u;
+  cpdu->flags = bk7258_wifi_cpdu_set_vif(cpdu->flags, vif);
   ret = netpkt_copyout(lower, tx->frame, packet, length, 0);
   if (ret < 0)
     {
@@ -1515,6 +1968,8 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
   tx->active = true;
   tx->transport_pending = true;
   tx->transport_rejected = false;
+  tx->vif = vif;
+  tx->role_epoch = role_epoch;
   ret = wifi_send_node(BK7258_WIFI_DATA_TX_CHANNEL, 2,
                        (uint32_t)(uintptr_t)cpdu,
                        (uint32_t)(uintptr_t)cpdu, 1,
@@ -1543,7 +1998,15 @@ static netpkt_t *wifi_receive(struct netdev_lowerhalf_s *lower)
 
   nxmutex_lock(&g_wifi.packet_lock);
   flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
-  if (g_wifi.packet_count == 0)
+  while (g_wifi.packet_count != 0 &&
+         g_wifi.packets[g_wifi.packet_head].role_epoch != g_wifi.role_epoch)
+    {
+      g_wifi.packet_head = (g_wifi.packet_head + 1) % WIFI_PACKET_QUEUE;
+      g_wifi.packet_count--;
+    }
+  if (g_wifi.packet_count == 0 ||
+      g_wifi.active_role == WIFI_ROLE_NONE ||
+      g_wifi.role_state != WIFI_ROLE_ACTIVE)
     {
       rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
       nxmutex_unlock(&g_wifi.packet_lock);
@@ -1582,76 +2045,225 @@ static int wifi_ioctl(struct netdev_lowerhalf_s *lower, int command,
 #ifdef CONFIG_NETDEV_WIRELESS_HANDLER
 static int wifi_connect(struct netdev_lowerhalf_s *lower)
 {
+  struct bk7258_wifi_ap_status_response ap_status;
   uint8_t payload[33 + 64];
+  struct bk7258_wifi_ap_start_request request;
+  struct wifi_role_config config;
+  enum wifi_role role;
+  int32_t status = 0;
+  uint16_t result_length = 0;
+  size_t ssid_length;
+  size_t password_length;
+  irqstate_t flags;
+  int ret;
 
   (void)lower;
-  memset(payload, 0, sizeof(payload));
-  memcpy(payload, g_wifi.ssid, strlen(g_wifi.ssid));
-  memcpy(payload + 33, g_wifi.password, strlen(g_wifi.password));
-  return wifi_command(BK7258_WIFI_CMD_CONNECT, payload, sizeof(payload),
-                       NULL, 0, NULL);
+  nxmutex_lock(&g_wifi.packet_lock);
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+  if (!g_wifi.admin_up)
+    {
+      ret = -ENETDOWN;
+      goto connect_unlock;
+    }
+  if (g_wifi.active_role != WIFI_ROLE_NONE ||
+      g_wifi.role_state != WIFI_ROLE_IDLE || wifi_tx_busy())
+    {
+      ret = -EBUSY;
+      goto connect_unlock;
+    }
+
+  role = g_wifi.configured_role;
+  config = role == WIFI_ROLE_STA ? g_wifi.sta_config : g_wifi.ap_config;
+  if (role == WIFI_ROLE_STA)
+    {
+      ssid_length = strnlen(config.ssid, sizeof(config.ssid));
+      password_length = strnlen(config.password, sizeof(config.password));
+    }
+  else
+    {
+      ssid_length = strnlen(config.ssid, sizeof(config.ssid));
+      password_length = strnlen(config.password, sizeof(config.password));
+      if (ssid_length == 0 || config.channel < 1 || config.channel > 14 ||
+          (config.wpa_version == IW_AUTH_WPA_VERSION_DISABLED &&
+           (config.cipher != IW_AUTH_CIPHER_NONE ||
+            password_length != 0)) ||
+          (config.wpa_version == IW_AUTH_WPA_VERSION_WPA2 &&
+           (config.cipher != IW_AUTH_CIPHER_CCMP ||
+            password_length < 8 || password_length > 63)))
+        {
+          ret = -EINVAL;
+          goto connect_unlock;
+        }
+    }
+
+  g_wifi.active_role = role;
+  g_wifi.role_state = WIFI_ROLE_STARTING;
+  g_wifi.ap_started = false;
+  g_wifi.ap_client_count = 0;
+  g_wifi.tx_gate = false;
+  g_wifi.role_epoch++;
+  memcpy(g_wifi.lower.netdev.d_mac.ether.ether_addr_octet,
+         role == WIFI_ROLE_STA ? g_wifi.sta_mac : g_wifi.ap_mac,
+         sizeof(g_wifi.sta_mac));
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+
+  if (role == WIFI_ROLE_STA)
+    {
+      memset(payload, 0, sizeof(payload));
+      memcpy(payload, config.ssid, ssid_length);
+      memcpy(payload + 33, config.password, password_length);
+      ret = wifi_command(BK7258_WIFI_CMD_CONNECT, payload, sizeof(payload),
+                         NULL, 0, NULL);
+    }
+  else
+    {
+      memset(&request, 0, sizeof(request));
+      request.version = BK7258_WIFI_AP_ABI_VERSION;
+      request.channel = config.channel;
+      request.security = config.wpa_version ==
+                         IW_AUTH_WPA_VERSION_DISABLED ?
+                         BK7258_WIFI_AP_SECURITY_OPEN :
+                         BK7258_WIFI_AP_SECURITY_WPA2;
+      request.max_clients = BK7258_WIFI_AP_MAX_CLIENTS;
+      request.ssid_length = ssid_length;
+      request.password_length = password_length;
+      memcpy(request.ssid, config.ssid, ssid_length);
+      memcpy(request.password, config.password, password_length);
+      ret = wifi_command(BK7258_WIFI_CMD_OPENVELA_AP_START, &request,
+                         sizeof(request), &status, sizeof(status),
+                         &result_length);
+      if (ret >= 0 && result_length != sizeof(status))
+        {
+          ret = -EPROTO;
+        }
+      else if (ret >= 0 && status != 0)
+        {
+          ret = status;
+        }
+      if (ret >= 0)
+        {
+          ret = wifi_ap_status_query(&ap_status);
+          if (ret >= 0 && !ap_status.started)
+            {
+              ret = -EIO;
+            }
+          else if (ret >= 0)
+            {
+              memcpy(g_wifi.ap_mac, ap_status.mac, sizeof(g_wifi.ap_mac));
+              memcpy(g_wifi.lower.netdev.d_mac.ether.ether_addr_octet,
+                     ap_status.mac, sizeof(ap_status.mac));
+              wifi_ap_start_event(true);
+            }
+        }
+    }
+
+  if (ret < 0)
+    {
+      wifi_role_deactivate(role);
+    }
+  return ret;
+
+connect_unlock:
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  nxmutex_unlock(&g_wifi.packet_lock);
+  return ret;
 }
 
 static int wifi_disconnect(struct netdev_lowerhalf_s *lower)
 {
   (void)lower;
-  wifi_set_carrier(false);
-  return wifi_command(BK7258_WIFI_CMD_DISCONNECT, NULL, 0, NULL, 0, NULL);
+  return wifi_stop_active_role();
 }
 
 static int wifi_essid(struct netdev_lowerhalf_s *lower,
-                      struct iwreq *request, bool set)
+                       struct iwreq *request, bool set)
 {
+  struct wifi_role_config *config;
   size_t length;
+  int ret = OK;
 
   (void)lower;
   if (request->u.essid.pointer == NULL)
     {
       return -EINVAL;
     }
+  nxmutex_lock(&g_wifi.packet_lock);
+  config = g_wifi.configured_role == WIFI_ROLE_SOFTAP ?
+           &g_wifi.ap_config : &g_wifi.sta_config;
   if (set)
     {
       length = request->u.essid.length;
-      if (length >= sizeof(g_wifi.ssid))
+      if (length >= sizeof(config->ssid))
         {
-          return -E2BIG;
+          ret = -E2BIG;
+          goto essid_unlock;
         }
-      memcpy(g_wifi.ssid, request->u.essid.pointer, length);
-      g_wifi.ssid[length] = '\0';
+      memcpy(config->ssid, request->u.essid.pointer, length);
+      config->ssid[length] = '\0';
     }
   else
     {
-      length = strlen(g_wifi.ssid) + 1;
+      length = strlen(config->ssid) + 1;
       if (request->u.essid.length < length)
         {
           request->u.essid.length = length;
-          return -E2BIG;
+          ret = -E2BIG;
+          goto essid_unlock;
         }
-      memcpy(request->u.essid.pointer, g_wifi.ssid, length);
+      memcpy(request->u.essid.pointer, config->ssid, length);
       request->u.essid.length = length;
       request->u.essid.flags = IW_ESSID_ON;
     }
-  return OK;
+
+essid_unlock:
+  nxmutex_unlock(&g_wifi.packet_lock);
+  return ret;
 }
 
 static int wifi_passwd(struct netdev_lowerhalf_s *lower,
                        struct iwreq *request, bool set)
 {
-  struct iw_encode_ext *ext = request->u.encoding.pointer;
+  struct iw_encode_ext *ext;
+  struct wifi_role_config *config;
+  int ret = OK;
 
   (void)lower;
+  nxmutex_lock(&g_wifi.packet_lock);
+  config = g_wifi.configured_role == WIFI_ROLE_SOFTAP ?
+           &g_wifi.ap_config : &g_wifi.sta_config;
   if (!set)
     {
       request->u.encoding.length = 0;
-      return OK;
+      goto passwd_unlock;
     }
-  if (ext == NULL || ext->key_len >= sizeof(g_wifi.password))
+  if ((request->u.encoding.flags & IW_ENCODE_DISABLED) != 0)
     {
-      return -EINVAL;
+      config->password[0] = '\0';
+      config->cipher = IW_AUTH_CIPHER_NONE;
+      config->wpa_version = IW_AUTH_WPA_VERSION_DISABLED;
+      goto passwd_unlock;
     }
-  memcpy(g_wifi.password, ext->key, ext->key_len);
-  g_wifi.password[ext->key_len] = '\0';
-  return OK;
+  ext = request->u.encoding.pointer;
+  if (ext == NULL || ext->key_len >= sizeof(config->password) ||
+      (ext->alg != IW_ENCODE_ALG_NONE && ext->alg != IW_ENCODE_ALG_CCMP) ||
+      (ext->alg == IW_ENCODE_ALG_NONE && ext->key_len != 0))
+    {
+      ret = -EINVAL;
+      goto passwd_unlock;
+    }
+  memcpy(config->password, ext->key, ext->key_len);
+  config->password[ext->key_len] = '\0';
+  config->cipher = ext->alg == IW_ENCODE_ALG_NONE ?
+                   IW_AUTH_CIPHER_NONE : IW_AUTH_CIPHER_CCMP;
+  if (ext->alg == IW_ENCODE_ALG_CCMP)
+    {
+      config->wpa_version = IW_AUTH_WPA_VERSION_WPA2;
+    }
+
+passwd_unlock:
+  nxmutex_unlock(&g_wifi.packet_lock);
+  return ret;
 }
 
 static int wifi_country(struct netdev_lowerhalf_s *lower,
@@ -1723,14 +2335,37 @@ static int wifi_country(struct netdev_lowerhalf_s *lower,
 static int wifi_mode(struct netdev_lowerhalf_s *lower,
                      struct iwreq *request, bool set)
 {
+  enum wifi_role role;
+  irqstate_t flags;
+
   (void)lower;
   if (set)
     {
-      g_wifi.mode = request->u.mode;
+      if (request->u.mode != IW_MODE_INFRA &&
+          request->u.mode != IW_MODE_MASTER)
+        {
+          return -EINVAL;
+        }
+      role = request->u.mode == IW_MODE_MASTER ? WIFI_ROLE_SOFTAP :
+                                                WIFI_ROLE_STA;
+      nxmutex_lock(&g_wifi.packet_lock);
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      if (g_wifi.active_role != WIFI_ROLE_NONE)
+        {
+          rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+          nxmutex_unlock(&g_wifi.packet_lock);
+          return -EBUSY;
+        }
+      g_wifi.configured_role = role;
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      nxmutex_unlock(&g_wifi.packet_lock);
     }
   else
     {
-      request->u.mode = g_wifi.mode;
+      nxmutex_lock(&g_wifi.packet_lock);
+      request->u.mode = g_wifi.configured_role == WIFI_ROLE_SOFTAP ?
+                        IW_MODE_MASTER : IW_MODE_INFRA;
+      nxmutex_unlock(&g_wifi.packet_lock);
     }
   return OK;
 }
@@ -1738,15 +2373,139 @@ static int wifi_mode(struct netdev_lowerhalf_s *lower,
 static int wifi_auth(struct netdev_lowerhalf_s *lower,
                      struct iwreq *request, bool set)
 {
+  struct wifi_role_config *config;
+  int32_t value;
+  int ret = OK;
+
   (void)lower;
+  nxmutex_lock(&g_wifi.packet_lock);
+  config = g_wifi.configured_role == WIFI_ROLE_SOFTAP ?
+           &g_wifi.ap_config : &g_wifi.sta_config;
   if (set)
     {
-      g_wifi.auth = request->u.param.value;
+      value = request->u.param.value;
+      switch (request->u.param.flags & IW_AUTH_INDEX)
+        {
+          case IW_AUTH_WPA_VERSION:
+            if (value != IW_AUTH_WPA_VERSION_DISABLED &&
+                value != IW_AUTH_WPA_VERSION_WPA2)
+              {
+                ret = -EOPNOTSUPP;
+                goto auth_unlock;
+              }
+            config->wpa_version = value;
+            if (value == IW_AUTH_WPA_VERSION_DISABLED)
+              {
+                config->cipher = IW_AUTH_CIPHER_NONE;
+                config->password[0] = '\0';
+              }
+            break;
+
+          case IW_AUTH_CIPHER_PAIRWISE:
+          case IW_AUTH_CIPHER_GROUP:
+            if (value != IW_AUTH_CIPHER_NONE &&
+                value != IW_AUTH_CIPHER_CCMP)
+              {
+                ret = -EOPNOTSUPP;
+                goto auth_unlock;
+              }
+            config->cipher = value;
+            break;
+
+          default:
+            ret = -EOPNOTSUPP;
+            goto auth_unlock;
+        }
     }
   else
     {
-      request->u.param.value = g_wifi.auth;
+      switch (request->u.param.flags & IW_AUTH_INDEX)
+        {
+          case IW_AUTH_WPA_VERSION:
+            request->u.param.value = config->wpa_version;
+            break;
+
+          case IW_AUTH_CIPHER_PAIRWISE:
+          case IW_AUTH_CIPHER_GROUP:
+            request->u.param.value = config->cipher;
+            break;
+
+          default:
+            ret = -EOPNOTSUPP;
+            goto auth_unlock;
+        }
     }
+
+auth_unlock:
+  nxmutex_unlock(&g_wifi.packet_lock);
+  return ret;
+}
+
+static int wifi_freq(struct netdev_lowerhalf_s *lower,
+                     struct iwreq *request, bool set)
+{
+  struct wifi_role_config *config;
+  uint8_t channel;
+  irqstate_t flags;
+
+  (void)lower;
+  if (set)
+    {
+      if (request->u.freq.e != 0 || request->u.freq.m < 1 ||
+          request->u.freq.m > 14)
+        {
+          return -EINVAL;
+        }
+      channel = request->u.freq.m;
+      nxmutex_lock(&g_wifi.packet_lock);
+      config = g_wifi.configured_role == WIFI_ROLE_SOFTAP ?
+               &g_wifi.ap_config : &g_wifi.sta_config;
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      if (g_wifi.active_role == WIFI_ROLE_SOFTAP &&
+          g_wifi.role_state != WIFI_ROLE_IDLE &&
+          channel != g_wifi.ap_config.channel)
+        {
+          rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+          nxmutex_unlock(&g_wifi.packet_lock);
+          return -EBUSY;
+        }
+      config->channel = channel;
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      nxmutex_unlock(&g_wifi.packet_lock);
+    }
+  else
+    {
+      nxmutex_lock(&g_wifi.packet_lock);
+      config = g_wifi.configured_role == WIFI_ROLE_SOFTAP ?
+               &g_wifi.ap_config : &g_wifi.sta_config;
+      request->u.freq.m = config->channel;
+      request->u.freq.e = 0;
+      request->u.freq.i = 0;
+      request->u.freq.flags = IW_FREQ_FIXED;
+      nxmutex_unlock(&g_wifi.packet_lock);
+    }
+  return OK;
+}
+
+static int wifi_bssid(struct netdev_lowerhalf_s *lower,
+                      struct iwreq *request, bool set)
+{
+  struct bk7258_wifi_ap_status_response response;
+  int ret;
+
+  (void)lower;
+  if (set)
+    {
+      return -EOPNOTSUPP;
+    }
+  ret = wifi_ap_status_query(&response);
+  if (ret < 0)
+    {
+      return ret;
+    }
+  memset(&request->u.ap_addr, 0, sizeof(request->u.ap_addr));
+  request->u.ap_addr.sa_family = ARPHRD_ETHER;
+  memcpy(request->u.ap_addr.sa_data, response.mac, sizeof(response.mac));
   return OK;
 }
 
@@ -1763,6 +2522,13 @@ static int wifi_scan(struct netdev_lowerhalf_s *lower,
     {
       return -EINVAL;
     }
+  nxmutex_lock(&g_wifi.packet_lock);
+  if (g_wifi.active_role == WIFI_ROLE_SOFTAP)
+    {
+      nxmutex_unlock(&g_wifi.packet_lock);
+      return -EBUSY;
+    }
+  nxmutex_unlock(&g_wifi.packet_lock);
   if (!set)
     {
       nxmutex_lock(&g_wifi.scan_lock);
@@ -1862,11 +2628,11 @@ static const struct wireless_ops_s g_wifi_ops =
   .connect = wifi_connect,
   .disconnect = wifi_disconnect,
   .essid = wifi_essid,
-  .bssid = NULL,
+  .bssid = wifi_bssid,
   .passwd = wifi_passwd,
   .mode = wifi_mode,
   .auth = wifi_auth,
-  .freq = NULL,
+  .freq = wifi_freq,
   .bitrate = NULL,
   .txpower = NULL,
   .country = wifi_country,
@@ -1904,6 +2670,7 @@ int bk7258_wifi_initialize(void)
   nxmutex_init(&g_wifi.packet_lock);
   nxmutex_init(&g_wifi.scan_lock);
   nxsem_init(&g_wifi.command_sem, 0, 0);
+  nxsem_init(&g_wifi.role_sem, 0, 0);
   nxsem_init(&g_wifi.work_sem, 0, 0);
   nxsem_init(&g_wifi.ready_sem, 0, 0);
   g_worker_result = -EINPROGRESS;
@@ -1950,7 +2717,15 @@ int bk7258_wifi_initialize(void)
   g_wifi.lower.quota[NETPKT_RX] = WIFI_PACKET_QUEUE;
   g_wifi.lower.rxtype = NETDEV_RX_WORK;
   g_wifi.lower.netdev.d_pktsize = BK7258_WIFI_MAX_FRAME;
-  g_wifi.mode = IW_MODE_INFRA;
+  g_wifi.configured_role = WIFI_ROLE_STA;
+  g_wifi.active_role = WIFI_ROLE_NONE;
+  g_wifi.role_state = WIFI_ROLE_IDLE;
+  g_wifi.role_epoch = 1;
+  g_wifi.sta_config.wpa_version = IW_AUTH_WPA_VERSION_DISABLED;
+  g_wifi.sta_config.cipher = IW_AUTH_CIPHER_NONE;
+  g_wifi.ap_config.wpa_version = IW_AUTH_WPA_VERSION_DISABLED;
+  g_wifi.ap_config.cipher = IW_AUTH_CIPHER_NONE;
+  g_wifi.ap_config.channel = 1;
 
   memset(mac, 0, sizeof(mac));
   ret = wifi_command(BK7258_WIFI_CMD_GET_MAC_ADDR, NULL, 0,
@@ -1960,6 +2735,16 @@ int bk7258_wifi_initialize(void)
       return ret;
     }
   memcpy(g_wifi.lower.netdev.d_mac.ether.ether_addr_octet, mac, sizeof(mac));
+  memcpy(g_wifi.sta_mac, mac, sizeof(mac));
+  {
+    struct bk7258_wifi_ap_status_response ap_status;
+    ret = wifi_ap_status_query(&ap_status);
+    if (ret < 0)
+      {
+        return ret;
+      }
+    memcpy(g_wifi.ap_mac, ap_status.mac, sizeof(g_wifi.ap_mac));
+  }
   memset(status, 0, sizeof(status));
   ret = wifi_command(BK7258_WIFI_CMD_GET_WLAN_STATUS, NULL, 0,
                      status, sizeof(status), NULL);
@@ -1974,14 +2759,8 @@ int bk7258_wifi_initialize(void)
       return ret;
     }
   g_wifi.initialized = true;
-  if (g_wifi.carrier)
-    {
-      netdev_lower_carrier_on(&g_wifi.lower);
-    }
-  else
-    {
-      netdev_lower_carrier_off(&g_wifi.lower);
-    }
+  g_wifi.carrier_notified = !g_wifi.carrier;
+  wifi_notify_carrier();
   return OK;
 }
 

@@ -1,8 +1,45 @@
 # BK7258 OpenVela Wi-Fi SoftAP 模式移植方案
 
-> 文档状态：2026-08-17 已选定首选方案，等待开始移植。本文只定义实施路径、修改边界和
-> 验收门禁，尚未开始修改 Wi-Fi 驱动、CP 固件或 OpenVela 配置。未经实施验收不得将
-> 本文中的“目标状态”写成“已实现”。
+> 文档状态：2026-08-18 AP0 至 AP3 代码移植和构建门禁已完成；`nsh -Werror`、
+> `ai_agent`、CP clean build 与最终打包通过。实板已确认 WPA2 SoftAP 进入
+> `RUNNING`、手机可发现并成功关联、NuttX DHCP server 可启动。AP4 的 DHCP lease
+> 结果、ARP/Socket 双向数据面、反复热切换和稳定性门禁仍待继续验收。
+> 在这些实板门禁完成前，不声明 SoftAP 首版移植全部完成。
+
+### 0.1 本轮实施记录
+
+已完成：
+
+- pointer-free `0x210..0x212` AP command、固定结构和双侧静态 ABI 断言。
+- 单 `wlan0` STA/SoftAP 互斥角色状态机，默认初始化为 STA。
+- STA/SoftAP 独立 SSID、密码、安全和 channel pending config。
+- AP start/stop/client event、真实 SoftAP MAC、carrier 和 status fallback。
+- TX/RX wire VIF 0/1 标记、RX role epoch 隔离、切换前 TX ownership 门禁。
+- CP 保留 EAPOL/hostapd，SoftAP ARP/IPv4 direct-push 给 OpenVela。
+- `CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4` 下 CP `g_uap` L3/DHCP 入口级禁用。
+- NuttX broadcast、DHCP server、地址池和最多 4 个 lease 配置。
+- WAPI MASTER 模式 `disconnect` 下发 ESSID-OFF，支持命令行停止 SoftAP。
+
+构建门禁：
+
+- `nsh` 全量及增量 `-Werror` 构建通过。
+- `ai_agent` 正常构建通过；补齐其既有 audio test 的 `CONFIG_LIB_OPUS` 依赖。
+- 实际 CP 构建树与比赛仓镜像一致，CP clean build 和最终 package 通过。
+- 生成 CP 配置包含 STA 与 SoftAP 两个 OpenVela IPv4 ownership 开关。
+- 最终 `all-app.bin` 已生成，外部 AP 输入与 package `app1.bin` 字节一致。
+
+实板基础验证（2026-08-18）：
+
+- `VelaSight_AP`、channel 6、WPA2-CCMP 在实板进入 `RUNNING`。
+- 手机可发现热点并使用正确密码成功关联。
+- `dhcpd_start wlan0` 可启动，板端地址为 `192.168.10.1/24`。
+
+待实板射频验收：
+
+- 默认开机 STA 实际关联、DHCP、DNS、TLS/HTTPS 回归。
+- Open SoftAP 和 WPA2 错误密码拒绝行为。
+- DHCP lease 地址确认、ARP、ping 和 TCP/UDP 双向通信。
+- STA -> AP -> STA 100 次、客户端计数、复位和 24 小时稳定性。
 
 ## 1. 目标与结论
 
@@ -559,7 +596,7 @@ wapi freq wlan0 6 1
 wapi psk wlan0 <8至63字节密码> 3
 wapi essid wlan0 <SSID> 1
 ifconfig wlan0
-dhcpd wlan0 &
+dhcpd_start wlan0
 ```
 
 开放热点只用于受控测试，必须显式清除 AP password/security 后再启动，不能仅

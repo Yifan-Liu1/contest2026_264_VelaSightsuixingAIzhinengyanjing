@@ -794,12 +794,22 @@ void uap_ip_down(void)
 		dhcp_server_stop_iface(net_get_uap_handle());
 #else
 		dhcp_server_stop();
-#endif
+		#endif
 	}
+	#if CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4
+		netifapi_netif_set_down(&g_uap.netif);
+		netif_set_status_callback(&g_uap.netif, NULL);
+	#endif
 }
 
 void uap_ip_start(void)
 {
+#if CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4
+	/* Keep the Wi-Fi VIF for role mapping, but leave all SoftAP L3 state on
+	 * OpenVela.  In particular, do not configure g_uap or start CP DHCP. */
+	uap_ip_start_flag = false;
+	return;
+#endif
 	if (uap_ip_start_flag) {
 		/* VIF may have been recreated (channel change / restart with P2P GO). */
 		netifapi_netif_set_down(&g_uap.netif);
@@ -1029,6 +1039,13 @@ int net_configure_address(struct ipv4_config *addr, void *intrfc_handle)
 
 	struct iface *if_handle = (struct iface *)intrfc_handle;
 
+#if CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4
+	if (if_handle == &g_uap) {
+		/* Never allow a future direct caller to claim SoftAP L3 on CP. */
+		return 0;
+	}
+#endif
+
 	char *ip_type = NULL;
 	if(addr->addr_type == ADDR_TYPE_DHCP)
 		ip_type = "DHCP client";
@@ -1118,9 +1135,13 @@ int net_configure_address(struct ipv4_config *addr, void *intrfc_handle)
 		up_iface = 0;
 #endif
 	} else if (if_handle == &g_uap) {
+#if CONFIG_WIFI_VNET_OPENVELA_SOFTAP_IPV4
+		up_iface = 0;
+#else
 		dhcp_server_start(net_get_uap_handle());
 		ap_set_default_netif();
 		up_iface = 0;
+#endif
 	} else {
 		up_iface = 0;
 	}
