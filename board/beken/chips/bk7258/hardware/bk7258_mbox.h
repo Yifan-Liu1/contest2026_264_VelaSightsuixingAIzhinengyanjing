@@ -70,14 +70,13 @@ _Static_assert((BK7258_MB_HEADER_STATE_MASK &
 #define BK7258_MB_CTRL_RESET        0x04u
 #define BK7258_MB_STATE_COM_FAIL    0x01u
 
-/* Armino's ACK_STATE_COMPLETE.  The mb_ipc socket layer only treats a command
- * as delivered when the acknowledgement says this; a state of zero leaves its
- * socket in "receive in process" and it then rejects everything else with
- * RX_BUSY.  Notification-only channels (BT, Wi-Fi, SARADC) do not look at it,
- * which is why they worked with zero.
+/* Armino's ACK_STATE_COMPLETE.  This is mb_chnl_ack_t.ack_state in mailbox
+ * word 3.  It is deliberately not a BK7258_MB_STATE_* value: hdr.state only
+ * accepts CHNL_STATE_COM_FAIL, and the CP rejects any other bit before the
+ * mb_ipc completion callback can clear STATE_RX_IN_PROCESS.
  */
 
-#define BK7258_MB_STATE_ACK_COMPLETE 0x02u
+#define BK7258_MB_ACK_STATE_COMPLETE 0x02u
 
 #define BK7258_MB_CHAN_HW_CTRL_TX   0x10u
 
@@ -92,12 +91,23 @@ _Static_assert((BK7258_MB_HEADER_STATE_MASK &
 #define BK7258_MB_CHAN_WIFI_CMD_TX  0x14u
 #define BK7258_MB_CHAN_WIFI_DATA_TX 0x15u
 #define BK7258_MB_CHAN_UART0_TX     0x19u
+
+/* The flash operation notification, index 11 in the same enum
+ * (MB_CHNL_FLASH).  The CP raises it before and after every flash access it
+ * performs -- cp/middleware/driver/flash/flash_notify.c send_flash_op_state()
+ * -- and then spins for up to 5ms waiting for an acknowledgement whose
+ * ack_data1 reads IPC_FLASH_OP_ACK.  Only the RX direction is used here: the
+ * CP is always the one that announces, this core only answers.
+ */
+
+#define BK7258_MB_CHAN_FLASH_TX     0x1bu
 #define BK7258_MB_CHAN_IPC_RX       0x41u
 #define BK7258_MB_CHAN_PWC_RX       0x42u
 #define BK7258_MB_CHAN_BT_RX        0x43u
 #define BK7258_MB_CHAN_WIFI_CMD_RX  0x44u
 #define BK7258_MB_CHAN_WIFI_DATA_RX 0x45u
 #define BK7258_MB_CHAN_UART0_RX     0x49u
+#define BK7258_MB_CHAN_FLASH_RX     0x4bu
 #define BK7258_MB_CHAN_SARADC_RX    0x4cu
 
 #define BK7258_MB_UART_DATA         0u
@@ -124,12 +134,37 @@ _Static_assert((BK7258_MB_HEADER_STATE_MASK &
 #define BK7258_FLASH_IPC_ADDRESS    0x2809f980u
 #define BK7258_FLASH_IPC_SIZE       0x00000020u
 
+/* Payload staging for the flash service, one protocol chunk (512 bytes, the
+ * FLASH_IPC_READ_SIZE/FLASH_IPC_WRITE_SIZE the vendor's flash_ipc.h fixes).
+ *
+ * A write frame carries only a pointer, and the CP dereferences it directly
+ * (flash_server.c flash_write_handler() memcpy's from cmd_buff->buff and then
+ * re-computes the CRC over it).  A pointer into the AP's own heap is no good:
+ * the descriptor itself had to be moved here for exactly that reason -- see
+ * BK7258_FLASH_IPC_ADDRESS -- so the bytes it points at have to be here too.
+ */
+
+#define BK7258_FLASH_DATA_ADDRESS   0x2809fa00u
+#define BK7258_FLASH_DATA_SIZE      0x00000200u
+
 #define BK7258_MB_UART_RX_ADDRESS   0x2809fc00u
 #define BK7258_MB_UART_TX_ADDRESS   0x2809fd00u
 #define BK7258_MB_SHARED_TX_START   BK7258_IPC_TX_ADDRESS
 #define BK7258_MB_SHARED_TX_SIZE    \
   (BK7258_MB_UART_TX_ADDRESS + BK7258_MB_UART_CHUNK_SIZE - \
    BK7258_MB_SHARED_TX_START)
+
+/* The contiguous run of SWAP this core writes and the CP reads: the IPC TX
+ * frame, then the flash descriptor, then the flash payload staging buffer,
+ * ending where the read-only UART RX window begins.  bk7258_start.c maps this
+ * as one MPU region, which is what keeps it non-cacheable -- without a region
+ * the addresses only work by falling back to the default memory map, and that
+ * map calls this range cacheable.
+ */
+
+#define BK7258_MB_SHARED_RW_START   BK7258_IPC_TX_ADDRESS
+#define BK7258_MB_SHARED_RW_SIZE    \
+  (BK7258_MB_UART_RX_ADDRESS - BK7258_MB_SHARED_RW_START)
 
 _Static_assert(BK7258_IPC_TX_ADDRESS >= BK7258_SWAP_BASE &&
                BK7258_IPC_TX_ADDRESS + BK7258_IPC_TX_SIZE <=
@@ -151,6 +186,26 @@ _Static_assert(BK7258_MB_UART_TX_ADDRESS >= BK7258_SWAP_BASE &&
 _Static_assert((BK7258_MB_UART_RX_ADDRESS & 31u) == 0 &&
                (BK7258_MB_UART_TX_ADDRESS & 31u) == 0,
                "mailbox UART buffers must be cache-line aligned");
+_Static_assert(BK7258_FLASH_IPC_ADDRESS >= BK7258_MB_SHARED_RW_START &&
+               BK7258_FLASH_IPC_ADDRESS + BK7258_FLASH_IPC_SIZE <=
+               BK7258_MB_SHARED_RW_START + BK7258_MB_SHARED_RW_SIZE,
+               "flash descriptor lies outside the shared RW window");
+_Static_assert(BK7258_FLASH_DATA_ADDRESS >= BK7258_MB_SHARED_RW_START &&
+               BK7258_FLASH_DATA_ADDRESS + BK7258_FLASH_DATA_SIZE <=
+               BK7258_MB_SHARED_RW_START + BK7258_MB_SHARED_RW_SIZE,
+               "flash payload staging lies outside the shared RW window");
+_Static_assert(BK7258_FLASH_IPC_ADDRESS >=
+               BK7258_IPC_TX_ADDRESS + BK7258_IPC_TX_SIZE &&
+               BK7258_FLASH_DATA_ADDRESS >=
+               BK7258_FLASH_IPC_ADDRESS + BK7258_FLASH_IPC_SIZE,
+               "flash windows overlap the IPC TX frame or each other");
+_Static_assert((BK7258_FLASH_IPC_ADDRESS & 31u) == 0 &&
+               (BK7258_FLASH_DATA_ADDRESS & 31u) == 0,
+               "flash windows must be cache-line aligned");
+_Static_assert(BK7258_MB_SHARED_RW_START >= BK7258_SWAP_BASE &&
+               BK7258_MB_SHARED_RW_START + BK7258_MB_SHARED_RW_SIZE <=
+               BK7258_SWAP_BASE + BK7258_SWAP_SIZE,
+               "shared RW window lies outside SWAP");
 
 struct bk7258_mb_wire_message
 {
@@ -208,8 +263,8 @@ bk7258_mb_header_seq(const struct bk7258_mb_wire_message *message)
 static inline uint8_t
 bk7258_mb_header_channel(const struct bk7258_mb_wire_message *message)
 {
-  return (message->header & BK7258_MB_HEADER_CHAN_MASK) >>
-         BK7258_MB_HEADER_CHAN_SHIFT;
+  return (uint8_t)((message->header & BK7258_MB_HEADER_CHAN_MASK) >>
+                   BK7258_MB_HEADER_CHAN_SHIFT);
 }
 
 static inline uint32_t bk7258_mb_make_header(uint8_t command, uint8_t state,
@@ -221,6 +276,52 @@ static inline uint32_t bk7258_mb_make_header(uint8_t command, uint8_t state,
          ((uint32_t)(control & 0x0fu) << BK7258_MB_HEADER_CTRL_SHIFT) |
          ((uint32_t)sequence << BK7258_MB_HEADER_SEQ_SHIFT) |
          ((uint32_t)channel << BK7258_MB_HEADER_CHAN_SHIFT);
+}
+
+static inline uint32_t bk7258_mb_make_ack_header(
+    const struct bk7258_mb_wire_message *request, bool failed)
+{
+  return bk7258_mb_make_header(
+    bk7258_mb_header_cmd(request),
+    failed ? BK7258_MB_STATE_COM_FAIL : 0u,
+    BK7258_MB_CTRL_ACK_BOX,
+    bk7258_mb_header_seq(request),
+    bk7258_mb_header_channel(request));
+}
+
+#define BK7258_MB_IPC_RSP_FLAG 0x80u
+
+static inline uint8_t
+bk7258_mb_ipc_tag(const struct bk7258_mb_wire_message *message)
+{
+  return (uint8_t)((message->payload_address >> 16) & 0xffu);
+}
+
+static inline bool bk7258_mb_ipc_is_response(
+    const struct bk7258_mb_wire_message *message, uint8_t command,
+    uint8_t tag)
+{
+  return bk7258_mb_header_cmd(message) ==
+           (uint8_t)(command | BK7258_MB_IPC_RSP_FLAG) &&
+         bk7258_mb_ipc_tag(message) == tag;
+}
+
+static inline void bk7258_mb_ipc_make_response(
+    const struct bk7258_mb_wire_message *request,
+    struct bk7258_mb_wire_message *response)
+{
+  uint32_t param1 = request->payload_address;
+
+  response->header = bk7258_mb_make_header(
+    (uint8_t)(bk7258_mb_header_cmd(request) | BK7258_MB_IPC_RSP_FLAG),
+    0u, 0u, 0u, 0u);
+  response->payload_address = ((param1 & 0x000000ffu) << 8) |
+                              ((param1 & 0x0000ff00u) >> 8) |
+                              (param1 & 0x00ff0000u);
+  response->payload_length = request->payload_length;
+  response->flags = request->flags;
+  response->crc8 = request->crc8;
+  response->reserved = request->reserved;
 }
 
 typedef struct

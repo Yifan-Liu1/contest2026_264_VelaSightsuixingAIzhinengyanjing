@@ -22,7 +22,7 @@
 #include "hardware/bk7258_mbox.h"
 
 #define MB_CHANNEL_COUNT       7u
-#define MB_RX_CHANNEL_COUNT    6u
+#define MB_RX_CHANNEL_COUNT    7u
 #define MB_ACK_SLOT_COUNT      8u
 #define MB_ACK_HIGH_WATER      3u
 #define MB_TIMEOUT             MSEC2TICK(200)
@@ -120,6 +120,7 @@ static const uint8_t g_rx_channel_ids[MB_RX_CHANNEL_COUNT] =
   BK7258_MB_CHAN_WIFI_CMD_RX,
   BK7258_MB_CHAN_WIFI_DATA_RX,
   BK7258_MB_CHAN_UART0_RX,
+  BK7258_MB_CHAN_FLASH_RX,
   BK7258_MB_CHAN_SARADC_RX
 };
 
@@ -799,24 +800,14 @@ static int handle_command(const struct bk7258_mb_wire_message *message)
       state = BK7258_MB_STATE_COM_FAIL;
     }
 
-  /* Socket channels need an explicit "handled and complete" state; see
-   * BK7258_MB_STATE_ACK_COMPLETE.
-   */
-
-  if (channel == BK7258_MB_CHAN_IPC_RX && ret == OK && state == 0)
-    {
-      state = BK7258_MB_STATE_ACK_COMPLETE;
-    }
-
   if ((control & BK7258_MB_CTRL_SYNC_TX) != 0)
     {
       return OK;
     }
 
   memset(&slot->message, 0, sizeof(slot->message));
-  slot->message.header = bk7258_mb_make_header(
-    bk7258_mb_header_cmd(message), state, BK7258_MB_CTRL_ACK_BOX,
-    bk7258_mb_header_seq(message), channel);
+  slot->message.header = bk7258_mb_make_ack_header(message,
+                                                   state != 0);
   /* On the socket channels the peer reinterprets the whole ack box as the
    * command it sent -- ipc_router_tx_cmpl_isr() in the CP's mb_ipc.c does a
    * plain cast, `ipc_cmd = (mb_ipc_cmd_t *)ack_buf`, and then checks that
@@ -974,23 +965,39 @@ static int mailbox_tx_worker(int argc, char **argv)
       flags = up_irq_save();
 
       probe = busy_probe();
-      if ((g_active.busy &&
-           clock_systime_ticks() - g_active.started >= MB_TIMEOUT) ||
-          (probe != NULL &&
-           clock_systime_ticks() - probe->started >= MB_TIMEOUT))
+      if (probe != NULL &&
+          clock_systime_ticks() - probe->started >= MB_TIMEOUT)
         {
+          /* A probe going unanswered really does mean the link is down: the
+           * probe is the thing that establishes it.  Recovery is right here.
+           */
+
           g_stats.timeout++;
-          if (probe != NULL)
-            {
-              probe->quarantine = true;
-              complete_transaction(probe, NULL, -ETIMEDOUT);
-              g_stats.probe_fail++;
-              set_link_state(BK7258_MB_LINK_DOWN);
-            }
-          else
-            {
-              begin_abort(-ETIMEDOUT);
-            }
+          probe->quarantine = true;
+          complete_transaction(probe, NULL, -ETIMEDOUT);
+          g_stats.probe_fail++;
+          set_link_state(BK7258_MB_LINK_DOWN);
+        }
+      else if (g_active.busy &&
+               clock_systime_ticks() - g_active.started >= MB_TIMEOUT)
+        {
+          /* An ordinary message going unanswered does not.  Fail that one
+           * transaction and carry on.
+           *
+           * This used to call begin_abort(), which quarantined the link and
+           * started a recovery epoch -- and while the link is PROBING, dispatch
+           * only lets probe frames out, so the console and the CP heartbeat
+           * were both blocked.  The CP's 8-second watchdog then reset the chip.
+           * Measured 2026-08-18: one unanswered flash read turned into an
+           * endless boot loop ("IPC[1]heartbeat timeout", "Assert at:
+           * mb_ipc_task:297"), because the transport treated a single
+           * application-level non-reply as evidence that the whole link was
+           * broken.  It is not: the console and the heartbeat were working up
+           * to that moment, and they are what recovery then destroyed.
+           */
+
+          g_stats.timeout++;
+          complete_transaction(&g_active, NULL, -ETIMEDOUT);
         }
 
       if (g_link_state == BK7258_MB_LINK_DOWN &&
