@@ -116,4 +116,23 @@ int bk7258_kvdb_foreach(bk7258_kvdb_cb_t callback, FAR void *arg);
 
 void bk7258_kvdb_seed_agent_config(void);
 
+/****************************************************************************
+ * Name: bk7258_kvdb_apply_wifi
+ *
+ * Description:
+ *   Join the stored network: brings wlan0 up, hands the driver the stored
+ *   passphrase and asks it to associate with the stored SSID -- the two `wapi`
+ *   commands the manual procedure used to need, through the same ioctls.
+ *   Returns OK, -ENOENT when no SSID is stored, or a negated errno.
+ *
+ *   An address is not part of this.  DHCP lives in apps and cannot be reached
+ *   from here, so `renew wlan0` is still what asks for one.
+ *
+ *   Call from a task, for the same reason as bk7258_kvdb_load(): associating
+ *   is a request to the CP and it blocks.
+ *
+ ****************************************************************************/
+
+int bk7258_kvdb_apply_wifi(void);
+
 #endif /* __ARCH_ARM_SRC_BK7258_INCLUDE_BK7258_KVDB_H */

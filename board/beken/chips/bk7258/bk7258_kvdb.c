@@ -62,6 +62,7 @@
 #define KVDB_VERSION      1u
 #define KVDB_SECTOR       BK7258_FLASH_AP_ENV_BASE
 #define KVDB_CAPACITY     BK7258_FLASH_SECTOR_SIZE
+#define KVDB_LOAD_CHUNK   BK7258_FLASH_CHUNK_SIZE
 
 /****************************************************************************
  * Private Types
@@ -75,6 +76,10 @@ begin_packed_struct struct kvdb_header_s
   uint32_t bytes;      /* Record area length */
   uint32_t crc;        /* CRC-32 over the record area */
 } end_packed_struct;
+
+_Static_assert(KVDB_LOAD_CHUNK <= KVDB_CAPACITY &&
+               KVDB_LOAD_CHUNK >= sizeof(struct kvdb_header_s),
+               "kvdb load chunk must hold the header and fit the store");
 
 /****************************************************************************
  * Private Data
@@ -266,7 +271,14 @@ int bk7258_kvdb_load(void)
 
   nxmutex_lock(&g_kvdb_lock);
 
-  ret = bk7258_flash_read(KVDB_SECTOR, g_kvdb_image, KVDB_CAPACITY);
+  /* One chunk first, not the whole sector.  A stored configuration is a few
+   * hundred bytes, so this is almost always the entire store: reading 4KB
+   * blind costs eight chunks and sixteen cross-core frames to fetch mostly
+   * erased flash, and every one of those frames is exposure.  What the first
+   * chunk cannot hold, the header's own length tells us to go back for.
+   */
+
+  ret = bk7258_flash_read(KVDB_SECTOR, g_kvdb_image, KVDB_LOAD_CHUNK);
   if (ret < 0)
     {
       /* Keep whatever is in memory rather than clearing it: a value set
@@ -278,7 +290,29 @@ int bk7258_kvdb_load(void)
       return ret;
     }
 
+  memset(g_kvdb_image + KVDB_LOAD_CHUNK, 0, KVDB_CAPACITY - KVDB_LOAD_CHUNK);
+
   hdr = kvdb_hdr();
+
+  if (memcmp(hdr->magic, KVDB_MAGIC, KVDB_MAGIC_LEN) == 0 &&
+      hdr->version == KVDB_VERSION &&
+      hdr->bytes <= KVDB_CAPACITY - sizeof(struct kvdb_header_s) &&
+      sizeof(struct kvdb_header_s) + hdr->bytes > KVDB_LOAD_CHUNK)
+    {
+      size_t used = sizeof(struct kvdb_header_s) + hdr->bytes;
+
+      ret = bk7258_flash_read(KVDB_SECTOR + KVDB_LOAD_CHUNK,
+                              g_kvdb_image + KVDB_LOAD_CHUNK,
+                              used - KVDB_LOAD_CHUNK);
+      if (ret < 0)
+        {
+          nxmutex_unlock(&g_kvdb_lock);
+          printf("kvdb: flash read failed (%d) past the first %u bytes, "
+                 "staying in memory only\n", ret,
+                 (unsigned int)KVDB_LOAD_CHUNK);
+          return ret;
+        }
+    }
 
   if (memcmp(hdr->magic, KVDB_MAGIC, KVDB_MAGIC_LEN) != 0 ||
       hdr->version != KVDB_VERSION ||

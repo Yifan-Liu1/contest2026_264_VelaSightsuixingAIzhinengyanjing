@@ -27,6 +27,48 @@
 #define BK7258_FLASH_AP_ENV_SIZE   0x00002000u
 #define BK7258_FLASH_SECTOR_SIZE   0x00001000u
 
+/* The transfer size the protocol fixes (flash_ipc.h, FLASH_IPC_READ_SIZE and
+ * FLASH_IPC_WRITE_SIZE).  Reads and writes are chunked to it internally, two
+ * frames per chunk; a caller that wants one chunk's worth of exposure keeps
+ * its transfer at or below this.
+ */
+
+#define BK7258_FLASH_CHUNK_SIZE    0x00000200u
+
+/****************************************************************************
+ * Name: bk7258_flash_notify_init
+ *
+ * Description:
+ *   Take MB_CHNL_FLASH, the channel the CP uses to announce that it is about
+ *   to touch flash and that it has finished.  Answering it is required of this
+ *   core whatever it does with flash itself: the CP raises the same
+ *   notification around its own writes and spins 5ms per edge waiting for the
+ *   acknowledgement.  Call once from board bring-up; it only registers a
+ *   callback and never blocks.
+ *
+ ****************************************************************************/
+
+int bk7258_flash_notify_init(void);
+
+/****************************************************************************
+ * Name: bk7258_flash_op_notify_register
+ *
+ * Description:
+ *   Subscribe to those announcements.  busy is true when a flash access is
+ *   starting and false when it has finished; between the two the part is
+ *   unavailable, which for this core means instruction fetch out of it stalls
+ *   -- so anything with a deadline (the panel, the camera sampler) wants to be
+ *   told.  Runs in interrupt context with the CP spinning on the answer: do
+ *   nothing here that can block or take long.  One subscriber; registering
+ *   again replaces it, NULL removes it.
+ *
+ ****************************************************************************/
+
+typedef CODE void (*bk7258_flash_op_notify_t)(bool busy, FAR void *arg);
+
+void bk7258_flash_op_notify_register(bk7258_flash_op_notify_t callback,
+                                     FAR void *arg);
+
 /****************************************************************************
  * Name: bk7258_flash_client_init
  *

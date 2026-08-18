@@ -48,4 +48,14 @@ int bk7258_kvdb_set(FAR const char *key, FAR const char *value);
 int bk7258_kvdb_del(FAR const char *key);
 int bk7258_kvdb_foreach(bk7258_kvdb_cb_t callback, FAR void *arg);
 
+#ifdef CONFIG_BK7258_WIFI
+/* Join the stored network now: wlan0 up, stored passphrase and SSID handed to
+ * the driver.  The same thing bring-up does with them at boot, exposed so a
+ * freshly typed credential can be used without a reset.  An address is not
+ * part of it -- `renew wlan0` still asks for one.
+ */
+
+int bk7258_kvdb_apply_wifi(void);
+#endif
+
 #endif /* __BOARDS_BEKEN_BK7258_AP_INCLUDE_KVDB_H */

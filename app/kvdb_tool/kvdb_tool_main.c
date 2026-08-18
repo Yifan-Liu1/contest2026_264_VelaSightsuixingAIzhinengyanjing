@@ -18,7 +18,7 @@
  *   kvdb set <key> <value>     write and persist
  *   kvdb del <key>             remove and persist
  *
- * Anything whose key ends in ".key" or ".psk" is masked unless --raw is
+ * Keys ending in ".key", ".psk" or ".token" are masked unless --raw is
  * given, because these values otherwise end up in serial logs and in the AI
  * coding logs this project has to submit.
  *
@@ -39,6 +39,8 @@
 
 #include <arch/board/kvdb.h>
 
+#include "kvdb_secret.h"
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
@@ -51,17 +53,13 @@ static void kvdb_usage(void)
          "  kvdb get <key> [--raw]  print one value\n"
          "  kvdb set <key> <value>  write and persist across reset\n"
          "  kvdb del <key>          remove and persist\n"
+#ifdef CONFIG_BK7258_WIFI
+         "  kvdb wifi               join the stored network now\n"
+         "                          (boot does this too; then `renew wlan0`)\n"
+#endif
          "\n"
          "Keys the rest of the system reads:\n"
          "  llm.key llm.host llm.model wifi.ssid wifi.psk\n");
-}
-
-static bool kvdb_is_secret(const char *key)
-{
-  size_t len = strlen(key);
-
-  return (len >= 4 && strcmp(key + len - 4, ".key") == 0) ||
-         (len >= 4 && strcmp(key + len - 4, ".psk") == 0);
 }
 
 /* Show enough to recognise which key is loaded, not enough to use it. */
@@ -70,7 +68,7 @@ static void kvdb_print_value(const char *key, const char *value, bool raw)
 {
   size_t len = strlen(value);
 
-  if (raw || !kvdb_is_secret(key) || len == 0)
+  if (raw || !kvdb_key_is_secret(key) || len == 0)
     {
       printf("%s = %s\n", key, value);
     }
@@ -182,6 +180,29 @@ int main(int argc, char *argv[])
       printf("kvdb: %s removed\n", argv[2]);
       return EXIT_SUCCESS;
     }
+
+#ifdef CONFIG_BK7258_WIFI
+  if (strcmp(argv[1], "wifi") == 0)
+    {
+      /* Boot does this by itself; this is for the credential just typed, so
+       * that setting it does not mean rebooting to use it.
+       */
+
+      ret = bk7258_kvdb_apply_wifi();
+      if (ret == -ENOENT)
+        {
+          printf("kvdb: no %s stored\n", BK7258_KVDB_KEY_WIFI_SSID);
+          return EXIT_FAILURE;
+        }
+
+      if (ret < 0)
+        {
+          return EXIT_FAILURE;
+        }
+
+      return EXIT_SUCCESS;
+    }
+#endif
 
   kvdb_usage();
   return EXIT_FAILURE;
