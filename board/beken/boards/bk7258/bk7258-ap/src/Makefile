@@ -29,6 +29,11 @@ CSRCS += bk7258_audio_bringup.c
 CSRCS += bk7258_audio_dev.c
 endif
 
+ifeq ($(CONFIG_BK7258_WIFI),y)
+CSRCS += bk7258_wifi_config.c
+CSRCS += bk7258_net_autostart.c
+endif
+
 ifeq ($(CONFIG_BK7258_JPEG_ENC),y)
 CSRCS += bk7258_jpeg_enc.c
 endif
