@@ -24,14 +24,18 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <mqueue.h>
+
 #include <sys/boardctl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <nuttx/audio/audio.h>
 #include <nuttx/video/video.h>
 
 #include <netutils/cJSON.h>
@@ -42,6 +46,12 @@
 #include "wt_command.h"
 #include "wt_protocol.h"
 #include "wt_queue.h"
+
+/* app/conv's record store, reached by REALPATH from this directory -- see the
+ * comment in CMakeLists.txt.  Only the reading half is used here.
+ */
+
+#include "conv_store.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -70,6 +80,62 @@
 /* kvdb values are capped at 512 bytes by bk7258_kvdb_get()'s callers. */
 
 #define WT_KVDB_VAL_MAX   513
+
+/* Conversation record read buffers.  Same sizes the `conv` command uses
+ * (CONV_TEXT_MAX and its cue_json buffer), so a record that prints in full on
+ * the console also arrives in full at the page -- two different truncation
+ * points for the same file would be a bug that only shows up on long
+ * conversations.
+ */
+
+#define WT_CONV_TEXT_MAX  1024
+#define WT_CONV_CUE_MAX   512
+
+/* Playback device, and where 0 dB lands in the upper half's 0..1000 scale.
+ *
+ * The driver maps 0..1000 onto the DAC's 6-bit digital gain whose 0 dB point
+ * is 0x2d of 0x3f, so unity is 714 rather than the top of the range: above it
+ * the DAC is amplifying and can clip.  The page marks that point instead of
+ * presenting 100% as "normal".
+ */
+
+#define WT_AUDIO_PLAY_DEV     "/dev/audio/pcm0p"
+#define WT_AUDIO_UNITY_VOLUME ((0x2d * 1000) / 0x3f)
+
+/* The spoken confirmation: mono signed 16-bit little-endian, no header.
+ *
+ * 8 kHz, not 16: at 16 kHz the two-second phrase is 63.7 KB and the protocol's
+ * frame limit is 65.5 KB, which leaves nothing for a slightly longer phrase --
+ * a limit that is met exactly today is a limit that breaks on the next edit.
+ * 8 kHz halves it and speech at 8 kHz is what a telephone is.
+ *
+ * 8.3 name, like everything else on this card: CONFIG_FAT_LFN is off and a
+ * longer name would be silently mangled.
+ */
+
+#define WT_ANNOUNCE_PCM   "/mnt/sdnand/ai_agent/VOLSET.PCM"
+#define WT_ANNOUNCE_RATE  8000
+#define WT_ANNOUNCE_MAX   (256 * 1024)
+
+/* Upload chunk ceiling, in base64 characters.  Well under the 64 KB frame so
+ * the JSON around it cannot push a legal chunk over the limit -- the far end
+ * drops the connection on an oversized frame rather than trying to recover.
+ */
+
+#define WT_ANNOUNCE_B64_MAX  (32 * 1024)
+
+/* Playback plumbing for the announcement. */
+
+#define WT_PLAY_MQ           "wt_play"
+#define WT_PLAY_MAX_BUFFERS  8
+#define WT_PLAY_POLL_MS      50
+
+/* Consecutive idle polls before giving up on a clip.  Without it a driver that
+ * stopped returning buffers would hold the session thread for ever.  At 50 ms
+ * this is five seconds, well over the length of any confirmation.
+ */
+
+#define WT_PLAY_IDLE_LIMIT   100
 
 #ifndef V4L2_PIX_FMT_ENTROPY
 #  define V4L2_PIX_FMT_ENTROPY  v4l2_fourcc('G', 'R', 'E', 'P')
@@ -1645,6 +1711,1129 @@ static int wt_arg_int(cJSON *args, const char *name, int dflt)
   return cJSON_IsNumber(a) ? (int)a->valuedouble : dflt;
 }
 
+static double wt_arg_dbl(cJSON *args, const char *name, double dflt)
+{
+  cJSON *a = args != NULL ? cJSON_GetObjectItemCaseSensitive(args, name)
+                          : NULL;
+
+  return cJSON_IsNumber(a) ? a->valuedouble : dflt;
+}
+
+/****************************************************************************
+ * Private Functions: playback volume
+ *
+ * The DAC's digital gain, reached through the standard NuttX audio feature
+ * ioctl rather than anything private to this board.
+ *
+ * No AUDIOIOC_RESERVE around it, deliberately: audio.c forwards
+ * AUDIOIOC_CONFIGURE straight to the lower half without checking whether the
+ * device is reserved, so the volume can be changed while something is
+ * playing -- which is when an operator actually wants to change it.  Taking
+ * the reservation would have made this fail with EBUSY exactly then.
+ ****************************************************************************/
+
+/* One direction of the audio device, opened for the duration of one clip.
+ *
+ * The sequence below is audio_test_open()'s, kept in the same order because
+ * that order is not arbitrary: GETBUFFERINFO has to precede ALLOCBUFFER or the
+ * upper half's buffer quota is still zero and every allocation returns 0
+ * (audio.c:786) -- which presents as "no buffers" rather than as a missing
+ * ioctl.
+ */
+
+struct wt_play_s
+{
+  int                 fd;
+  mqd_t               mq;
+  unsigned int        nbuffers;
+  unsigned int        buffersize;
+  struct ap_buffer_s *buffers[WT_PLAY_MAX_BUFFERS];
+  unsigned int        inflight;
+  bool                started;
+};
+
+static void wt_play_close(struct wt_play_s *p)
+{
+  struct audio_buf_desc_s desc;
+  unsigned int i;
+
+  if (p->fd < 0)
+    {
+      return;
+    }
+
+  if (p->started)
+    {
+      ioctl(p->fd, AUDIOIOC_STOP, 0);
+      p->started = false;
+    }
+
+  if (p->mq != (mqd_t)-1)
+    {
+      ioctl(p->fd, AUDIOIOC_UNREGISTERMQ, (unsigned long)p->mq);
+    }
+
+  for (i = 0; i < p->nbuffers; i++)
+    {
+      if (p->buffers[i] != NULL)
+        {
+          desc.u.buffer = p->buffers[i];
+          ioctl(p->fd, AUDIOIOC_FREEBUFFER, (unsigned long)&desc);
+          p->buffers[i] = NULL;
+        }
+    }
+
+  ioctl(p->fd, AUDIOIOC_RELEASE, 0);
+
+  if (p->mq != (mqd_t)-1)
+    {
+      mq_close(p->mq);
+      mq_unlink(WT_PLAY_MQ);
+      p->mq = (mqd_t)-1;
+    }
+
+  close(p->fd);
+  p->fd = -1;
+}
+
+static int wt_play_open(struct wt_play_s *p, unsigned int samplerate)
+{
+  struct audio_caps_desc_s cap_desc;
+  struct ap_buffer_info_s buf_info;
+  struct audio_buf_desc_s desc;
+  struct mq_attr attr;
+  unsigned int i;
+  int ret;
+
+  memset(p, 0, sizeof(*p));
+  p->fd = -1;
+  p->mq = (mqd_t)-1;
+
+  p->fd = open(WT_AUDIO_PLAY_DEV, O_RDWR | O_CLOEXEC);
+  if (p->fd < 0)
+    {
+      return -errno;
+    }
+
+  if (ioctl(p->fd, AUDIOIOC_RESERVE, 0) < 0)
+    {
+      ret = -errno;
+      close(p->fd);
+      p->fd = -1;
+      return ret;
+    }
+
+  memset(&cap_desc, 0, sizeof(cap_desc));
+  cap_desc.caps.ac_len            = sizeof(struct audio_caps_s);
+  cap_desc.caps.ac_type           = AUDIO_TYPE_OUTPUT;
+  cap_desc.caps.ac_channels       = 1;
+  cap_desc.caps.ac_controls.hw[0] = samplerate & 0xffff;
+  cap_desc.caps.ac_controls.b[3]  = samplerate >> 16;
+  cap_desc.caps.ac_controls.b[2]  = 16;
+  cap_desc.caps.ac_subtype        = AUDIO_FMT_PCM;
+
+  if (ioctl(p->fd, AUDIOIOC_CONFIGURE, (unsigned long)&cap_desc) < 0)
+    {
+      ret = -errno;
+      goto err;
+    }
+
+  if (ioctl(p->fd, AUDIOIOC_GETBUFFERINFO, (unsigned long)&buf_info) < 0)
+    {
+      ret = -errno;
+      goto err;
+    }
+
+  p->buffersize = buf_info.buffer_size;
+  p->nbuffers   = buf_info.nbuffers > WT_PLAY_MAX_BUFFERS ?
+                  WT_PLAY_MAX_BUFFERS : buf_info.nbuffers;
+
+  for (i = 0; i < p->nbuffers; i++)
+    {
+      desc.numbytes  = p->buffersize;
+      desc.u.pbuffer = &p->buffers[i];
+
+      /* Zero is not an error code here, it is the quota answer -- see the
+       * comment on the struct.
+       */
+
+      ret = ioctl(p->fd, AUDIOIOC_ALLOCBUFFER, (unsigned long)&desc);
+      if (ret <= 0 || p->buffers[i] == NULL)
+        {
+          p->nbuffers = i;
+          ret = -ENOMEM;
+          goto err;
+        }
+    }
+
+  attr.mq_maxmsg  = p->nbuffers + 8;
+  attr.mq_msgsize = sizeof(struct audio_msg_s);
+  attr.mq_curmsgs = 0;
+  attr.mq_flags   = 0;
+
+  p->mq = mq_open(WT_PLAY_MQ, O_RDWR | O_CREAT, 0644, &attr);
+  if (p->mq == (mqd_t)-1)
+    {
+      ret = -errno;
+      goto err;
+    }
+
+  if (ioctl(p->fd, AUDIOIOC_REGISTERMQ, (unsigned long)p->mq) < 0)
+    {
+      ret = -errno;
+      goto err;
+    }
+
+  return OK;
+
+err:
+  wt_play_close(p);
+  return ret;
+}
+
+/* Copy the next slice of the clip into a buffer.  Returns the bytes supplied,
+ * zero once the clip is spent.
+ */
+
+static size_t wt_play_fill(struct ap_buffer_s *apb, const uint8_t *pcm,
+                           size_t len, size_t *pos)
+{
+  size_t copy = len - *pos;
+
+  if (copy > apb->nmaxbytes)
+    {
+      copy = apb->nmaxbytes;
+    }
+
+  if (copy > 0)
+    {
+      memcpy(apb->samp, pcm + *pos, copy);
+      *pos += copy;
+    }
+
+  apb->nbytes  = copy;
+  apb->curbyte = 0;
+  return copy;
+}
+
+static int wt_play_enqueue(struct wt_play_s *p, struct ap_buffer_s *apb)
+{
+  struct audio_buf_desc_s desc;
+
+  desc.numbytes = apb->nbytes;
+  desc.u.buffer = apb;
+
+  if (ioctl(p->fd, AUDIOIOC_ENQUEUEBUFFER, (unsigned long)&desc) < 0)
+    {
+      return -errno;
+    }
+
+  p->inflight++;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: wt_play_pcm
+ *
+ * Description:
+ *   Play one mono 16-bit clip to the speaker, blocking until it has drained.
+ *
+ *   Blocking is deliberate.  The clip is under two seconds and the caller is
+ *   the session thread, which has nothing else to do until it answers; a
+ *   thread for it would need its own lifetime and a way to say "still
+ *   playing", and the only thing that buys is a response that arrives before
+ *   the sound the operator is waiting to hear.
+ *
+ ****************************************************************************/
+
+static int wt_play_pcm(const uint8_t *pcm, size_t len,
+                       unsigned int samplerate, unsigned int *played)
+{
+  struct wt_play_s p;
+  size_t pos = 0;
+  unsigned int idle = 0;
+  unsigned int i;
+  int ret;
+
+  *played = 0;
+
+  ret = wt_play_open(&p, samplerate);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  for (i = 0; i < p.nbuffers; i++)
+    {
+      if (wt_play_fill(p.buffers[i], pcm, len, &pos) == 0)
+        {
+          break;
+        }
+
+      ret = wt_play_enqueue(&p, p.buffers[i]);
+      if (ret < 0)
+        {
+          wt_play_close(&p);
+          return ret;
+        }
+    }
+
+  if (ioctl(p.fd, AUDIOIOC_START, 0) < 0)
+    {
+      ret = -errno;
+      wt_play_close(&p);
+      return ret;
+    }
+
+  p.started = true;
+
+  while ((pos < len || p.inflight > 0) && idle < WT_PLAY_IDLE_LIMIT)
+    {
+      struct audio_msg_s msg;
+      struct timespec ts;
+      unsigned int prio;
+      ssize_t got;
+
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += WT_PLAY_POLL_MS * 1000000;
+      if (ts.tv_nsec >= 1000000000)
+        {
+          ts.tv_nsec -= 1000000000;
+          ts.tv_sec++;
+        }
+
+      got = mq_timedreceive(p.mq, (char *)&msg, sizeof(msg), &prio, &ts);
+      if (got != sizeof(msg))
+        {
+          idle++;
+          continue;
+        }
+
+      if (msg.msg_id != AUDIO_MSG_DEQUEUE || msg.u.ptr == NULL)
+        {
+          continue;
+        }
+
+      idle = 0;
+      if (p.inflight > 0)
+        {
+          p.inflight--;
+        }
+
+      (*played)++;
+
+      if (pos < len)
+        {
+          struct ap_buffer_s *apb = msg.u.ptr;
+
+          if (wt_play_fill(apb, pcm, len, &pos) > 0)
+            {
+              wt_play_enqueue(&p, apb);
+            }
+        }
+    }
+
+  wt_play_close(&p);
+  return idle >= WT_PLAY_IDLE_LIMIT ? -ETIMEDOUT : OK;
+}
+
+/* base64 decode, in place of a dependency.
+ *
+ * Rejects anything that is not base64 rather than skipping it: this decodes a
+ * clip that is about to be played at whatever volume was just set, and silently
+ * dropping stray bytes would turn a truncated upload into noise out of the
+ * speaker instead of an error on the page.  Padding is optional because the
+ * chunks are cut on 3-byte boundaries by the sender and only the last one has
+ * any.
+ */
+
+static int wt_b64_val(char c)
+{
+  if (c >= 'A' && c <= 'Z')
+    {
+      return c - 'A';
+    }
+
+  if (c >= 'a' && c <= 'z')
+    {
+      return c - 'a' + 26;
+    }
+
+  if (c >= '0' && c <= '9')
+    {
+      return c - '0' + 52;
+    }
+
+  if (c == '+')
+    {
+      return 62;
+    }
+
+  if (c == '/')
+    {
+      return 63;
+    }
+
+  return -1;
+}
+
+static int wt_b64_decode(const char *in, uint8_t *out, size_t outcap,
+                         size_t *outlen)
+{
+  uint32_t acc = 0;
+  unsigned int nbits = 0;
+  size_t pos = 0;
+
+  for (; *in != '\0'; in++)
+    {
+      int v;
+
+      if (*in == '=')
+        {
+          break;
+        }
+
+      v = wt_b64_val(*in);
+      if (v < 0)
+        {
+          return -EINVAL;
+        }
+
+      acc = (acc << 6) | (uint32_t)v;
+      nbits += 6;
+
+      if (nbits >= 8)
+        {
+          nbits -= 8;
+          if (pos >= outcap)
+            {
+              return -E2BIG;
+            }
+
+          out[pos++] = (uint8_t)((acc >> nbits) & 0xff);
+        }
+    }
+
+  *outlen = pos;
+  return OK;
+}
+
+/* mkdir every component of the path's directory.  The card starts empty after
+ * a format and the clip's directory is shared with the conversation store, so
+ * whichever feature is used first has to create it.
+ */
+
+static int wt_mkdir_parents(const char *path)
+{
+  char dir[96];
+  char *p;
+
+  strlcpy(dir, path, sizeof(dir));
+
+  p = strrchr(dir, '/');
+  if (p == NULL)
+    {
+      return OK;
+    }
+
+  *p = '\0';
+
+  for (p = dir + 1; *p != '\0'; p++)
+    {
+      if (*p != '/')
+        {
+          continue;
+        }
+
+      *p = '\0';
+      if (mkdir(dir, 0755) < 0 && errno != EEXIST)
+        {
+          return -errno;
+        }
+
+      *p = '/';
+    }
+
+  if (mkdir(dir, 0755) < 0 && errno != EEXIST)
+    {
+      return -errno;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: wt_announce
+ *
+ * Description:
+ *   Play the "volume set" confirmation from the SD card.
+ *
+ *   On the card rather than in the firmware because there is no room for it:
+ *   this configuration is at 92% of a 1088 KB flash, and the clip is 29 KB of
+ *   raw PCM.  The card has it to spare and the phrase can be re-recorded
+ *   without a reflash, which is the same trade as keeping the page on the
+ *   development machine.
+ *
+ *   Raw PCM rather than Opus, even though libopus is linked: a decoder here
+ *   would be code and heap for a file that is already small enough, and the
+ *   samples being exactly what comes out of the file makes "is it the volume
+ *   or is it the clip" answerable by ear.
+ *
+ * Returned Value:
+ *   true when the clip was played.  On failure *err carries the reason: the
+ *   volume itself has already been set by the time this runs, so a missing
+ *   clip must not turn into a failed command.
+ *
+ ****************************************************************************/
+
+/* The clip is played on its own thread, not on the session thread.
+ *
+ * Blocking the session thread was the first attempt and it broke the link: that
+ * thread is the one that reads the socket and answers PING (web_tool_main.c's
+ * receive loop dispatches commands and replies to keepalives from the same
+ * place), so two seconds of playback is two seconds of not answering.  The host
+ * gives up after 16 s, and several volume changes in a row were enough to be
+ * declared dead -- observed as "board stopped answering (no frame for 16s)"
+ * while the board was healthy and audibly playing.
+ *
+ * So the handler starts a thread and answers immediately.  What the page loses
+ * is confirmation that the sound finished; what it gains is a link that
+ * survives using the feature.  `announced` therefore means "playback started",
+ * and the syslog line carries the buffer count when it ends.
+ */
+
+struct wt_announce_job_s
+{
+  uint8_t *pcm;
+  size_t   len;
+};
+
+static volatile bool g_announce_busy;
+
+static void *wt_announce_thread(void *arg)
+{
+  struct wt_announce_job_s *job = arg;
+  unsigned int played = 0;
+  int ret;
+
+  ret = wt_play_pcm(job->pcm, job->len, WT_ANNOUNCE_RATE, &played);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "web_tool: announcement failed: %d\n", ret);
+    }
+  else
+    {
+      syslog(LOG_INFO, "web_tool: announcement played, %u buffer(s)\n",
+             played);
+    }
+
+  free(job->pcm);
+  free(job);
+  g_announce_busy = false;
+  return NULL;
+}
+
+static bool wt_announce(int *err)
+{
+  struct wt_announce_job_s *job;
+  pthread_attr_t attr;
+  struct stat st;
+  pthread_t tid;
+  uint8_t *pcm;
+  size_t len;
+  int fd;
+  int ret;
+
+  *err = 0;
+
+  if (g_announce_busy)
+    {
+      /* One at a time.  Two clips on the DAC at once is not a thing the device
+       * can do, and queueing them would mean a burst of slider clicks keeps the
+       * speaker talking long after the operator stopped.
+       */
+
+      *err = -EBUSY;
+      return false;
+    }
+
+  if (stat(WT_ANNOUNCE_PCM, &st) < 0)
+    {
+      *err = -errno;
+      return false;
+    }
+
+  if (st.st_size < 2 || (size_t)st.st_size > WT_ANNOUNCE_MAX)
+    {
+      /* Refused rather than truncated: half a phrase played at the new volume
+       * still sounds like a working feature, so it would be a bug that hides.
+       */
+
+      *err = -E2BIG;
+      return false;
+    }
+
+  len = (size_t)st.st_size & ~(size_t)1;   /* whole samples only */
+
+  pcm = malloc(len);
+  if (pcm == NULL)
+    {
+      *err = -ENOMEM;
+      return false;
+    }
+
+  fd = open(WT_ANNOUNCE_PCM, O_RDONLY);
+  if (fd < 0)
+    {
+      *err = -errno;
+      free(pcm);
+      return false;
+    }
+
+  ret = (int)read(fd, pcm, len);
+  close(fd);
+
+  if (ret < (int)len)
+    {
+      *err = ret < 0 ? -errno : -EIO;
+      free(pcm);
+      return false;
+    }
+
+  /* Read on this thread, played on the other: the file is on the card and a
+   * read that fails is something the page should hear about in its response,
+   * whereas the playback is what must not hold the session up.
+   */
+
+  job = malloc(sizeof(*job));
+  if (job == NULL)
+    {
+      free(pcm);
+      *err = -ENOMEM;
+      return false;
+    }
+
+  job->pcm = pcm;
+  job->len = len;
+  g_announce_busy = true;
+
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 4096);
+
+  /* Above the low-priority work queue (100) for the same reason the camera
+   * grabber is: the DAC asks for the next buffer through this thread, and below
+   * LPWORK it would be starved and the clip would stutter.  Below HPWORK (224)
+   * so it cannot delay the audio interrupt itself.
+   */
+
+  {
+    struct sched_param sp;
+
+    sp.sched_priority = 110;
+    pthread_attr_setschedparam(&attr, &sp);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+  }
+
+  ret = pthread_create(&tid, &attr, wt_announce_thread, job);
+  pthread_attr_destroy(&attr);
+
+  if (ret != 0)
+    {
+      g_announce_busy = false;
+      free(pcm);
+      free(job);
+      *err = -ret;
+      return false;
+    }
+
+  pthread_detach(tid);
+  return true;
+}
+
+/****************************************************************************
+ * Name: wt_cmd_audio_announce
+ *
+ * Description:
+ *   Receive the confirmation clip and write it to the card.
+ *
+ *   This exists because there was no way to put a file on the board at all:
+ *   the console is a mailbox command-injection path rather than a byte stream,
+ *   and nothing else in this project uploads.  Rather than add a general file
+ *   transfer for one 32 KB clip, the clip arrives base64 in the request that
+ *   already crosses TLS.
+ *
+ *   Chunked with an explicit offset, and the offset is checked against the file
+ *   position instead of trusted: base64 makes each chunk about a third larger
+ *   than the raw bytes, so a 32 KB clip is several requests, and a lost or
+ *   reordered one would otherwise produce a file that is the right length and
+ *   the wrong sound.
+ *
+ ****************************************************************************/
+
+static char *wt_cmd_audio_announce(cJSON *args)
+{
+  const char *b64 = wt_arg_str(args, "b64");
+  int offset = wt_arg_int(args, "offset", 0);
+  bool final = wt_arg_bool(args, "final", false);
+  uint8_t *raw;
+  size_t rawlen;
+  char data[128];
+  int fd;
+  int ret;
+
+  if (b64 == NULL)
+    {
+      /* No payload: report what is already there, so the page can decide
+       * whether it needs to upload at all.
+       */
+
+      struct stat st;
+
+      if (stat(WT_ANNOUNCE_PCM, &st) < 0)
+        {
+          snprintf(data, sizeof(data), "{\"present\":false,\"bytes\":0}");
+        }
+      else
+        {
+          snprintf(data, sizeof(data),
+                   "{\"present\":true,\"bytes\":%ld,\"seconds\":%u.%02u}",
+                   (long)st.st_size,
+                   (unsigned int)(st.st_size / 2 / WT_ANNOUNCE_RATE),
+                   (unsigned int)(((st.st_size / 2) % WT_ANNOUNCE_RATE) *
+                                  100 / WT_ANNOUNCE_RATE));
+        }
+
+      return wt_ok_raw(data);
+    }
+
+  if (offset < 0 || offset > (int)WT_ANNOUNCE_MAX)
+    {
+      return wt_fail("audio.announce: offset out of range", -EINVAL);
+    }
+
+  rawlen = strlen(b64);
+  if (rawlen == 0 || rawlen > WT_ANNOUNCE_B64_MAX)
+    {
+      return wt_fail("audio.announce: chunk too large", -E2BIG);
+    }
+
+  raw = malloc(rawlen);            /* decoded is always smaller than encoded */
+  if (raw == NULL)
+    {
+      return NULL;
+    }
+
+  ret = wt_b64_decode(b64, raw, rawlen, &rawlen);
+  if (ret < 0)
+    {
+      free(raw);
+      return wt_fail("audio.announce: chunk is not valid base64", ret);
+    }
+
+  if (offset == 0)
+    {
+      ret = wt_mkdir_parents(WT_ANNOUNCE_PCM);
+      if (ret < 0)
+        {
+          free(raw);
+          return wt_fail("audio.announce: cannot create the directory -- is "
+                         "/mnt/sdnand mounted?", ret);
+        }
+    }
+
+  /* O_TRUNC only at offset zero, so a retry of the first chunk restarts the
+   * file rather than appending to a half-written one.
+   */
+
+  fd = open(WT_ANNOUNCE_PCM,
+            O_WRONLY | O_CREAT | (offset == 0 ? O_TRUNC : 0), 0644);
+  if (fd < 0)
+    {
+      int err = -errno;
+
+      free(raw);
+      return wt_fail("audio.announce: cannot open the clip for writing", err);
+    }
+
+  if (lseek(fd, offset, SEEK_SET) != offset)
+    {
+      int err = -errno;
+
+      close(fd);
+      free(raw);
+      return wt_fail("audio.announce: seek failed", err);
+    }
+
+  ret = (int)write(fd, raw, rawlen);
+  free(raw);
+
+  if (ret < (int)rawlen)
+    {
+      int err = ret < 0 ? -errno : -ENOSPC;
+
+      close(fd);
+      return wt_fail("audio.announce: short write", err);
+    }
+
+  ret = (int)lseek(fd, 0, SEEK_CUR);
+  close(fd);
+
+  snprintf(data, sizeof(data), "{\"bytes\":%d,\"final\":%s}", ret,
+           final ? "true" : "false");
+  return wt_ok_raw(data);
+}
+
+static char *wt_cmd_audio_volume(cJSON *args)
+{
+  struct audio_caps_desc_s cap_desc;
+  struct wt_sb_s sb;
+  int requested = wt_arg_int(args, "volume", -1);
+  int current = -1;
+  int announce_err = 0;
+  bool announced = false;
+  int fd;
+
+  if (requested > 1000 || (requested < 0 && requested != -1))
+    {
+      return wt_fail("audio.volume: volume must be 0..1000", -EINVAL);
+    }
+
+  fd = open(WT_AUDIO_PLAY_DEV, O_RDWR | O_CLOEXEC);
+  if (fd < 0)
+    {
+      return wt_fail("audio.volume: cannot open " WT_AUDIO_PLAY_DEV, -errno);
+    }
+
+  if (requested >= 0)
+    {
+      memset(&cap_desc, 0, sizeof(cap_desc));
+      cap_desc.caps.ac_len       = sizeof(struct audio_caps_s);
+      cap_desc.caps.ac_type      = AUDIO_TYPE_FEATURE;
+      cap_desc.caps.ac_format.hw = AUDIO_FU_VOLUME;
+      cap_desc.caps.ac_controls.hw[0] = (uint16_t)requested;
+
+      if (ioctl(fd, AUDIOIOC_CONFIGURE, (unsigned long)&cap_desc) < 0)
+        {
+          int err = -errno;
+
+          close(fd);
+          return wt_fail("audio.volume: the driver rejected the volume", err);
+        }
+    }
+
+  /* Read back rather than echo the request: the driver clamps and quantises
+   * to 6 bits of digital gain, so 700 and 714 are the same setting and
+   * reporting the request would invent a precision that does not exist.
+   *
+   * Read before the announcement, so the value reported is the one the
+   * announcement is about to be played at.
+   */
+
+  memset(&cap_desc, 0, sizeof(cap_desc));
+  cap_desc.caps.ac_len       = sizeof(struct audio_caps_s);
+  cap_desc.caps.ac_type      = AUDIO_TYPE_FEATURE;
+  cap_desc.caps.ac_format.hw = AUDIO_FU_VOLUME;
+
+  if (ioctl(fd, AUDIOIOC_GETCAPS, (unsigned long)&cap_desc.caps) >= 0 &&
+      cap_desc.caps.ac_channels != 0)
+    {
+      current = cap_desc.caps.ac_controls.hw[0];
+    }
+
+  close(fd);
+
+  /* Say it out loud, at the volume just set.
+   *
+   * This is the whole point of the control: a number on a slider does not tell
+   * anyone whether the board is too quiet in the room they are standing in, and
+   * the confirmation being spoken *at* the new gain makes the setting audible
+   * rather than merely acknowledged.
+   *
+   * One fixed phrase rather than one per level: the level is carried by how
+   * loud the phrase is, so eleven recordings would say the same thing eleven
+   * times and only differ in the number nobody needs to hear.
+   *
+   * Announced only on a set.  A read is what the page does on connect and
+   * whenever the link comes back, and a board that says "音量设置成功" every
+   * time a browser reconnects would be a poltergeist.
+   */
+
+  if (requested >= 0 && wt_arg_bool(args, "announce", true))
+    {
+      announced = wt_announce(&announce_err);
+    }
+
+  if (!wt_sb_init(&sb, 256))
+    {
+      return NULL;
+    }
+
+  wt_sb_addstr(&sb, "{\"ok\":true,\"data\":{");
+  if (current >= 0)
+    {
+      wt_sb_addf(&sb, "\"volume\":%d,\"percent\":%d,", current,
+                 (current * 100 + 500) / 1000);
+    }
+  else
+    {
+      /* Say so rather than substituting the request: a slider that shows a
+       * number the hardware never confirmed is the failure this read-back
+       * exists to avoid.
+       */
+
+      wt_sb_addstr(&sb, "\"volume\":null,\"percent\":null,");
+    }
+
+  /* 0 dB is where the device comes up, and it is not the top of the range --
+   * the page needs it to mark the point above which the DAC is amplifying.
+   */
+
+  wt_sb_addf(&sb, "\"unity\":%d,\"max\":1000,\"applied\":%s",
+             WT_AUDIO_UNITY_VOLUME, requested >= 0 ? "true" : "false");
+
+  /* Reported separately from ok:true, because the volume did take even when
+   * the announcement did not: the device can be busy with a recording, and
+   * folding that into a failure would tell the operator the setting was lost
+   * when it was not.
+   */
+
+  wt_sb_addf(&sb, ",\"announced\":%s", announced ? "true" : "false");
+  if (!announced && announce_err != 0)
+    {
+      wt_sb_addf(&sb, ",\"announce_errno\":%d,\"announce_errname\":\"%s\"",
+                 announce_err, wt_errname(announce_err));
+    }
+
+  wt_sb_addstr(&sb, "}}");
+
+  if (sb.failed)
+    {
+      free(sb.p);
+      return NULL;
+    }
+
+  return sb.p;
+}
+
+/****************************************************************************
+ * Private Functions: conversation history
+ *
+ * The store is app/conv's; this is the second consumer of it, after the `conv`
+ * NSH command.  Only reads live here.  Writing a record is the recogniser's
+ * job and clearing history is destructive enough to be worth typing out on a
+ * console, so neither is exposed to a page that a stray click can drive.
+ ****************************************************************************/
+
+struct wt_conv_list_s
+{
+  struct wt_sb_s *sb;
+  int             matched;
+  int             returned;
+  int             limit;
+};
+
+static int wt_conv_visit(const struct conv_entry_s *e, void *arg)
+{
+  struct wt_conv_list_s *st = arg;
+
+  st->matched++;
+
+  /* Count every match but stop appending at the limit, rather than asking
+   * conv_store_query() to stop early: a visitor that returns non-zero makes
+   * the query return that value instead of a count, so the page would lose
+   * the one number it needs to say "showing 20 of 57" -- and "57 matches, 20
+   * shown" and "20 matches" are different answers to the operator's question.
+   */
+
+  if (st->returned >= st->limit)
+    {
+      return 0;
+    }
+
+  wt_sb_addf(st->sb, "%s{\"seq\":%u,\"date\":%u,\"epoch\":%lu",
+             st->returned > 0 ? "," : "", e->seq,
+             conv_epoch_to_date(e->epoch), (unsigned long)e->epoch);
+  wt_sb_addf(st->sb, ",\"duration_ms\":%u,\"cue\":\"", e->duration_ms);
+  wt_sb_addesc(st->sb, e->cue);
+  wt_sb_addf(st->sb, "\",\"confidence\":%.2f,\"unable_to_judge\":%s",
+             (double)e->confidence, e->unable_to_judge ? "true" : "false");
+  wt_sb_addf(st->sb, ",\"text_bytes\":%zu,\"summary\":\"", e->text_bytes);
+  wt_sb_addesc(st->sb, e->summary);
+  wt_sb_addstr(st->sb, "\"}");
+
+  st->returned++;
+  return 0;
+}
+
+static char *wt_cmd_conv_query(cJSON *args)
+{
+  struct conv_filter_s filter;
+  struct wt_conv_list_s st;
+  struct wt_sb_s sb;
+  unsigned int from;
+  unsigned int to;
+  int ret;
+
+  ret = conv_store_ready();
+  if (ret < 0)
+    {
+      /* Distinguishable from "no records": bring-up defers the SD-NAND mount,
+       * so a query run in the first few seconds finds nothing for a reason
+       * that has nothing to do with the filter.
+       */
+
+      return wt_fail("conv: store not ready -- is /mnt/sdnand mounted?", ret);
+    }
+
+  memset(&filter, 0, sizeof(filter));
+
+  /* Dates arrive as YYYYMMDD integers, the same form the index holds and the
+   * `conv` command takes, so the page never has to know about epochs.
+   */
+
+  from = (unsigned int)wt_arg_int(args, "from", 0);
+  to   = (unsigned int)wt_arg_int(args, "to", 0);
+
+  if (from != 0)
+    {
+      filter.from_epoch = conv_date_to_epoch(from, false);
+    }
+
+  if (to != 0)
+    {
+      filter.to_epoch = conv_date_to_epoch(to, true);
+    }
+
+  filter.cue     = wt_arg_str(args, "cue");
+  filter.keyword = wt_arg_str(args, "keyword");
+  filter.min_confidence = (float)wt_arg_dbl(args, "min_confidence", 0.0);
+
+  /* Records the model could not judge are included by default.  Hiding them
+   * would make a conversation the device saw disappear from history with
+   * nothing to indicate it ever happened, and "we are not sure" is the honest
+   * answer this product is built around.
+   */
+
+  filter.include_unjudged = wt_arg_bool(args, "include_unjudged", true);
+
+  if (!wt_sb_init(&sb, 512))
+    {
+      return NULL;
+    }
+
+  st.sb       = &sb;
+  st.matched  = 0;
+  st.returned = 0;
+  st.limit    = wt_arg_int(args, "limit", 50);
+
+  if (st.limit <= 0 || st.limit > 200)
+    {
+      st.limit = 50;
+    }
+
+  wt_sb_addstr(&sb, "{\"ok\":true,\"data\":{\"items\":[");
+  ret = conv_store_query(&filter, wt_conv_visit, &st);
+  wt_sb_addf(&sb, "],\"matched\":%d,\"returned\":%d,\"limit\":%d}}",
+             st.matched, st.returned, st.limit);
+
+  if (sb.failed)
+    {
+      free(sb.p);
+      return NULL;
+    }
+
+  if (ret < 0)
+    {
+      free(sb.p);
+      return wt_fail("conv: query failed", ret);
+    }
+
+  return sb.p;
+}
+
+static char *wt_cmd_conv_get(int seq)
+{
+  struct wt_sb_s sb;
+  char *text;
+  char *cue;
+  int textlen;
+  int cuelen;
+  int ret;
+
+  if (seq <= 0)
+    {
+      return wt_fail("conv.get: seq is required", -EINVAL);
+    }
+
+  ret = conv_store_ready();
+  if (ret < 0)
+    {
+      return wt_fail("conv: store not ready -- is /mnt/sdnand mounted?", ret);
+    }
+
+  /* Heap, not stack: this runs on the session thread and a 1.5 KB frame there
+   * is a stack overflow that presents itself as corrupted JSON on the wire.
+   */
+
+  text = malloc(WT_CONV_TEXT_MAX);
+  cue  = malloc(WT_CONV_CUE_MAX);
+  if (text == NULL || cue == NULL)
+    {
+      free(text);
+      free(cue);
+      return NULL;
+    }
+
+  textlen = conv_store_read_file(CONV_FMT_TEXT, (unsigned int)seq, text,
+                                 WT_CONV_TEXT_MAX);
+  if (textlen < 0)
+    {
+      free(text);
+      free(cue);
+      return wt_fail("conv.get: no such record", textlen);
+    }
+
+  /* A record with no analysis is normal -- the file is written after the
+   * transcript -- so an empty object rather than a failure.
+   */
+
+  cuelen = conv_store_read_file(CONV_FMT_CUE, (unsigned int)seq, cue,
+                               WT_CONV_CUE_MAX);
+  if (cuelen < 0)
+    {
+      cue[0] = '\0';
+    }
+
+  if (!wt_sb_init(&sb, (size_t)textlen + 512))
+    {
+      free(text);
+      free(cue);
+      return NULL;
+    }
+
+  wt_sb_addf(&sb, "{\"ok\":true,\"data\":{\"seq\":%d,\"text\":\"", seq);
+  wt_sb_addesc(&sb, text);
+
+  /* The analysis is already JSON, so it goes in as a value rather than as an
+   * escaped string: the page reads .cue.cues[0].confidence, and a string
+   * would make every consumer parse it a second time.
+   */
+
+  wt_sb_addf(&sb, "\",\"text_bytes\":%d,\"cue\":%s}}", textlen,
+             cue[0] != '\0' ? cue : "null");
+
+  free(text);
+  free(cue);
+
+  if (sb.failed)
+    {
+      free(sb.p);
+      return NULL;
+    }
+
+  return sb.p;
+}
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -1738,6 +2927,27 @@ char *wt_command_dispatch(struct wt_ctx_s *ctx, const char *json, size_t len)
   else if (strcmp(cmd, "shell.kill") == 0)
     {
       rsp = wt_cmd_shell_kill(ctx);
+    }
+  else if (strcmp(cmd, "audio.announce") == 0)
+    {
+      rsp = wt_cmd_audio_announce(args);
+    }
+  else if (strcmp(cmd, "audio.volume") == 0)
+    {
+      /* One command for both directions: with no `volume` argument it reads,
+       * with one it sets and then reads back.  Two commands would have made
+       * the page do two round trips to show the result of its own change.
+       */
+
+      rsp = wt_cmd_audio_volume(args);
+    }
+  else if (strcmp(cmd, "conv.query") == 0)
+    {
+      rsp = wt_cmd_conv_query(args);
+    }
+  else if (strcmp(cmd, "conv.get") == 0)
+    {
+      rsp = wt_cmd_conv_get(wt_arg_int(args, "seq", 0));
     }
   else
     {

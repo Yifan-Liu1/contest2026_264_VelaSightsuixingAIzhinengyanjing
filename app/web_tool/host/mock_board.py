@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
 import os
 import pty
@@ -45,6 +47,92 @@ ASSET_JPEG = os.path.join(
     "..", "..", "..", "assets", "camera", "frame_640x480.jpg")
 
 CAMERA_SIZES = {(480, 480), (640, 480), (864, 480)}
+
+# The DAC's digital gain field, from bk7258_aud.h: six bits, 0 dB at 0x2d.  So
+# unity is 714 of 1000 and not the top of the range -- above it the DAC is
+# amplifying.
+DAC_GAIN_MAX = 0x3f
+DAC_GAIN_0DB = 0x2d
+
+# Conversation history fixture, copied from what is actually on the card so the
+# awkward cases are present rather than invented:
+#
+#   - record 5 is unable_to_judge with a confidence below any useful threshold,
+#     which is the record a page is most likely to render as a blank row;
+#   - record 4's summary mentions 爬山 and its transcript does not, so a keyword
+#     search that only reads transcripts silently misses it;
+#   - the dates are not contiguous, so an off-by-one in a range filter shows up.
+CONV_FIXTURE = [
+    {"seq": 1, "date": 20260805, "epoch": 1786060800, "duration_ms": 8000,
+     "cue": "brow_furrow", "confidence": 0.72, "unable_to_judge": False,
+     "text_bytes": 174, "summary": "周末爬山的安排",
+     "text": "对方: 这周末要不要去爬山\n我: 可以，几点出发\n"
+             "对方: 六点吧，太晚了太阳大\n我: 那我带点水和面包\n"
+             "对方: 好，我带防晒",
+     "analysis": {"schema": "social-cue/v1",
+                  "cues": [{"cue": "brow_furrow",
+                            "meaning": "possible concern",
+                            "confidence": 0.72}],
+                  "overall_confidence": 0.72,
+                  "unable_to_judge": False, "reason": "",
+                  "suggestion": "check whether the early start is a problem"}},
+    {"seq": 2, "date": 20260809, "epoch": 1786406400, "duration_ms": 12000,
+     "cue": "gaze_aversion", "confidence": 0.64, "unable_to_judge": False,
+     "text_bytes": 201, "summary": "项目排期的分歧",
+     "text": "对方: 这个排期我觉得太紧了\n我: 哪一部分\n"
+             "对方: 测试只留了两天\n我: 那我们把联调提前一周\n"
+             "对方: 那还行",
+     "analysis": {"schema": "social-cue/v1",
+                  "cues": [{"cue": "gaze_aversion",
+                            "meaning": "possible discomfort",
+                            "confidence": 0.64}],
+                  "overall_confidence": 0.64,
+                  "unable_to_judge": False, "reason": "",
+                  "suggestion": "ask which part feels tight before defending"}},
+    {"seq": 3, "date": 20260812, "epoch": 1786665600, "duration_ms": 6000,
+     "cue": "smile", "confidence": 0.81, "unable_to_judge": False,
+     "text_bytes": 117, "summary": "确认了下周的评审时间",
+     "text": "对方: 下周三下午评审可以吗\n我: 可以\n对方: 那我发日历",
+     "analysis": {"schema": "social-cue/v1",
+                  "cues": [{"cue": "smile", "meaning": "possible agreement",
+                            "confidence": 0.81}],
+                  "overall_confidence": 0.81,
+                  "unable_to_judge": False, "reason": "", "suggestion": ""}},
+    {"seq": 4, "date": 20260814, "epoch": 1786838400, "duration_ms": 15000,
+     "cue": "head_shake", "confidence": 0.69, "unable_to_judge": False,
+     "text_bytes": 192, "summary": "关于爬山路线的不同意见",
+     "text": "对方: 我还是觉得走西边那条路线不合适\n我: 为什么呢\n"
+             "对方: 那边石头多，下雨天滑\n我: 那我们走东边，虽然远一点\n"
+             "对方: 远点没关系，安全重要",
+     "analysis": {"schema": "social-cue/v1",
+                  "cues": [{"cue": "head_shake",
+                            "meaning": "possible disagreement",
+                            "confidence": 0.69}],
+                  "overall_confidence": 0.69,
+                  "unable_to_judge": False, "reason": "",
+                  "suggestion": "ask what specifically does not work before "
+                                "restating"}},
+    {"seq": 5, "date": 20260816, "epoch": 1787011200, "duration_ms": 4000,
+     "cue": "", "confidence": 0.31, "unable_to_judge": True,
+     "text_bytes": 57, "summary": "画面不完整，未能判断",
+     "text": "对方: 那个东西你放哪了\n我: 在抽屉里",
+     "analysis": {"schema": "social-cue/v1", "cues": [],
+                  "overall_confidence": 0.31, "unable_to_judge": True,
+                  "reason": "face partially out of frame",
+                  "suggestion": "no reading offered"}},
+    {"seq": 6, "date": 20260818, "epoch": 1787184000, "duration_ms": 9000,
+     "cue": "lean_forward", "confidence": 0.77, "unable_to_judge": False,
+     "text_bytes": 174, "summary": "聊到爬山装备",
+     "text": "对方: 你那双鞋是什么牌子的\n我: 就普通的登山鞋\n"
+             "对方: 抓地怎么样\n我: 还行，湿石头上也稳\n对方: 那我也去看看",
+     "analysis": {"schema": "social-cue/v1",
+                  "cues": [{"cue": "lean_forward",
+                            "meaning": "possible interest",
+                            "confidence": 0.77}],
+                  "overall_confidence": 0.77,
+                  "unable_to_judge": False, "reason": "",
+                  "suggestion": ""}},
+]
 
 
 def _errname(err: int) -> str:
@@ -78,6 +166,10 @@ class MockBoard:
         self.frames_sent = 0
         self.frames_dropped = 0
         self.shell_running = False
+        self.dac_gain = DAC_GAIN_0DB      # the device comes up at 0 dB
+        # Empty card: the clip has to be uploaded once, so the tests start from
+        # the state a fresh board is actually in.
+        self.announce_clip = b""
         self.seq = 0
         self.t0 = time.monotonic()
         self.backlog = ["mock: boot line %d" % i for i in range(5)]
@@ -269,10 +361,156 @@ class MockBoard:
         elif cmd == "shell.kill":
             self.shell_running = False
             rsp = ok({})
+        elif cmd == "audio.volume":
+            rsp = self._audio_volume(args)
+        elif cmd == "audio.announce":
+            rsp = self._audio_announce(args)
+        elif cmd == "conv.query":
+            rsp = self._conv_query(args)
+        elif cmd == "conv.get":
+            rsp = self._conv_get(args)
         else:
             rsp = fail("unknown cmd", 38)
 
         await self.send(TYPE_RSP, req_id, rsp)
+
+    # ---- playback volume -----------------------------------------------
+
+    def _audio_announce(self, args: dict) -> bytes:
+        """The confirmation clip: upload with b64, query without.
+
+        The offset is honoured rather than ignored so a test can prove the
+        chunks are reassembled in order; a mock that just appended would pass
+        even if the page sent them backwards.
+        """
+        b64 = args.get("b64")
+        if b64 is None:
+            if not self.announce_clip:
+                return ok({"present": False, "bytes": 0})
+            n = len(self.announce_clip)
+            return ok({"present": True, "bytes": n,
+                       "seconds": round(n / 2 / 8000, 2)})
+
+        offset = args.get("offset", 0)
+        if not isinstance(offset, int) or offset < 0:
+            return fail("audio.announce: offset out of range", 22)
+
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (ValueError, binascii.Error):
+            return fail("audio.announce: chunk is not valid base64", 22)
+
+        if offset == 0:
+            self.announce_clip = b""
+        if offset != len(self.announce_clip):
+            # The board seeks, so a gap would leave a hole; saying so is what
+            # lets the page retry rather than ship a file with a hole in it.
+            return fail("audio.announce: offset does not follow the file", 22)
+
+        self.announce_clip += raw
+        return ok({"bytes": len(self.announce_clip),
+                   "final": bool(args.get("final"))})
+
+    def _audio_volume(self, args: dict) -> bytes:
+        """The DAC's 6-bit digital gain, quantised the way the driver does.
+
+        The quantisation is reproduced rather than smoothed over because it is
+        the surprising part: the board answers 698 to a request of 700, and a
+        mock that echoed the request would let a page ship that displays the
+        request as though the hardware had confirmed it.
+        """
+        want = args.get("volume")
+        if want is not None:
+            if not isinstance(want, int) or want < 0 or want > 1000:
+                return fail("audio.volume: volume must be 0..1000", 22)
+            self.dac_gain = (want * DAC_GAIN_MAX + 500) // 1000
+
+        # Rounded both ways, matching the driver: truncating loses a step in
+        # each direction and the two compound, so 0 dB could not be asked for
+        # by the value the board itself reported.
+        volume = ((self.dac_gain * 1000 + DAC_GAIN_MAX // 2) // DAC_GAIN_MAX)
+
+        # The announcement only happens on a set, and only when there is a clip
+        # to play.  Reported apart from ok:true because the volume did take
+        # either way -- folding a missing clip into a failure would say the
+        # setting was lost when it was not.
+        announced = False
+        rsp = {"volume": volume,
+               "percent": (volume * 100 + 500) // 1000,
+               "unity": ((DAC_GAIN_0DB * 1000 + DAC_GAIN_MAX // 2) //
+                         DAC_GAIN_MAX),
+               "max": 1000,
+               "applied": want is not None}
+
+        if want is not None and args.get("announce", True):
+            if self.announce_clip:
+                announced = True
+            else:
+                rsp["announce_errno"] = -2
+                rsp["announce_errname"] = "ENOENT"
+
+        rsp["announced"] = announced
+        return ok(rsp)
+
+    # ---- conversation history ------------------------------------------
+
+    def _conv_query(self, args: dict) -> bytes:
+        """Same two-stage filter the board runs, on the fixture above.
+
+        Reimplemented rather than stubbed to a fixed list: the point of the
+        filters is which records they leave out, and a mock that returned
+        everything would let a page that ignores `from`/`to`/`keyword` pass.
+        The keyword searches summary *and* transcript, which is the part that
+        is easy to get wrong in only one of the two places -- record 4's
+        summary mentions 爬山 and its transcript does not.
+        """
+        frm = args.get("from") or 0
+        to = args.get("to") or 0
+        cue = args.get("cue") or ""
+        keyword = args.get("keyword") or ""
+        include_unjudged = args.get("include_unjudged", True)
+        limit = args.get("limit") or 50
+        if not isinstance(limit, int) or limit <= 0 or limit > 200:
+            limit = 50
+
+        matched = 0
+        items = []
+        for rec in CONV_FIXTURE:
+            if frm and rec["date"] < frm:
+                continue
+            if to and rec["date"] > to:
+                continue
+            if cue and rec["cue"] != cue:
+                continue
+            if rec["unable_to_judge"] and not include_unjudged:
+                continue
+            if float(args.get("min_confidence") or 0.0) > rec["confidence"]:
+                continue
+            if keyword and keyword not in rec["summary"] \
+                    and keyword not in rec["text"]:
+                continue
+
+            matched += 1
+            if len(items) >= limit:
+                continue
+            items.append({k: rec[k] for k in
+                          ("seq", "date", "epoch", "duration_ms", "cue",
+                           "confidence", "unable_to_judge", "text_bytes",
+                           "summary")})
+
+        return ok({"items": items, "matched": matched,
+                   "returned": len(items), "limit": limit})
+
+    def _conv_get(self, args: dict) -> bytes:
+        seq = args.get("seq") or 0
+        for rec in CONV_FIXTURE:
+            if rec["seq"] == seq:
+                return ok({"seq": seq, "text": rec["text"],
+                           "text_bytes": rec["text_bytes"],
+                           "cue": rec["analysis"]})
+        if not seq:
+            return fail("conv.get: seq is required", 22)
+        return fail("conv.get: no such record", 2)
 
     async def _shell(self, cmdline: str) -> None:
         burst = 40 if self.args.shell_burst else 3

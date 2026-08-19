@@ -211,7 +211,215 @@ async def test_commands() -> None:
         check(r["ok"] is False and r["errname"] == "ENOSYS",
               "an unknown command answers ENOSYS")
 
+        await _check_volume(link)
+        await _check_conv(link)
+
         await link.close()
+
+
+async def _check_volume(link) -> None:
+    """audio.volume.
+
+    The interesting property is that the answer is a read-back and not an echo:
+    the DAC's gain is six bits, so most requests land on a neighbouring value,
+    and a page that displayed the request would be showing a number the
+    hardware never confirmed.
+    """
+    r = await link.request("audio.volume")
+    check(r["ok"] and set(("volume", "percent", "unity", "max", "applied"))
+          <= set(r["data"]),
+          "audio.volume reads without changing anything")
+
+    # The read-back has to be a number, not null.  On hardware it was null for
+    # a while: the driver's getcaps clears ac_format.hw before the switch that
+    # matches on it, so the volume case never ran.  The mock cannot reproduce
+    # that, which is exactly why this asserts on the value rather than on the
+    # key being present.
+    check(isinstance(r["data"]["volume"], int),
+          "the volume reads back as a number, not null -- null means the "
+          "board has no read-back and the page can only show its own request")
+    check(r["data"]["applied"] is False,
+          "a read is reported as not having applied anything")
+    unity = r["data"]["unity"]
+    check(0 < unity < 1000,
+          "0 dB is inside the range, not at the top of it (%s) -- the page "
+          "needs that to mark where the DAC starts amplifying" % unity)
+
+    r = await link.request("audio.volume", {"volume": 300})
+    check(r["ok"] and r["data"]["applied"] is True, "a set is applied")
+    got = r["data"]["volume"]
+    check(abs(got - 300) <= 1000 // 0x3f + 1,
+          "the answer is the quantised value near the request "
+          "(asked 300, got %s)" % got)
+    # Half-up, the same rounding the board does.  Python's round() is
+    # half-to-even, so it disagrees on exactly the .5 cases and asserting
+    # against it would be testing Python rather than the board.
+    check(r["data"]["percent"] == (got * 100 + 500) // 1000,
+          "percent agrees with the raw value (%s vs %s)"
+          % (r["data"]["percent"], got))
+
+    r = await link.request("audio.volume")
+    check(r["ok"] and r["data"]["volume"] == got,
+          "and it sticks: a later read returns the same value (%s vs %s)"
+          % (r["data"].get("volume"), got))
+
+    r = await link.request("audio.volume", {"volume": 0})
+    check(r["ok"] and r["data"]["volume"] == 0, "zero is accepted (mute)")
+
+    r = await link.request("audio.volume", {"volume": 1001})
+    check(r["ok"] is False and r["errname"] == "EINVAL",
+          "out of range is refused rather than clamped silently")
+
+    r = await link.request("audio.volume", {"volume": unity})
+    check(r["ok"] and r["data"]["volume"] == unity,
+          "unity round-trips exactly, since it is a real gain step")
+
+    # ---- the spoken confirmation ----
+    #
+    # The clip is what makes the setting audible, and it lives on the card, so
+    # a fresh board does not have it.  The important property is that the
+    # volume still takes when the announcement cannot happen: reporting a lost
+    # setting because a file is missing would be worse than the silence.
+
+    r = await link.request("audio.announce")
+    check(r["ok"] and r["data"]["present"] is False,
+          "a fresh board reports no confirmation clip")
+
+    r = await link.request("audio.volume", {"volume": 500})
+    check(r["ok"] and r["data"]["volume"] > 0,
+          "the volume is still set when there is no clip to play")
+    check(r["data"]["announced"] is False and
+          r["data"].get("announce_errname") == "ENOENT",
+          "and the missing clip is named rather than passed over silently")
+
+    import base64 as _b64
+    clip = bytes(bytearray((i * 7) % 256 for i in range(3000)))
+    half = 1200
+    r = await link.request("audio.announce", {
+        "b64": _b64.b64encode(clip[:half]).decode(), "offset": 0})
+    check(r["ok"] and r["data"]["bytes"] == half,
+          "the first chunk lands and the board reports the file length")
+
+    r = await link.request("audio.announce", {
+        "b64": _b64.b64encode(clip[half:]).decode(), "offset": half,
+        "final": True})
+    check(r["ok"] and r["data"]["bytes"] == len(clip),
+          "the second chunk is appended at its offset (%s of %d)"
+          % (r["data"].get("bytes"), len(clip)))
+
+    r = await link.request("audio.announce", {
+        "b64": _b64.b64encode(b"xxxx").decode(), "offset": 99999})
+    check(r["ok"] is False,
+          "a chunk that does not follow the file is refused, so a hole cannot "
+          "be written silently")
+
+    r = await link.request("audio.announce", {"b64": "not base64 !!"})
+    check(r["ok"] is False and r["errname"] == "EINVAL",
+          "invalid base64 is refused rather than partially decoded")
+
+    r = await link.request("audio.announce")
+    check(r["ok"] and r["data"]["present"] is True
+          and r["data"]["bytes"] == len(clip),
+          "the clip is now on the board")
+
+    r = await link.request("audio.volume", {"volume": 600})
+    check(r["ok"] and r["data"]["announced"] is True,
+          "with a clip present, a set is announced out loud")
+
+    r = await link.request("audio.volume", {"volume": 600,
+                                            "announce": False})
+    check(r["ok"] and r["data"]["announced"] is False,
+          "and the announcement can be suppressed -- muting is the case where "
+          "playing it would be indistinguishable from a broken feature")
+
+    r = await link.request("audio.volume")
+    check(r["ok"] and r["data"]["announced"] is False,
+          "a plain read never announces; the page reads on every reconnect")
+
+
+async def _check_conv(link) -> None:
+    """conv.query / conv.get.
+
+    The filters are what this feature is, so each check below is a record that
+    must be left out.  A test that only asserted "some records came back" would
+    pass against a board that ignored every filter.
+    """
+    r = await link.request("conv.query")
+    check(r["ok"] and set(("items", "matched", "returned", "limit"))
+          <= set(r["data"]),
+          "conv.query carries matched and returned, not just a list")
+    all_n = r["data"]["matched"]
+    check(all_n >= 1, "there is history to query (%d records)" % all_n)
+
+    item = r["data"]["items"][0]
+    check(set(("seq", "date", "epoch", "duration_ms", "cue", "confidence",
+               "unable_to_judge", "text_bytes", "summary")) <= set(item),
+          "an index entry has the documented fields")
+    check(isinstance(item["date"], int) and item["date"] > 20000000,
+          "the date is a YYYYMMDD integer, so the page never sees an epoch: %r"
+          % item["date"])
+
+    # A range that excludes both ends of the fixture.  An inclusive-bound
+    # off-by-one shows up here and nowhere else.
+    r = await link.request("conv.query", {"from": 20260812, "to": 20260816})
+    dates = [i["date"] for i in r["data"]["items"]]
+    check(r["ok"] and dates and all(20260812 <= d <= 20260816 for d in dates),
+          "a date range excludes what is outside it: %r" % dates)
+    check(20260812 in dates and 20260816 in dates,
+          "and includes both bounds: %r" % dates)
+    check(r["data"]["matched"] < all_n,
+          "the range really narrowed the result (%d of %d)"
+          % (r["data"]["matched"], all_n))
+
+    # The keyword has to search the summary as well as the transcript: record 4
+    # mentions 爬山 only in its summary, and a transcript-only search drops it.
+    r = await link.request("conv.query", {"keyword": "爬山"})
+    seqs = sorted(i["seq"] for i in r["data"]["items"])
+    check(r["ok"] and len(seqs) >= 2,
+          "a keyword search matches more than one record: %r" % seqs)
+    summaries = {i["seq"]: i["summary"] for i in r["data"]["items"]}
+    check(any("爬山" in s for s in summaries.values()),
+          "including one whose summary carries the word: %r" % summaries)
+
+    r = await link.request("conv.query", {"keyword": "这个词不可能出现"})
+    check(r["ok"] and r["data"]["matched"] == 0 and not r["data"]["items"],
+          "a keyword that matches nothing answers zero, not everything")
+
+    # unable_to_judge records are in by default: hiding a conversation the
+    # device saw would be the wrong kind of quiet.
+    r = await link.request("conv.query")
+    check(any(i["unable_to_judge"] for i in r["data"]["items"]),
+          "a record the model could not judge is listed by default")
+    r = await link.request("conv.query", {"include_unjudged": False})
+    check(all(not i["unable_to_judge"] for i in r["data"]["items"]),
+          "and can be excluded on request")
+
+    r = await link.request("conv.query", {"limit": 2})
+    check(r["ok"] and r["data"]["returned"] == 2
+          and r["data"]["matched"] > 2,
+          "limit truncates the list but still reports the true total "
+          "(returned=%s matched=%s)"
+          % (r["data"].get("returned"), r["data"].get("matched")))
+
+    r = await link.request("conv.get", {"seq": 4})
+    check(r["ok"] and r["data"]["text"], "conv.get returns the transcript")
+    check("\n" in r["data"]["text"],
+          "with its line breaks intact -- each turn is a line and reflowing "
+          "them runs the speakers together")
+    cue = r["data"].get("cue")
+    check(isinstance(cue, dict) and cue.get("schema") == "social-cue/v1",
+          "the analysis arrives as an object, not as a string the page would "
+          "have to parse again: %r" % type(cue).__name__)
+    check("overall_confidence" in cue and "unable_to_judge" in cue,
+          "and it keeps the hedging fields")
+
+    r = await link.request("conv.get", {"seq": 9999})
+    check(r["ok"] is False and r["errname"] == "ENOENT",
+          "a missing record answers ENOENT rather than an empty transcript")
+
+    r = await link.request("conv.get")
+    check(r["ok"] is False and r["errname"] == "EINVAL",
+          "conv.get without a seq is refused")
 
 
 def _collect(sink: list, item):
