@@ -26,6 +26,11 @@
 #include "bk7258_status_screen.h"
 #include "bk7258_net_autostart.h"
 
+int weak_function velasight_autostart(void)
+{
+  return -ENOSYS;
+}
+
 #ifdef CONFIG_BK7258_TRNG
 #  include "bk7258_trng.h"
 #endif
@@ -492,4 +497,12 @@ void board_late_initialize(void)
       printf("bk7258_bringup: kvdb_loader not started; settings will not "
              "survive a reset\n");
     }
+#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+  /* The greeting is synchronous.  Start the app after board initialization. */
+  ret = velasight_autostart();
+  if (ret < 0)
+    {
+      printf("velasight autostart failed: %d\n", ret);
+    }
+#endif
 }

@@ -323,7 +323,7 @@ OpenAI SDK 示例（SDK 发的就是 Bearer），所以 Bearer 应当可用；�
 (cd contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/chips/bk7258/sim_tests && make)
 
 # 构建（必须走 cmake 路径）
-./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/nsh -e -Werror --cmake -j8
+# nsh 只是最小启动/对照配置；最终 VelaSight 固件必须使用 ai_agent。
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8   # 不能加 -Werror
 
 # 打包 + 一致性校验（不能省）

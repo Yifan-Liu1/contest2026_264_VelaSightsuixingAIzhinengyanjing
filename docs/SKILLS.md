@@ -165,12 +165,16 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 
 ### 7.1 OpenVela AP 构建
 
+本项目有两个不同的板级配置：`nsh` 仅用于最小启动/底层对照，`ai_agent`
+用于 VelaSight 产品固件。早期门禁命令保留 `nsh` 是因为它先完成了 AP
+基础启动验证；当前包含 VelaSight、LVGL 和中文界面的最终镜像必须使用
+`ai_agent`。两者的 `.config`、输出目录和固件内容不能混用。
+
 ```bash
 cd /home/mi/vela_competition/contest
 
 ./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
-  -e -Werror \
+  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
   --cmake \
   -j8
 ```
@@ -179,23 +183,23 @@ cd /home/mi/vela_competition/contest
 
 ```bash
 ./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
+  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
   --cmake distclean
 ```
 
 输出：
 
 ```text
-contest/cmake_out/bk7258-ap_nsh/nuttx       # ELF
-contest/cmake_out/bk7258-ap_nsh/nuttx.bin   # AP raw binary
-contest/cmake_out/bk7258-ap_nsh/System.map
+contest/cmake_out/bk7258-ap_ai_agent/nuttx       # ELF
+contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin   # AP raw binary
+contest/cmake_out/bk7258-ap_ai_agent/System.map
 ```
 
 ### 7.2 准备外部 AP 输入
 
 ```bash
 cp \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
   /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
 ```
 
@@ -244,12 +248,12 @@ bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/app_ab_crc.rbl
 
 ```bash
 sha256sum \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
   /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin \
   /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 
 cmp -s \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
   /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 ```
 
@@ -261,6 +265,9 @@ cmp -s \
 - 检查 ELF attributes：Cortex-M33、hard-float、`-mcmse`。
 - 检查 `System.map` 和 section 边界不越界。
 - 检查 `bk_package.json` 中 AP 角色和文件名。
+- 当前产品使用完整 CJK 字体；因 Beken code 分区必须按 `34K` 对齐，固定数据
+  分区前的最大合法值为 `primary_ap_app=4148K`，AP linker raw `FLASH` 区域为
+  `0x3d0000`（3904K）。分区源和 OpenVela linker 不能只改一侧。
 - 实板复位、NSH 交互、CP 不出现 `IPC retry to start core1` 或 heartbeat timeout。
 - 子系统功能、压力、恢复和安全测试按对应方案执行。
 

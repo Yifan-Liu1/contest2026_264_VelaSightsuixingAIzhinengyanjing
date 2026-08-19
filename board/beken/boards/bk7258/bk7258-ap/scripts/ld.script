@@ -20,7 +20,8 @@ EXTERN(_vectors)
 
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x02150000, LENGTH = 0x00110000
+  /* 4148K is the largest code-aligned AP partition before fixed data. */
+  FLASH (rx)  : ORIGIN = 0x02150000, LENGTH = 0x003d0000
   RAM   (rwx) : ORIGIN = 0x28010000, LENGTH = 0x00054000
   SWAP  (rw)  : ORIGIN = 0x2809f800, LENGTH = 0x00000800
   PSRAM_SECTION (rw) : ORIGIN = 0x60a00000, LENGTH = 0x00600000

@@ -68,15 +68,21 @@ CP 权威覆盖文件同步到 `bk_avdk_smp`，并执行逐字节校验。
 
 ### 4.2 构建 OpenVela AP
 
+`nsh` 和 `ai_agent` 是两个不同的板级配置。`nsh` 是最小 NSH 启动和底层
+资源对照配置；`ai_agent` 才是 VelaSight 产品配置，包含 VelaSight App、
+LVGL 双屏界面、UTF-8 中文和英文显示以及 `packages/ai_agent`。早期基础
+移植使用 `nsh` 是为了验证 AP 启动链，不能据此构建最终产品镜像。最终烧录
+必须使用 `ai_agent`，否则会得到能够启动但不包含目标 UI 的最小固件。
+
 ```bash
 cd /home/mi/vela_competition/contest
 
 ./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
+  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
   --cmake distclean
 
 ./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
+  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
   -e -Werror \
   --cmake \
   -j8
@@ -85,7 +91,7 @@ cd /home/mi/vela_competition/contest
 ### 4.3 打包最终固件
 
 ```bash
-cp /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+cp /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
   /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
 
 cd /home/mi/vela_competition/bk_avdk_smp

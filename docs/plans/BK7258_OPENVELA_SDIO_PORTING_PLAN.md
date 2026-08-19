@@ -115,8 +115,10 @@ config 文件 sha256
 ELF/map/bin sha256
 ```
 
-`contest/cmake_out/bk7258-ap_nsh` 是本计划唯一使用的主构建目录。旧的
-`contest/out/beken_bk7258-ap_nsh` 不可用于判断 SDIO、FAT 或 work queue 状态。
+本计划的 SDIO 底层门禁历史上使用 `contest/cmake_out/bk7258-ap_nsh`；它是
+最小启动/资源对照配置，不是 VelaSight 产品镜像。VelaSight 集成验证应使用
+`contest/cmake_out/bk7258-ap_ai_agent`。旧的 `contest/out/beken_bk7258-ap_nsh`
+不可用于判断 SDIO、FAT 或 work queue 状态。
 
 ## 2. 原厂基线与必须区分的事实
 

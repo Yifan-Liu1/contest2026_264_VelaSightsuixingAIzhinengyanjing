@@ -1,0 +1,66 @@
+config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	bool "VelaSight dual-screen UI"
+	default n
+	depends on VIDEO_FB
+	depends on ARCH_BUTTONS
+	select GRAPHICS_LVGL
+	select WIRELESS_WAPI
+	select NETUTILS_DHCPD
+	---help---
+		First-stage VelaSight UI for the dual GC9D01 framebuffer panels.
+
+config VS_INPUT_POLL_MS
+	int "VelaSight input polling interval (ms)"
+	default 10
+	range 5 100
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_SHORT_PRESS_MIN_MS
+	int "VelaSight short press minimum (ms)"
+	default 80
+	range 10 1000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_SHORT_PRESS_MAX_MS
+	int "VelaSight short press maximum (ms)"
+	default 500
+	range 100 1900
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_LONG_PRESS_MS
+	int "VelaSight long press duration (ms)"
+ default 2000
+	range 1000 10000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_COMBO_PRESS_MS
+	int "VelaSight combo long press duration (ms)"
+ default 2000
+	range 1000 10000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_STA_SSID
+	string "VelaSight development STA SSID"
+	default "VelaSight"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_STA_PASSWORD
+	string "VelaSight development STA password"
+	default "12345678"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_AP_SSID
+	string "VelaSight development SoftAP SSID"
+	default "VelaSight_AP"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_AP_PASSWORD
+	string "VelaSight development SoftAP password"
+	default "12345678"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_AP_CHANNEL
+	int "VelaSight development SoftAP channel"
+	default 6
+	range 1 14
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT

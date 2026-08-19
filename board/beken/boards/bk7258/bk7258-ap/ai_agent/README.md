@@ -3,9 +3,11 @@
 What this board needs in order to run `packages/ai_agent`, and which parts of
 that belong here rather than upstream.
 
-Build config: `../configs/ai_agent/defconfig` (the current `nsh` baseline --
-which already carries the Wi-Fi driver and the IPv4 stack -- plus mbedTLS,
-cJSON and the agent itself).
+Build config: `../configs/ai_agent/defconfig`. This is a product configuration,
+not the minimal `nsh` baseline. `nsh` is retained for AP bring-up and comparison;
+`ai_agent` adds the Wi-Fi/IPv4 dependencies, mbedTLS, cJSON, the agent itself,
+VelaSight and its LVGL display configuration. Building `nsh` instead produces a
+valid minimal AP image but cannot validate or display the VelaSight product UI.
 
 Two things `nsh` has and this config deliberately does not: the V4L2 M2M JPEG
 codec (`CONFIG_BK7258_JPEG_ENC`, `/dev/video1`) and on-device libjpeg
@@ -40,7 +42,8 @@ a fresh `repo sync` produces them):
 | RAM | 122160 B (35.51%) | 186112 B (54.09%) | 336 KB (`RAM` 0x54000) |
 | PSRAM_SECTION | 0 B | 0 B | 6 MB |
 
-`ai_agent` leaves 413 KB of flash spare. The gap to `nsh` is 201 KB, but it is
+`ai_agent` leaves 413 KB of flash spare in the historical no-LVGL measurement.
+The gap to `nsh` is 201 KB, but it is
 not a clean "cost of the agent": this config adds mbedTLS, cJSON, the agent and
 `agent_camera`, and drops `jpeg_test`. The Wi-Fi driver and the IPv4 stack are
 in both, which is why the gap is much smaller than the 371 KB this file used to

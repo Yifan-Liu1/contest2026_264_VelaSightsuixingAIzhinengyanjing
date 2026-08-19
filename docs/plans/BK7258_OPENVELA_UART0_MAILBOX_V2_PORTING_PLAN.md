@@ -567,7 +567,7 @@ ready门禁新增：MB_UART RX已能整包复制并调用NuttX worker，TX/STATE
 | `board/beken/chips/bk7258/hardware/bk7258_mbox.h` | 统一协议结构、公开API和地址常量；加static assert |
 | `board/beken/chips/bk7258/Make.defs`、`CMakeLists.txt` | 条件编译新增MB_UART文件 |
 | `board/beken/boards/bk7258/bk7258-ap/Kconfig` | 用MB_UART0 console选项替换UART1误导项；select OTHER UART driver/console和iflowcontrol |
-| `board/beken/boards/bk7258/bk7258-ap/configs/nsh/defconfig` | 删除UART1 console，启用Mailbox console和75%/25% flow-control watermarks |
+| `board/beken/boards/bk7258/bk7258-ap/configs/nsh/defconfig`、`configs/ai_agent/defconfig` | `nsh` 为最小门禁，`ai_agent` 为 VelaSight 产品；两者均删除UART1 console，启用Mailbox console和75%/25% flow-control watermarks |
 | `board/beken/boards/bk7258/bk7258-ap/scripts/ld.script` | 增加SWAP NOLOAD region/section和边界ASSERT，heap不得覆盖 |
 | board RAM配置生成/校验脚本 | 从external `ram_regions.csv`生成或核对OpenVela SWAP linker/header，最终与Armino生成头比较 |
 | `bk7258_serial.c::arm_serialinit()`、`bk7258_bringup.c` | `arm_serialinit()`在注册device前创建并kick worker、排队RESET/STATE；board late只等待成功STATE并继续IPC/PWC ready，不重复启动worker |

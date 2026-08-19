@@ -238,16 +238,19 @@ Armino CP app.bin + Beken bootloader.bin
 这会形成顶层 16 MiB、核内仍 8 MiB 的不一致产物。
 
 先按第 2.1 节确认 NuttX Bluetooth Host 补丁已应用，再构建 OpenVela AP，并将
-输入放到 Armino 工作树：
+输入放到 Armino 工作树。这里要区分 `nsh` 和 `ai_agent`：前者是最小启动/对照
+配置，后者是包含 VelaSight、LVGL 和 `packages/ai_agent` 的产品配置。早期基础
+移植记录使用 `nsh`，不代表最终产品也应使用 `nsh`；本节最终打包链统一采用
+`ai_agent`。
 
 ```bash
 cd ~/vela_competition/contest
 ./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
-  -e -Werror --cmake -j8
+  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
+  --cmake -j8
 
 cp \
-  cmake_out/bk7258-ap_nsh/nuttx.bin \
+  cmake_out/bk7258-ap_ai_agent/nuttx.bin \
   ~/vela_competition/bk_avdk_smp/build/openvela-ap.bin
 ```
 
@@ -316,7 +319,7 @@ PSRAM 最终边界                0x61000000
 
 ```bash
 sha256sum \
-  ~/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  ~/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
   build/openvela-ap.bin \
   projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 

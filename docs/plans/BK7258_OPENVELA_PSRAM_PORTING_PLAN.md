@@ -114,7 +114,9 @@ contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/
 - PWC worker：`chips/bk7258/bk7258_pm_pwc.c`
 - PSRAM allocator/API：`chips/bk7258/bk7258_psram.c`、
   `chips/bk7258/include/bk7258_psram.h`
-- 当前配置：`boards/bk7258/bk7258-ap/configs/nsh/defconfig`
+- 最小 AP 门禁配置：`boards/bk7258/bk7258-ap/configs/nsh/defconfig`；VelaSight
+  产品构建使用同目录下的 `configs/ai_agent/defconfig`，不能混用两者的
+  `.config` 或输出目录。
 - 现有总体方案：`BK7258_OPENVELA_AP_PORTING_PLAN.md:295-313`
 
 当前链接产物证明NuttX通用动态heap仍只使用AP私有SRAM；PSRAM由运行时创建的五个

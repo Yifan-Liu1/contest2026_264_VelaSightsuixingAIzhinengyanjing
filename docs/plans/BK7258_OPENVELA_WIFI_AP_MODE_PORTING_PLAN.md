@@ -568,7 +568,8 @@ CP 侧必须新增统计或临时 trace 证明：
 
 ### 8.1 defconfig 增量
 
-`nsh` 和需要 SoftAP 的 `ai_agent` 配置至少增加：
+`nsh` 和需要 SoftAP 的 `ai_agent` 是两个不同配置，均需增加：`nsh` 仅用于
+底层网络门禁，VelaSight 实际产品构建仍必须选择 `ai_agent`。两种配置至少增加：
 
 ```text
 CONFIG_NET_BROADCAST=y

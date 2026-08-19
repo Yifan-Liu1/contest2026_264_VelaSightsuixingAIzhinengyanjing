@@ -31,7 +31,9 @@ fi
 
 DEFAULT_IMAGE="$ROOT/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin"
 RUNTIME_DIR=${AUTOFLASH_RUNTIME_DIR:-"$SCRIPT_DIR/logs/runtime"}
-EXPECTED_SIZE=${AUTOFLASH_EXPECTED_SIZE:-2646016}
+# The package size changes when the AP partition layout changes.  Keep a
+# product-build default, while allowing the build flow to override it.
+EXPECTED_SIZE=${AUTOFLASH_EXPECTED_SIZE:-5709824}
 
 PORT=/dev/ttyUSB0
 PORTNUM=""
@@ -64,7 +66,7 @@ usage() {
   -h           显示帮助
 
 环境变量: VELA_ROOT、BK_LOADER、AUTOFLASH_RUNTIME_DIR、
-          AUTOFLASH_EXPECTED_SIZE 可覆盖自动检测的默认值。
+  AUTOFLASH_EXPECTED_SIZE 可覆盖当前产品包大小校验（当前默认 5709824）。
 
 日志约束: 烧录过程优先在当前 Shell 实时显示，同时保存文件用于追溯；
           不使用仅写文件、完成后再读取的日志方式。

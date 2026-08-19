@@ -59,7 +59,9 @@ ROOT 不对时报错会带上当前值和该改哪里，不会只丢一句"文�
 ## 它替你做的五件事
 
 1. **释放串口** — 自动关掉 detached 的 `screen` 会话和残留 `cat`。这是最高频的失败原因
-2. **烧前校验** — 打印 SHA256；`all-app.bin` 必须正好 2,646,016 字节，打包不完整直接拒绝
+2. **烧前校验** — 打印 SHA256；当前 `2992K` AP 分区产品包必须为
+   `4,526,080` 字节，打包不完整直接拒绝。分区变化后用
+   `AUTOFLASH_EXPECTED_SIZE` 更新校验值。
 3. **软复位** — 最多 8 次，每次先发 AP 控制台逃逸序列再发 `reboot`
 4. **实时进度条** — 擦除和写入两条进度条照常滚动
 5. **恢复串口速率** — 高速烧录后把串口拨回控制台波特率
@@ -128,14 +130,14 @@ sg dialout -c "stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb raw -echo -crtsct
 脚本只烧不编译，所以完整链条是三步：
 
 ```bash
-# 1. 编译 AP 核
+# 1. 编译 AP 核。nsh 仅是最小对照配置；VelaSight 产品必须使用 ai_agent。
 cd <workspace>/contest
 export PATH=$PWD/prebuilts/gcc/linux-x86_64/arm-none-eabi/bin:$PATH
-./build.sh ./contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/boards/bk7258/bk7258-ap/configs/nsh --cmake -j4
+./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8
 
 # 2. 打包
 cd <workspace>
-cp contest/cmake_out/bk7258-ap_nsh/nuttx.bin bk_avdk_smp/build/openvela-ap.bin
+cp contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin bk_avdk_smp/build/openvela-ap.bin
 cd bk_avdk_smp
 sg docker -c "./dbuild.sh make -C projects/app_ab bk7258 SDK_DIR=/armino EXTERNAL_AP_BIN=/armino/build/openvela-ap.bin"
 
@@ -146,9 +148,9 @@ sg dialout -c "<repo>/.claude/skills/autoflash/autoflash.sh -b 1500000 -a"
 打包后建议核对三处，确认烧的是刚编的：
 
 ```bash
-cmp contest/cmake_out/bk7258-ap_nsh/nuttx.bin bk_avdk_smp/build/openvela-ap.bin
-cmp contest/cmake_out/bk7258-ap_nsh/nuttx.bin bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
-stat -c%s bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin   # 必须 2646016
+cmp contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin bk_avdk_smp/build/openvela-ap.bin
+cmp contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
+stat -c%s bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin   # 当前必须 4526080
 ```
 
 ## 板上两个 shell

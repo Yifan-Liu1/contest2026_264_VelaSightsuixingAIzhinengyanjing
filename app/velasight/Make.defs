@@ -1,0 +1,3 @@
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_264_velasight
+endif

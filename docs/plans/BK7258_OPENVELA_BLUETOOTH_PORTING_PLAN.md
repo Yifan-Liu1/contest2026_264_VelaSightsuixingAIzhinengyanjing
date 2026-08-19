@@ -23,7 +23,9 @@
 - `bk_avdk_smp_original_backup`：只用于比较当前 CP 与工作区原始备份。
 - `openvela`：NuttX native BLE Host、`bt_driver_s` 和 STM32WB 双核 HCI 参考。
 - `vendor_beken`、`bk_idk`：交叉核验，不是 BK7258 正式源码目录。
-- `contest/cmake_out/bk7258-ap_nsh`：当前 CMake 产物；`contest/out` 是旧产物，不能作为当前配置证据。
+- `contest/cmake_out/bk7258-ap_nsh`：最小 AP 门禁的 CMake 产物；VelaSight
+  产品产物位于 `contest/cmake_out/bk7258-ap_ai_agent`。`contest/out` 是旧产物，
+  不能作为当前配置证据。
 
 固定采用以下架构：
 

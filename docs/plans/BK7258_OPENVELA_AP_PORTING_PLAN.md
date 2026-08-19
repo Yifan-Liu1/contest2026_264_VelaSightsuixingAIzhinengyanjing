@@ -19,6 +19,11 @@ contest/vendor/beken/boards/bk7258/bk7258-ap
 
 # BK7258 AP 移植 openvela 实施与验证方案
 
+> 配置边界：`configs/nsh` 是最小 AP 启动/资源对照配置；VelaSight 产品
+> 固件使用 `configs/ai_agent`，后者额外包含产品 App、LVGL 和 ai_agent。
+> 本方案中出现的 `nsh` 命令是基础移植历史门禁，不代表最终 VelaSight
+> 镜像的构建入口。
+
 > 文档状态：源码交叉验证后的实施基线。本文区分“已由当前仓库证实”“工程假设”和“量产前待原厂确认”。在 BK7258 专属安全启动、OTP/eFuse 和 CPU1 镜像认证资料闭环前，本文只能指导功能性 AP 移植，不能作为量产安全作业指导书。
 
 ## 1. 目标和结论
