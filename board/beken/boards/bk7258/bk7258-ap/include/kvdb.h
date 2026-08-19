@@ -38,8 +38,8 @@ typedef CODE void (*bk7258_kvdb_cb_t)(FAR const char *key,
 
 int bk7258_kvdb_init(void);
 
-/* Whether writes outlive a reset.  False means the store works for this boot
- * only -- see CONFIG_BK7258_KVDB_FLASH.
+/* Whether writes outlive a reset.  Always false: the store is memory-only,
+ * so it works for this boot and no longer.
  */
 
 bool bk7258_kvdb_persistent(void);

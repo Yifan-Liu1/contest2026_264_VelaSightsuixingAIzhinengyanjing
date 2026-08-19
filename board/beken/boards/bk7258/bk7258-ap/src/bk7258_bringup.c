@@ -22,7 +22,6 @@
 #include "bk7258_gc9d01_fb.h"
 #include "hardware/bk7258_mbox.h"
 #include "bk7258_wifi.h"
-#include "bk7258_flash_client.h"
 #include "bk7258_kvdb.h"
 #include "bk7258_status_screen.h"
 #include "bk7258_net_autostart.h"
@@ -168,19 +167,6 @@ int bk7258_bringup(void)
       return ret;
     }
 
-  /* Answer the CP when it says it is about to touch flash.  Independent of
-   * whether this core ever asks for a flash write of its own: the CP raises
-   * the same notification around its own accesses and spins 5ms per edge
-   * waiting for the acknowledgement, which it was not getting.  Registering a
-   * callback does not talk to the CP, so it is safe this early.
-   */
-
-  ret = bk7258_flash_notify_init();
-  if (ret < 0)
-    {
-      printf("flash: operation notifications unavailable, error=%d\n", ret);
-    }
-
 #ifdef CONFIG_BK7258_SDIO
   ret = bk7258_mmcsd_schedule(CONFIG_BK7258_SDIO_AUTOINIT_DELAY_MS);
   if (ret < 0)
@@ -251,19 +237,17 @@ int bk7258_bringup(void)
  * Name: kvdb_loader
  *
  * Description:
- *   Attaches the flash backend to the configuration store, injects the stored
- *   LLM settings into the agent's config file and joins the stored Wi-Fi
- *   network.
+ *   Injects the stored LLM settings into the agent's config file and joins
+ *   the stored Wi-Fi network.
  *
- *   A task rather than part of bring-up because every step blocks on the CP.
- *   Doing the flash read from bring-up stopped the AP from servicing the
- *   mailbox, so the heartbeat lapsed and the CP's 8-second watchdog reset the
- *   chip: a reboot loop that printed "connected to the CP flash server" every
- *   ~9 s and ended each round in "ap_bridg: link down".  Here a slow or
- *   missing flash service only delays this one task.
+ *   A task rather than part of bring-up because association blocks on the CP,
+ *   and blocking bring-up stops the mailbox from being serviced: the
+ *   heartbeat lapses and the CP's 8-second watchdog resets the chip.  Here a
+ *   slow answer only delays this one task.
  *
- *   Failure is not fatal: the store still works, it just does not survive a
- *   reset, and bk7258_kvdb_persistent() reports that.
+ *   The store is memory-only, so on a cold boot there is nothing to inject
+ *   and nothing to join; both calls are no-ops until something is set with
+ *   `kvdb set`.
  *
  ****************************************************************************/
 
@@ -272,10 +256,14 @@ static int kvdb_loader(int argc, FAR char *argv[])
   UNUSED(argc);
   UNUSED(argv);
 
-  if (bk7258_kvdb_load() >= 0)
-    {
-      bk7258_kvdb_seed_agent_config();
-    }
+  /* Seed regardless: bk7258_kvdb_load() only ever reports "memory only" now,
+   * and a value typed during this boot is just as good as a stored one.
+   * bk7258_kvdb_seed_agent_config() returns without writing when the keys
+   * are not there.
+   */
+
+  (void)bk7258_kvdb_load();
+  bk7258_kvdb_seed_agent_config();
 
 #ifdef CONFIG_BK7258_WIFI
   /* Whether or not the load worked: credentials typed during this boot are

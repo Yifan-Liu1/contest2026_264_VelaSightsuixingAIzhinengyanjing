@@ -39,7 +39,6 @@ CHIP_CSRCS += bk7258_aud.c
 CHIP_CSRCS += bk7258_cpuindex.c
 CHIP_CSRCS += bk7258_idle.c
 CHIP_CSRCS += bk7258_reset.c
-CHIP_CSRCS += bk7258_flash_client.c
 CHIP_CSRCS += bk7258_kvdb.c
 
 ifeq ($(CONFIG_BK7258_BLUETOOTH),y)
