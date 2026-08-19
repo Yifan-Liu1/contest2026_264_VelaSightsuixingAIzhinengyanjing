@@ -32,6 +32,17 @@
 #define MB_DOWN_RETRY          MSEC2TICK(100)
 #define MB_TX_PRIORITY         105
 
+/* The CP's flash operation notification (its flash_notify.c): the header
+ * command carries the edge, param1 the request/acknowledge state.  Values
+ * come from the IPC_FLASH_OP_* enumerations there and cross cores, so they
+ * are fixed by that side.
+ */
+
+#define FLASH_OP_START         0u
+#define FLASH_OP_END           1u
+#define FLASH_OP_STATE_REQ     1u
+#define FLASH_OP_STATE_ACK     2u
+
 enum ack_slot_state
 {
   ACK_SLOT_FREE = 0,
@@ -791,6 +802,38 @@ static int handle_command(const struct bk7258_mb_wire_message *message)
     {
       /* Match Armino's SARADC operation-notification ABI. */
       ack_flags = 2u;
+      ret = OK;
+    }
+  else if (channel == BK7258_MB_CHAN_FLASH_RX &&
+           (bk7258_mb_header_cmd(message) == FLASH_OP_START ||
+            bk7258_mb_header_cmd(message) == FLASH_OP_END) &&
+           message->payload_address == FLASH_OP_STATE_REQ)
+    {
+      /* The CP announces every flash access it is about to make, and its
+       * end, on this channel -- for its own writes as much as for anyone
+       * else's.  flash_lock() in its flash_driver.c calls
+       * mb_flash_op_prepare() with the scheduler already suspended, and
+       * send_flash_op_state() then spins until the acknowledgement carries
+       * IPC_FLASH_OP_ACK, giving up after FLASH_WAIT_ACK_TIMEOUT (5ms).
+       * Its tx-complete ISR only adopts ack_data1 when COM_FAIL is clear,
+       * so leaving this channel unmatched does not merely lose the
+       * notification: the CP burns that 5ms twice around every flash
+       * operation with its tasks suspended.
+       *
+       * Answering is therefore not optional, and it is all that is needed
+       * -- CONFIG_FLASH_CP_AP_DIRECT_ACCESS is off in the CP's config, so
+       * nothing here shares the part with it.  The vendor's own handler
+       * answers unconditionally before looking at anything.
+       *
+       * Only the header command and param1 are checked.  The CP fills a
+       * stack-local mb_chnl_cmd_t and assigns just hdr.data and param1, so
+       * param2 and param3 -- payload_length, flags, crc8 and reserved --
+       * hold whatever was on its stack.  The SARADC branch above can
+       * require them to be zero because its sender clears them; this one
+       * must not.
+       */
+
+      ack_flags = FLASH_OP_STATE_ACK;
       ret = OK;
     }
   else
