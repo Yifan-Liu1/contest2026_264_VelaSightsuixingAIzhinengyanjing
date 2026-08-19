@@ -66,16 +66,90 @@
       <button id="btn-rec-stop">停止录制</button>
     </div>
     <div class="meta" id="cam-meta">seq -, 校验 -</div>
-    <div class="meta">
-      帧率由驱动决定，web_tool 不做节流也不丢帧（<code>frames_dropped</code> 可核对）。
-      当前 <code>/dev/video0</code> 按分辨率选路：480x480 / 640x480 使用经过
-      完整熵校验的硬件 JPEG，864x480 自动回退到软件 JPEG；结构异常的硬件帧不会作为有效帧交付
-      （板上日志 <code>camera poll timeout</code>），尽管同尺寸用
-      <code>agent_camera</code> 单独跑能到 4.4 fps。这条通路正在被改，详见验收记录。
+
+    <!-- Saving frames to disk belongs with the camera, not with pairing where it
+         used to live: it writes the frames this card produces, and it was the
+         reason the pairing card was tall enough to be clipped. -->
+    <div class="row">
+      <button id="btn-cap-start" class="mini">开始落盘</button>
+      <button id="btn-cap-stop" class="mini">停止落盘</button>
     </div>
+    <div class="meta" id="cap-meta">未在录制</div>
+    <details>
+      <summary class="meta">落盘会话</summary>
+      <table id="sessions"><tbody></tbody></table>
+    </details>
+
+    <!-- Folded, not deleted: it is the sort of thing you need once, when a
+         frame rate looks wrong, and it is six lines long -- expanded it pushed
+         the cards below it off the screen. -->
+    <details>
+      <summary class="meta">帧率与选路说明</summary>
+      <div class="meta">
+        帧率由驱动决定，web_tool 不做节流也不丢帧（<code>frames_dropped</code> 可核对）。
+        当前 <code>/dev/video0</code> 按分辨率选路：480x480 / 640x480 使用经过
+        完整熵校验的硬件 JPEG，864x480 自动回退到软件 JPEG；结构异常的硬件帧不会作为有效帧交付
+        （板上日志 <code>camera poll timeout</code>），尽管同尺寸用
+        <code>agent_camera</code> 单独跑能到 4.4 fps。这条通路正在被改，详见验收记录。
+      </div>
+    </details>
   </section>
 
   <!-- LLM -->
+  <section class="card" id="card-audio">
+    <h2>开发板播报音量</h2>
+    <div class="vol-label">
+      <span>播报音量</span>
+      <output id="vol-value" for="vol-slider">—</output>
+    </div>
+    <input id="vol-slider" class="vol-slider" type="range" min="0" max="1000"
+           step="10" value="714" aria-label="播报音量">
+    <div class="vol-scale">
+      <span>静音</span>
+      <span class="vol-unity" id="vol-unity-mark">0 dB</span>
+      <span>最大</span>
+    </div>
+    <div class="row">
+      <button id="btn-vol-apply" class="primary">应用</button>
+      <button id="btn-vol-mute">静音</button>
+      <button id="btn-vol-unity">0 dB</button>
+      <button id="btn-vol-read" class="mini" title="读回板子上的当前值">读回</button>
+    </div>
+    <!-- The clip lives on the card, not in the firmware: flash is at 92% and
+         this is 32 KB.  Uploading is a one-off per card, so the button is
+         secondary and says what it is for. -->
+    <div class="row">
+      <button id="btn-vol-upload" class="mini"
+              title="把 host/web/announce/VOLSET.PCM 写到板子 SD 卡，只需做一次">上传语音</button>
+      <span class="meta" id="vol-clip"></span>
+    </div>
+    <div class="meta" id="vol-meta"></div>
+  </section>
+
+  <section class="card" id="card-conv">
+    <h2>会话历史</h2>
+    <div class="row">
+      <input id="conv-from" placeholder="起 YYYYMMDD" size="10"
+             inputmode="numeric">
+      <input id="conv-to" placeholder="止 YYYYMMDD" size="10"
+             inputmode="numeric">
+    </div>
+    <div class="row">
+      <input id="conv-keyword" placeholder="关键词（摘要和正文都搜）"
+             size="18">
+    </div>
+    <div class="row">
+      <input id="conv-cue" placeholder="表情线索，如 brow_furrow" size="18">
+    </div>
+    <div class="row">
+      <button id="btn-conv-query">查询</button>
+      <button id="btn-conv-all">全部</button>
+    </div>
+    <div class="meta" id="conv-meta"></div>
+    <div id="conv-list"></div>
+    <div id="conv-detail"></div>
+  </section>
+
   <section class="card" id="card-llm">
     <h2>LLM 配置</h2>
     <div class="row">
@@ -160,25 +234,27 @@
     <div class="row">
       <button id="btn-pair">一键配对（走串口）</button>
     </div>
-    <div class="meta">
-      本机通过串口替你配网并启动 <code>web_tool</code>，然后板子主动拨回来——
-      它在 AP 的 NAT 后面，本机连不进去。配对期间会短暂占用串口，之后立刻释放。
-      <strong>当前固件使用 flash kvdb；首次配对后，Wi-Fi 与 web.* 配置会跨重启保留。</strong>
-    </div>
     <details>
-      <summary class="meta">或者自己在串口粘这些</summary>
+      <summary class="meta">配对说明与手工命令</summary>
+      <div class="meta">
+        本机通过串口替你配网并启动 <code>web_tool</code>，然后板子主动拨回来——
+        它在 AP 的 NAT 后面，本机连不进去。配对期间会短暂占用串口，之后立刻释放。
+        <strong>kvdb 的 flash 后端已被上游撤回，配置只在本次开机有效：板子重启后
+        Wi-Fi 与 web.* 都要重新配一次。</strong>
+      </div>
       <pre class="meta pick" id="pair-cmds">…</pre>
     </details>
-    <h3>导出</h3>
-    <div class="meta" id="cap-meta">未在录制</div>
-    <div class="row">
-      <button id="btn-cap-start">开始落盘</button>
-      <button id="btn-cap-stop">停止落盘</button>
-    </div>
-    <table id="sessions"><tbody></tbody></table>
   </section>
 
 </main>
+
+<div id="dragger" title="拖动改变下方高度"></div>
+
+<!-- Console and log side by side rather than stacked.  Stacked they were 460px
+     of the viewport between them and pushed half the cards off the bottom;
+     next to each other they cost one pane's height and the pairing they exist
+     for -- press a button, read what it did -- still holds. -->
+<div id="bottom">
 
 <!-- 控制台：输入指令，看它自己的回显 -->
 <section id="consolepane">
@@ -198,8 +274,6 @@
   </div>
 </section>
 
-<div id="dragger" title="拖动改变日志高度"></div>
-
 <section id="logpane">
   <div id="logbar">
     <strong>日志</strong>
@@ -213,6 +287,8 @@
   </div>
   <pre id="log"></pre>
 </section>
+
+</div><!-- #bottom -->
 
 <script type="module" src="/static/app.js"></script>
 </body>
