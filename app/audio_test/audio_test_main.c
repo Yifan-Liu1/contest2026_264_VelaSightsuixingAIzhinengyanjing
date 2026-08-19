@@ -289,6 +289,7 @@ struct audio_test_cfg_s
   const char *stream_host;          /* non-NULL: chunked upload target */
   int stream_port;
   unsigned int chunk_ms;            /* chunk length for 'stream' */
+  const char *save_path;            /* non-NULL: write the Ogg here */
 };
 
 /* A recording held in the heap.  Capture appends to it and playback drains
@@ -336,6 +337,8 @@ static void audio_test_usage(void)
          "           while still recording; capture is never blocked by\n"
          "           the network, chunks are dropped instead\n"
          "  -c <ms>    stream: chunk length, default %d\n"
+         "  -o <path>  opus: write the file here instead of printing it,\n"
+         "             e.g. -o /mnt/sdnand/SEED.OGG\n"
          "  diag     capture with a driver register dump\n"
          "  -b <bps>   opus bitrate, default %d\n"
          "  -t <sec>   duration, default %d\n"
@@ -1416,7 +1419,8 @@ static int audio_test_recplay(const struct audio_test_cfg_s *cfg)
     {
       ret = audio_test_ogg_opus_dump((const int16_t *)clip.data,
                                      clip.used / sizeof(int16_t),
-                                     cfg->samplerate, cfg->bitrate);
+                                     cfg->samplerate, cfg->bitrate,
+                                     cfg->save_path);
       goto free_clip;
     }
 
@@ -1684,6 +1688,7 @@ int main(int argc, char *argv[])
   cfg.stream_host = NULL;
   cfg.stream_port = 0;
   cfg.chunk_ms = AUDIO_TEST_DEF_CHUNK_MS;
+  cfg.save_path = NULL;
 
   if (argc < 2)
     {
@@ -1826,6 +1831,14 @@ int main(int argc, char *argv[])
       else if (strcmp(argv[i], "-c") == 0)
         {
           cfg.chunk_ms = (unsigned int)value;
+        }
+      else if (strcmp(argv[i], "-o") == 0)
+        {
+          /* A path, not a number: `value` above is meaningless here and
+           * simply unused.
+           */
+
+          cfg.save_path = argv[i + 1];
         }
       else if (strcmp(argv[i], "-m") == 0)
         {

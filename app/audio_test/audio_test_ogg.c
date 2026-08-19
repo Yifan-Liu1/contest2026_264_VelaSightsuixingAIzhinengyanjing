@@ -32,9 +32,11 @@
 #include <nuttx/config.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -548,6 +550,56 @@ int audio_test_ogg_send(const char *host, int port)
   return ret;
 }
 
+int audio_test_ogg_save(const char *path)
+{
+  size_t written = 0;
+  int fd;
+
+  if (g_ogg_file == NULL || g_ogg_len == 0)
+    {
+      printf("audio_test: nothing encoded yet\n");
+      return -ENODATA;
+    }
+
+  fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    {
+      printf("audio_test: cannot create %s: %d\n", path, errno);
+      return -errno;
+    }
+
+  /* Looped: a short write on a FAT filesystem is not an error, and treating
+   * one as success would leave a truncated file that still decodes for part
+   * of its length -- the kind of corruption that is noticed much later.
+   */
+
+  while (written < g_ogg_len)
+    {
+      ssize_t n = write(fd, g_ogg_file + written, g_ogg_len - written);
+
+      if (n <= 0)
+        {
+          if (n < 0 && errno == EINTR)
+            {
+              continue;
+            }
+
+          printf("audio_test: write to %s stalled after %zu byte(s): %d\n",
+                 path, written, errno);
+          close(fd);
+          return n < 0 ? -errno : -EIO;
+        }
+
+      written += (size_t)n;
+    }
+
+  close(fd);
+
+  printf("audio_test: wrote %zu byte(s) to %s (crc32=0x%08lx)\n", written,
+         path, (unsigned long)ogg_crc32_zlib(g_ogg_file, g_ogg_len));
+  return OK;
+}
+
 int audio_test_ogg_redump(void)
 {
   if (g_ogg_file == NULL || g_ogg_len == 0)
@@ -807,7 +859,8 @@ int audio_test_ogg_encode(void *handle, const int16_t *pcm, size_t nsamples,
 }
 
 int audio_test_ogg_opus_dump(const int16_t *pcm, size_t nsamples,
-                             unsigned int rate, unsigned int bitrate)
+                             unsigned int rate, unsigned int bitrate,
+                             const char *save_path)
 {
   uint32_t serial = 0x4f505553;        /* "OPUS"; any constant will do */
   void *handle;
@@ -870,6 +923,17 @@ int audio_test_ogg_opus_dump(const int16_t *pcm, size_t nsamples,
   g_ogg_len = outlen;
   g_ogg_rate = rate;
   g_ogg_bitrate = bitrate;
+
+  /* A file and a console dump are alternatives, not both: the dump paces
+   * itself at 8 ms a line to survive the mailbox relay, so printing 15 KiB
+   * that has already been written to the card would add seconds of waiting
+   * for output nobody is reading.
+   */
+
+  if (save_path != NULL)
+    {
+      return audio_test_ogg_save(save_path);
+    }
 
   audio_test_ogg_redump();
   return OK;
