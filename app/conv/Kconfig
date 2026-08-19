@@ -1,0 +1,29 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LVX_USE_DEMO_CONTEST2026_264_CONV
+	bool "VelaSight conversation history on SD-NAND"
+	default n
+	depends on FS_FAT
+	---help---
+		Enable the conv NSH command: stores conversation records on the
+		SD-NAND and answers the web console's history queries locally.
+
+		Each record is a transcript, a social-cue/v1 analysis of the other
+		person's expression, and the recording.  Queries filter by date
+		range, cue and confidence from a single index file, then search the
+		transcripts of only the records that survived that filter, and the
+		matches are POSTed to the console with their recordings.
+
+		The query runs on the board because the recordings are on the board:
+		shipping every conversation to the console so it could filter them
+		would move megabytes to answer a question whose answer is a few
+		hundred bytes, over the same link that carries live audio.
+
+		Note that this board cannot timestamp its own records -- time(NULL)
+		returns seconds since boot -- so dates are supplied from outside and
+		stored in the index.  Neither filenames nor mtimes can hold them:
+		FAT_LFN is off, so names are 8.3, and FS_FATTIME is off, so the
+		filesystem keeps no modification times.
