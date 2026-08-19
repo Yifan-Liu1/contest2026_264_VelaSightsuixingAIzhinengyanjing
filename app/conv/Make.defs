@@ -1,0 +1,7 @@
+############################################################################
+# VelaSight conversation history - Make.defs
+############################################################################
+
+ifneq ($(CONFIG_LVX_USE_DEMO_CONTEST2026_264_CONV),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_264_conv
+endif

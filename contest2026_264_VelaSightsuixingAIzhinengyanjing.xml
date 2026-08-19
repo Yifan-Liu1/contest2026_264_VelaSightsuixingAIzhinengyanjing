@@ -21,6 +21,7 @@
     <linkfile src="app/hello_screen" dest="packages/demos/contest2026_264_hello_screen"/>
     <linkfile src="app/web_tool" dest="packages/demos/contest2026_264_web_tool"/>
     <linkfile src="app/provisioning_web" dest="packages/demos/contest2026_264_provision_web"/>
+    <linkfile src="app/conv" dest="packages/demos/contest2026_264_conv"/>
     <linkfile src="board/beken/chips/bk7258"
               dest="vendor/beken/chips/bk7258"/>
     <linkfile src="board/beken/boards/bk7258"
