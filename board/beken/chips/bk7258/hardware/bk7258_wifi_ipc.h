@@ -52,7 +52,7 @@
 #define BK7258_WIFI_AP_ABI_VERSION        1u
 #define BK7258_WIFI_AP_SECURITY_OPEN      0u
 #define BK7258_WIFI_AP_SECURITY_WPA2      1u
-#define BK7258_WIFI_AP_MAX_CLIENTS        4u
+#define BK7258_WIFI_AP_MAX_CLIENTS        1u
 
 struct bk7258_wifi_ap_start_request
 {

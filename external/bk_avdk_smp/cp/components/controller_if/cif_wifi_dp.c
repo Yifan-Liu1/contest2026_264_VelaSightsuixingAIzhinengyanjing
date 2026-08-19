@@ -137,6 +137,7 @@ static uint8_t cif_vif_id_route()
 
 bk_err_t cif_handle_txdata(void *head)
 {
+    static uint32_t trace_count;
     uint8_t ret = BK_OK;
     struct pbuf* pbuf = NULL;
 
@@ -181,6 +182,16 @@ bk_err_t cif_handle_txdata(void *head)
 
     CIF_STATS_INC(buf_in_txdata);
     cif_stats_ptr->cif_tx_cnt++;
+    if (cpdu->co_hdr.vif_idx == 1 && trace_count < 16 && pbuf->payload &&
+        pbuf->len >= 14)
+    {
+        uint8_t *frame = (uint8_t *)pbuf->payload;
+        uint8_t sta_idx = vif_mgmt_tx_get_staidx(vif_id - 0xF, frame);
+        CIF_LOGI("OpenVela TX wire=%d lmac=%d sta=%d len=%d eth=%02x%02x\n",
+                 cpdu->co_hdr.vif_idx, vif_id - 0xF, sta_idx, pbuf->len,
+                 frame[12], frame[13]);
+        trace_count++;
+    }
     CIF_LOGV("%s p:%x next:%x payload%x sizeof:%d\r\n",__func__, pbuf, pbuf->next, pbuf->payload, sizeof(struct pbuf));
     CIF_LOGV("%s p:%x,vif_id=%d\r\n",__func__, pbuf,vif_id);
 

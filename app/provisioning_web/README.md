@@ -151,6 +151,8 @@ SSID；**密码永不回显、永不进日志**。
 | 110 | 4 | CRC32（IEEE，覆盖 0..109） |
 
 落盘顺序是同目录的 `vpsave.tmp` → `fflush` → `fsync` → `close` → `rename` → `sync()`。
+若目标文件缺失但 scratch 是完整且 CRC 有效的记录，下一次读取会先将 scratch 提升为正式
+记录；损坏 scratch 按 `-EBADMSG` 拒绝，不会被提升。
 魔数、版本、两个长度、开放标志与 `psk_len` 的自洽性、补零区、保留字节和 CRC 逐项校验，
 任何一项不过按 `-EBADMSG` 处理，不做「尽力恢复」。
 

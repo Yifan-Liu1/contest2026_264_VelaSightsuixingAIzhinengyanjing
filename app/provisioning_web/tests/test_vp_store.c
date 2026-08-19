@@ -187,6 +187,34 @@ static void test_store_file(void)
         strcmp(out.ssid, "OtherNet") == 0 && out.open_network &&
         out.generation == 2, "the replacement is what reads back");
 
+  CHECK(rename(g_path, tmp) == 0,
+        "an interrupted replacement can leave only the scratch record");
+  CHECK(vp_store_load(g_path, &out) == 0 &&
+        strcmp(out.ssid, "OtherNet") == 0 && out.generation == 2,
+        "a complete scratch record is recovered");
+  CHECK(access(g_path, F_OK) == 0 && access(tmp, F_OK) != 0,
+        "recovery promotes scratch to the final path");
+
+  CHECK(unlink(g_path) == 0, "the recovered record can be removed");
+  stream = fopen(tmp, "wb");
+  CHECK(stream != NULL, "a corrupt scratch record can be created");
+  if (stream != NULL)
+    {
+      CHECK(fwrite("not a record", 1, 12, stream) == 12,
+            "corrupt scratch bytes written");
+      fclose(stream);
+    }
+
+  CHECK(vp_store_load(g_path, &out) == -EBADMSG,
+        "a corrupt scratch record is rejected");
+  CHECK(access(g_path, F_OK) != 0,
+        "a corrupt scratch record is not promoted");
+  unlink(tmp);
+
+  fill(&in, "OtherNet", "", 2);
+  CHECK(vp_store_save(g_path, &in) == 0,
+        "a valid record can be saved after rejected scratch recovery");
+
   /* A corrupt file must read as corrupt, and must not be silently replaced by
    * the loader; only an explicit save may overwrite it.
    */

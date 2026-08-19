@@ -30,7 +30,7 @@
 #define VP_STATE_FINISHED 2  /* the thread returned, still needs a join */
 
 #define VP_ACCEPT_POLL_MS  200
-#define VP_REQUEST_TIMEOUT_MS 5000
+#define VP_REQUEST_TIMEOUT_MS 1500
 #define VP_STORE_PATH_MAX  192
 #define VP_THREAD_STACK    8192
 
@@ -291,7 +291,18 @@ static void vp_handle(int fd, bool *saved, int *save_status,
 
   if (len > 0)
     {
-      (void)vp_write_all(fd, g_response, len);
+      ret = vp_write_all(fd, g_response, len);
+      if (ret < 0)
+        {
+          /* Keep AP mode available when the phone disconnected before it
+           * received the result page.  The record itself was already saved.
+           */
+          if (*saved)
+            {
+              *saved = false;
+            }
+          *save_status = ret;
+        }
     }
 }
 
@@ -359,6 +370,7 @@ static void *vp_thread(void *arg)
           break;
         }
 
+      printf("provision_web: accepted client\n");
       vp_handle(fd, &saved, &save_status, &generation);
 
       /* Close before notifying.  The application is expected to leave SoftAP
@@ -492,6 +504,7 @@ int velasight_provisioning_start(
   snprintf(g_server.store_path, sizeof(g_server.store_path), "%s",
            cfg.store_path != NULL ? cfg.store_path :
            CONFIG_VELASIGHT_PROVISION_STORE);
+  g_server.state = VP_STATE_RUNNING;
 
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, VP_THREAD_STACK);
@@ -501,11 +514,11 @@ int velasight_provisioning_start(
     {
       close(fd);
       g_server.listenfd = -1;
+      g_server.state = VP_STATE_IDLE;
       pthread_mutex_unlock(&g_lock);
       return -ret;
     }
 
-  g_server.state = VP_STATE_RUNNING;
   pthread_mutex_unlock(&g_lock);
 
   printf("provision_web: listening on 0.0.0.0:%u, store %s\n",

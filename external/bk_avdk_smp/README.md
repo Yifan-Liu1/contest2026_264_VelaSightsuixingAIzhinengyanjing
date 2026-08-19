@@ -11,6 +11,7 @@
 | `cp/components/bk_cli/cli_main.c` | `cp/components/bk_cli/cli_main.c` | 注册 `ap_console` CLI 命令 |
 | `cp/components/bk_cli/shell_task.c` | `cp/components/bk_cli/shell_task.c` | UART0 CP_CLI/AP_CONSOLE owner 状态机、延迟切换和退出转义 |
 | `cp/components/bk_pm/pm.c` | `cp/components/bk_pm/pm.c` | DVFS 错误传播、vote/cache rollback 和 CPU/PSRAM 联合 VDDDIG 下限 |
+| `cp/components/bk_wifi/src/hostapd_intf.c` | `cp/components/bk_wifi/src/hostapd_intf.c` | 按 VIF 清理 station，保护 AP BCMC station 和 station 密钥状态 |
 | `cp/components/controller_if/cif_ipc.c` | `cp/components/controller_if/cif_ipc.c` | 保留 Wi-Fi IPC RX status callback ABI |
 | `cp/components/controller_if/Kconfig` | `cp/components/controller_if/Kconfig` | `CONFIG_WIFI_VNET_AP_IPV4` 配置 |
 | `cp/components/controller_if/cif_cntrl.c` | `cp/components/controller_if/cif_cntrl.c` | STA scan/country IPC、扫描完成通知和结果快照 |
@@ -69,6 +70,7 @@ for path in \
   cp/components/bk_cli/cli_main.c \
   cp/components/bk_cli/shell_task.c \
   cp/components/bk_pm/pm.c \
+  cp/components/bk_wifi/src/hostapd_intf.c \
   cp/components/controller_if/cif_ipc.c \
   cp/components/controller_if/Kconfig \
   cp/components/controller_if/cif_cntrl.c \
@@ -114,6 +116,7 @@ for path in \
   cp/components/bk_cli/cli_main.c \
   cp/components/bk_cli/shell_task.c \
   cp/components/bk_pm/pm.c \
+  cp/components/bk_wifi/src/hostapd_intf.c \
   cp/components/controller_if/cif_ipc.c \
   cp/components/controller_if/Kconfig \
   cp/components/controller_if/cif_cntrl.c \

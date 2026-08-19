@@ -88,8 +88,8 @@ int vp_store_temp_path(const char *path, char *buf, size_t buflen);
  *   Write the record to the scratch file, flush it, fsync it, then rename it
  *   over the target, so a reader sees a complete record rather than a
  *   half-written one.  Creates the parent directory when it is missing.  On
- *   failure the scratch file is removed and any previous record is left
- *   intact.  Returns 0 or a negative errno.
+ *   failure a complete scratch file is retained for load-time recovery.
+ *   Returns 0 or a negative errno.
  *
  *   On VFAT the rename is not a single atomic step -- NuttX's VFS unlinks an
  *   existing target first, and FAT's own rename refuses to overwrite -- so
@@ -108,6 +108,8 @@ int vp_store_save(const char *path,
  * Description:
  *   Read and validate the record.  Returns 0, -ENOENT, -EBADMSG for a corrupt
  *   or wrong-sized file, or a negative errno.
+ *   If the final path is absent but a complete scratch record exists, load
+ *   validates and promotes that record before returning it.
  *
  ****************************************************************************/
 

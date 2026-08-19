@@ -350,7 +350,11 @@ int vp_store_save(const char *path,
   if (rename(tmp, path) < 0)
     {
       ret = -errno;
-      unlink(tmp);
+      /* Keep a complete, fsynced scratch record.  FAT replacement unlinks an
+       * existing destination before rename, so this may be the only valid
+       * copy left after an interrupted replacement.  load() recovers it when
+       * the final path is absent.
+       */
       return ret;
     }
 
@@ -362,8 +366,10 @@ int vp_store_load(const char *path,
                   struct velasight_prov_credentials_s *cred)
 {
   uint8_t record[VP_RECORD_SIZE + 1];
+  char tmp[VP_STORE_PATH_MAX + 16];
   FILE *stream;
   size_t nread;
+  bool recover = false;
 
   if (path == NULL || cred == NULL)
     {
@@ -384,16 +390,44 @@ int vp_store_load(const char *path,
 
       if (errno == ENOENT || errno == ENOTDIR)
         {
-          return -ENOENT;
-        }
+          if (vp_store_temp_path(path, tmp, sizeof(tmp)) < 0)
+            {
+              return -ENOENT;
+            }
 
-      return -errno;
+          stream = fopen(tmp, "rb");
+          if (stream == NULL)
+            {
+              return errno == ENOENT || errno == ENOTDIR ? -ENOENT : -errno;
+            }
+
+          recover = true;
+        }
+      else
+        {
+          return -errno;
+        }
     }
 
   nread = fread(record, 1, sizeof(record), stream);
   fclose(stream);
 
-  return vp_record_decode(record, nread, cred);
+  if (vp_record_decode(record, nread, cred) < 0)
+    {
+      return -EBADMSG;
+    }
+
+  if (recover)
+    {
+      if (rename(tmp, path) < 0)
+        {
+          return -errno;
+        }
+
+      sync();
+    }
+
+  return 0;
 }
 
 uint32_t vp_store_next_generation(const char *path)

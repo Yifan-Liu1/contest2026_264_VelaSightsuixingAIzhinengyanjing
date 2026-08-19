@@ -185,6 +185,8 @@ struct wifi_driver
 
 static struct wifi_driver g_wifi;
 static volatile int g_worker_result;
+static unsigned int g_wifi_rx_trace;
+static unsigned int g_wifi_tx_trace;
 
 _Static_assert(sizeof(g_wifi.command_data) >=
                sizeof(struct bk7258_wifi_scan_page_response),
@@ -677,11 +679,17 @@ static void wifi_ap_client_event(bool associated)
       if (associated &&
           g_wifi.ap_client_count < BK7258_WIFI_AP_MAX_CLIENTS)
         {
+          g_wifi_rx_trace = 0;
+          g_wifi_tx_trace = 0;
           g_wifi.ap_client_count++;
+          printf("bk7258_wifi: AP client associated, count=%u\n",
+                 g_wifi.ap_client_count);
         }
       else if (!associated && g_wifi.ap_client_count != 0)
         {
           g_wifi.ap_client_count--;
+          printf("bk7258_wifi: AP client disassociated, count=%u\n",
+                 g_wifi.ap_client_count);
         }
     }
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
@@ -1571,6 +1579,15 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
                                  &vif) &&
               vif == wifi_role_vif(g_wifi.active_role))
             {
+              if (g_wifi_rx_trace < 16)
+                {
+                  const uint8_t *frame = g_wifi.packets[index].frame;
+                  uint16_t type = ((uint16_t)frame[12] << 8) | frame[13];
+
+                  printf("bk7258_wifi: AP RX vif=%u len=%u eth=0x%04x\n",
+                         vif, g_wifi.packets[index].length, type);
+                  g_wifi_rx_trace++;
+                }
               g_wifi.packets[index].role_epoch = pending->role_epoch;
               packet_added++;
             }
@@ -1940,6 +1957,7 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
     }
   if (tx == NULL)
     {
+      printf("bk7258_wifi: AP TX slots exhausted\n");
       nxmutex_unlock(&g_wifi.packet_lock);
       return -EBUSY;
     }
@@ -1962,6 +1980,16 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
     {
       nxmutex_unlock(&g_wifi.packet_lock);
       return ret;
+    }
+
+  if (g_wifi.active_role == WIFI_ROLE_SOFTAP && g_wifi_tx_trace < 16)
+    {
+      uint16_t type = length >= 14 ?
+                      ((uint16_t)tx->frame[12] << 8) | tx->frame[13] : 0;
+
+      printf("bk7258_wifi: AP TX vif=%u len=%u eth=0x%04x\n",
+             vif, length, type);
+      g_wifi_tx_trace++;
     }
 
   tx->packet = packet;
