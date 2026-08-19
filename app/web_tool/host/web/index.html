@@ -59,11 +59,7 @@
     <div class="row">
       <button id="btn-cam-start">开始</button>
       <button id="btn-cam-stop">停止</button>
-      <button id="btn-grab">抓一帧</button>
-    </div>
-    <div class="row">
-      <button id="btn-rec-start">录一段</button>
-      <button id="btn-rec-stop">停止录制</button>
+      <button id="btn-grab" class="primary">抓一帧</button>
     </div>
     <div class="meta" id="cam-meta">seq -, 校验 -</div>
 
@@ -164,55 +160,38 @@
       <button id="btn-key-show" class="mini" title="看一眼">👁</button>
     </div>
     <div class="row">
-      <button id="btn-llm-push">写入板子</button>
+      <button id="btn-llm-push" class="primary">写入板子</button>
       <button id="btn-llm-pull">读回</button>
     </div>
-
-    <h3>本机记住 API key</h3>
-    <div class="row">
-      <input id="pin" placeholder="6 位以上数字 PIN" size="12"
-             type="password" inputmode="numeric" autocomplete="off">
-      <button id="btn-key-save">加密保存</button>
-    </div>
-    <div class="row">
-      <button id="btn-key-unlock">解锁并填入</button>
-      <button id="btn-key-forget">清除</button>
-    </div>
     <div class="meta" id="key-meta"></div>
-    <div class="meta warn" id="key-warn"></div>
   </section>
 
   <!-- Wi-Fi -->
+  <!-- Read-only.  Setting the credentials from here needed the board already
+       connected, which needs the Wi-Fi already working -- so it only ever
+       helped when switching networks, and it duplicated 一键配对, which does the
+       same writes over serial and works when the board is not connected at
+       all.  What is left is the part that answers "is it actually on the
+       network", which the lamps alone cannot say. -->
   <section class="card" id="card-wifi">
-    <h2>Wi-Fi</h2>
+    <h2>Wi-Fi 状态</h2>
     <div class="row">
-      <input id="wifi-ssid" placeholder="SSID（2.4G）" size="16" value="AIPC">
-    </div>
-    <div class="row">
-      <input id="wifi-psk" placeholder="密码（开放热点留空）" size="16"
-             type="password" autocomplete="off">
-    </div>
-    <div class="row">
-      <button id="btn-wifi-connect">连接并保存</button>
       <button id="btn-wifi-status">查看状态</button>
     </div>
     <div class="meta" id="wifi-meta"></div>
     <div class="meta">
-      这颗芯片没有 5GHz 射频，SSID 必须是 2.4G 的那一个。
+      要改网络用「连接板子」里的一键配对。这颗芯片没有 5GHz 射频，
+      SSID 必须是 2.4G 的那一个。
     </div>
   </section>
 
   <!-- 控制 -->
   <section class="card" id="card-control">
     <h2>控制</h2>
-    <div class="row wrap">
-      <button data-cmd="agent_camera 640x480">拍一张</button>
-      <button data-cmd="periph_selftest">跑自检</button>
-      <button data-cmd="social_cue mock case 0">social_cue</button>
-      <button data-cmd="free">free</button>
-      <button data-cmd="ps">ps</button>
-      <button data-cmd="ifconfig">ifconfig</button>
-    </div>
+    <!-- The six shortcut buttons that were here were shell.exec with a fixed
+         command line, which the console below can do -- and does with history
+         and a place to read the output.  What stays is the two that are
+         structured commands rather than shell. -->
     <div class="row">
       <button id="btn-status">系统状态</button>
       <button id="btn-reboot" class="danger">重启</button>
@@ -278,8 +257,9 @@
   <div id="logbar">
     <strong>日志</strong>
     <input id="log-filter" placeholder="过滤（子串）" size="16">
-    <button id="btn-log-sub">订阅</button>
-    <button id="btn-log-unsub">取消订阅</button>
+    <!-- Subscribed automatically once the board is there.  It used to need a
+         click, and an unsubscribed log looks exactly like a board with nothing
+         to say. -->
     <button id="btn-log-pause">暂停</button>
     <button id="btn-log-clear">清屏</button>
     <span class="grow"></span>

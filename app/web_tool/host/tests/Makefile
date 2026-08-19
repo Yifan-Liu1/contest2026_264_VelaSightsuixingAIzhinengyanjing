@@ -13,7 +13,6 @@
 #   make queue      just the queue and ring tests
 #   make e2e        the host side against mock_board.py, no hardware needed
 #   make tls        the TLS path: pin, token, HTTPS/WSS, full chain
-#   make keystore   the browser's encrypted key store (needs node)
 #   make wiring     every id app.js touches exists in index.html
 #   make clean
 #
@@ -28,7 +27,7 @@ LDFLAGS += -fsanitize=address,undefined -pthread
 
 HDRS    := ../../wt_protocol.h ../../wt_queue.h
 
-.PHONY: all run protocol queue mailbox kvdb-secret jpeg-header e2e tls keystore wiring provisioning clean
+.PHONY: all run protocol queue mailbox kvdb-secret jpeg-header e2e tls wiring provisioning clean
 
 all: run
 
@@ -85,11 +84,6 @@ e2e:
 tls:
 	python3 test_tls_e2e.py
 
-# Runs in node because that is where WebCrypto lives outside a browser, and the
-# key store must not be the one piece nobody tested.
-keystore:
-	node test_keystore.mjs
-
 # One missing element kills every button wired after it, and the symptom is
 # "some buttons do not work" with no hint which edit did it.
 wiring:
@@ -100,7 +94,7 @@ wiring:
 provisioning:
 	$(MAKE) -C ../../../provisioning_web/tests run
 
-run: wiring protocol queue mailbox kvdb-secret jpeg-header provisioning e2e tls keystore
+run: wiring protocol queue mailbox kvdb-secret jpeg-header provisioning e2e tls
 
 clean:
 	rm -f test_wt_protocol test_wt_queue test_board_mbox_abi test_kvdb_secret \

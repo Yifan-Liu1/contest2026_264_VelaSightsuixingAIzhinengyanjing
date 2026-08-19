@@ -11,9 +11,6 @@
 
 'use strict';
 
-import { makeKeyStore, isValidPin, MAX_ATTEMPTS, MIN_PIN_DIGITS }
-  from '/static/keystore.mjs';
-
 const $ = (id) => document.getElementById(id);
 
 let ws = null;
@@ -23,7 +20,10 @@ let paused = false;
 let lastObjectUrl = null;
 let logLines = [];
 let filterText = '';
-const keystore = makeKeyStore();
+
+/* Whether this link's log subscription has been asked for.  Reset when the link
+ * drops, because the subscription is per session on the board. */
+let logSubscribed = false;
 
 /* Console state: which command is running, and where its output goes. */
 let consoleRunning = null;
@@ -46,7 +46,6 @@ function connect() {
 
   ws.onopen = () => {
     addLog('me', 'console: 已连接后端（' + proto.replace(':', '') + '）');
-    refreshKeyMeta();
     /* Learn whether the board's store is persistent, which changes what the
      * reboot button means.  Harmless if the board is not there yet. */
     llmPull().catch(() => {});
@@ -231,6 +230,26 @@ function renderState(st) {
    * only would leave the control blank whenever the page was open first. */
   if (link.connected && volApplied === null && volUnity === null) {
     volRead().catch(() => {});
+  }
+
+  /* Subscribe to the log the moment there is a board to subscribe to, and only
+   * once per link.  This used to be a button, and a log nobody had subscribed
+   * to is indistinguishable from a board that has nothing to say -- which is a
+   * bad first impression for the pane that exists to tell you what went wrong.
+   */
+  if (link.connected && !logSubscribed) {
+    logSubscribed = true;
+    cmd('log.subscribe', { on: true }).then((r) => {
+      if (r && r.ok) {
+        addLog('me', 'log: 已订阅，补发 ' + r.data.replayed + ' 行');
+      } else {
+        logSubscribed = false;      /* let the next state event try again */
+      }
+    }).catch(() => { logSubscribed = false; });
+  } else if (!link.connected) {
+    /* The subscription lives in the board's session, so a new link needs a new
+     * one. */
+    logSubscribed = false;
   }
   $('console-input').disabled = down;
   $('degraded').textContent = down
@@ -711,65 +730,6 @@ async function llmPush() {
   await llmPull();
 }
 
-/* ---- key store ------------------------------------------------------- */
-
-function refreshKeyMeta() {
-  const st = keystore.status();
-  if (!st.stored) {
-    $('key-meta').textContent = '本机未保存 API key';
-    $('key-warn').textContent = '';
-    return;
-  }
-  $('key-meta').textContent =
-    '本机已加密保存：' + (st.hint || '') +
-    '\n剩余尝试次数 ' + st.attemptsLeft + ' / ' + MAX_ATTEMPTS +
-    '（连续错 ' + MAX_ATTEMPTS + ' 次自动清除）';
-  $('key-warn').textContent = st.attemptsLeft <= 2
-    ? '只剩 ' + st.attemptsLeft + ' 次，错完就没了' : '';
-}
-
-async function keySave() {
-  const pin = $('pin').value;
-  const secret = $('llm-key').value;
-  if (!isValidPin(pin)) {
-    $('key-warn').textContent = 'PIN 必须是至少 ' + MIN_PIN_DIGITS + ' 位数字';
-    return;
-  }
-  if (!secret) {
-    $('key-warn').textContent = '先把 API key 填进上面的框';
-    return;
-  }
-  try {
-    await keystore.save(pin, secret);
-    $('pin').value = '';
-    $('key-warn').textContent =
-      '已加密保存。注意：这只防住「有人拿到浏览器后乱猜」；' +
-      '整份记录被拷走后可以离线爆破，PIN 越长越好。';
-  } catch (e) {
-    $('key-warn').textContent = e.message;
-  }
-  refreshKeyMeta();
-}
-
-async function keyUnlock() {
-  const pin = $('pin').value;
-  if (!pin) { $('key-warn').textContent = '先输入 PIN'; return; }
-  const r = await keystore.unlock(pin);
-  $('pin').value = '';
-  if (r.ok) {
-    $('llm-key').value = r.secret;
-    $('key-warn').textContent = '已填入，可以「写入板子」';
-  } else if (r.reason === 'wiped') {
-    $('key-warn').textContent =
-      '连续错 ' + MAX_ATTEMPTS + ' 次，本机保存的 API key 已被清除';
-  } else if (r.reason === 'empty') {
-    $('key-warn').textContent = '本机没有保存过';
-  } else {
-    $('key-warn').textContent = 'PIN 不对，还剩 ' + r.attemptsLeft + ' 次';
-  }
-  refreshKeyMeta();
-}
-
 /* ---- wiring ---------------------------------------------------------- */
 
 function wire() {
@@ -831,16 +791,6 @@ function wire() {
       void finish(true);
     }, 5000);
   };
-  $('btn-rec-start').onclick = async () => {
-    await send({ op: 'capture', action: 'start' });
-    const [w, h] = $('cam-size').value.split('x').map(Number);
-    await cmd('camera.start', { width: w, height: h });
-  };
-  $('btn-rec-stop').onclick = async () => {
-    await cmd('camera.stop');
-    await send({ op: 'capture', action: 'stop' });
-  };
-
   /* Dragging only moves the label; nothing is sent until 应用.  A slider that
    * fired an ioctl per pixel would put a few hundred requests on the wire for
    * one gesture, and the board answers each one. */
@@ -869,35 +819,7 @@ function wire() {
     const el = $('llm-key');
     el.type = el.type === 'password' ? 'text' : 'password';
   };
-  $('btn-key-save').onclick = keySave;
-  $('btn-key-unlock').onclick = keyUnlock;
-  $('btn-key-forget').onclick = () => {
-    keystore.forget();
-    $('key-warn').textContent = '已从本机清除';
-    refreshKeyMeta();
-  };
-  $('pin').onkeydown = (e) => {
-    if (e.key === 'Enter') { keyUnlock(); }
-  };
 
-  $('btn-wifi-connect').onclick = async () => {
-    const ssid = $('wifi-ssid').value.trim();
-    const psk = $('wifi-psk').value;
-    if (!ssid) { return; }
-    /* Applying this drops the link it travelled on -- the board is talking to
-     * us over the very Wi-Fi it is about to re-associate.  The board answers
-     * first and applies afterwards, so the sequence is: ack, link drops, board
-     * dials back in.  Say that here rather than let it look like a failure. */
-    $('wifi-meta').textContent = '已提交…关联会断开当前连接，板子随后自己重连';
-    const r = await cmd('wifi.connect', { ssid, psk });
-    if (r && r.ok) {
-      $('wifi-meta').textContent =
-        '已保存并开始关联 ' + (r.data.ssid || ssid) +
-        (r.data.persistent === false ? '（仅本次启动有效）' : '') +
-        '\n连接会断开几秒，然后板子重新拨入；重连后按「查看状态」确认地址';
-      addLog('me', 'wifi.connect: ' + (r.data.note || '已提交'));
-    }
-  };
   $('btn-wifi-status').onclick = async () => {
     const r = await cmd('wifi.status');
     if (r && r.ok) {
@@ -907,10 +829,6 @@ function wire() {
         (r.data.ssid ? ' ssid ' + r.data.ssid : '');
     }
   };
-
-  document.querySelectorAll('[data-cmd]').forEach((btn) => {
-    btn.onclick = () => runConsole(btn.getAttribute('data-cmd'));
-  });
 
   $('btn-status').onclick = async () => {
     const r = await cmd('sys.status');
@@ -1009,11 +927,6 @@ function wire() {
   };
   $('btn-console-clear').onclick = () => { $('consoleout').innerHTML = ''; };
 
-  $('btn-log-sub').onclick = () => cmd('log.subscribe', { on: true })
-    .then((r) => {
-      if (r && r.ok) { addLog('me', 'log: 补发 ' + r.data.replayed + ' 行'); }
-    });
-  $('btn-log-unsub').onclick = () => cmd('log.subscribe', { on: false });
   $('btn-log-pause').onclick = (e) => {
     paused = !paused;
     e.target.textContent = paused ? '继续' : '暂停';
@@ -1069,7 +982,6 @@ function wire() {
   };
 
   setConsoleState();
-  refreshKeyMeta();
 }
 
 wire();

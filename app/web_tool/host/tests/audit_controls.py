@@ -96,7 +96,7 @@ async def audit(args) -> int:
             body = await r.text()
         record("GET / (HTTPS)", r.status == 200, "%d, %d bytes"
                % (r.status, len(body)))
-        for asset in ("style.css", "app.js", "keystore.mjs"):
+        for asset in ("style.css", "app.js"):
             async with sess.get(args.url + "/static/" + asset) as r:
                 await r.read()
             record("GET /static/" + asset, r.status == 200, str(r.status))
