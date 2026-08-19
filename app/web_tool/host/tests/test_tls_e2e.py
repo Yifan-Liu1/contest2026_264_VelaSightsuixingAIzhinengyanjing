@@ -319,14 +319,16 @@ async def test_browser_https() -> None:
                 body = await r.text()
             check(r.status == 200 and "web_tool" in body,
                   "the page is served over HTTPS")
-            check("keystore.mjs" in body or "app.js" in body,
+            check("app.js" in body,
                   "and references the module the page needs")
 
-            async with sess.get("https://127.0.0.1:%d/static/keystore.mjs"
+            # Asserting on a symbol from the file, not only on the status: a
+            # 200 that serves an error page would otherwise pass.
+            async with sess.get("https://127.0.0.1:%d/static/app.js"
                                 % https_port) as r:
-                ks = await r.text()
-            check(r.status == 200 and "MAX_ATTEMPTS" in ks,
-                  "keystore.mjs is served")
+                js = await r.text()
+            check(r.status == 200 and "audio.volume" in js,
+                  "app.js is served over HTTPS")
 
             async with sess.ws_connect("https://127.0.0.1:%d/ws"
                                        % https_port) as ws:

@@ -130,16 +130,33 @@ body {
  * is about twenty lines of log.
  */
 
+/* Four columns, packed rather than aligned in rows.
+ *
+ * A row grid was the obvious thing and it wasted a lot of screen: the cards
+ * differ in height by a factor of three (the preview with its image against
+ * "Wi-Fi 状态" with one button), and in a row grid every card in a row leaves
+ * the difference blank.  Multi-column flow lets a short card sit directly under
+ * the one above it.
+ *
+ * The cost is reading order: cards fill top-to-bottom in the first column, then
+ * the next.  That is acceptable here because the cards are independent panels
+ * rather than steps in a sequence.
+ */
+
 #cards {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-auto-rows: min-content;
-  align-content: start;
-  gap: 7px;
+  columns: 4;
+  column-gap: 7px;
   padding: 7px;
   max-height: 64vh;
   min-height: 0;
   overflow: auto;
+}
+
+#cards .card {
+  /* Splitting a card across a column boundary would put half its controls at
+   * the top of the next column, which is worse than a ragged bottom edge. */
+  break-inside: avoid;
+  margin: 0 0 7px;
 }
 
 /* The heading stays put and the rest scrolls, so a card that is too small for
@@ -341,21 +358,11 @@ td.masked { color: var(--warn); }
  * fallback is to scroll the cards and keep the panes where they are.
  */
 
-@media (max-width: 1400px) {
-  #cards {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    grid-auto-rows: minmax(220px, 1fr);
-    overflow: auto;
-  }
-}
-
-@media (max-width: 1000px) {
-  #cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  #card-conv { grid-row: auto; }
-}
+@media (max-width: 1400px) { #cards { columns: 3; } }
+@media (max-width: 1000px) { #cards { columns: 2; } }
 
 @media (max-width: 620px) {
-  #cards { grid-template-columns: 1fr; }
+  #cards { columns: 1; }
   #bottom { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
 }
 
