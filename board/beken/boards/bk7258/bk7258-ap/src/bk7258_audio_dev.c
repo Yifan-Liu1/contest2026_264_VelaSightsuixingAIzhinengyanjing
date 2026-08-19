@@ -457,11 +457,22 @@ static int bk7258_audio_getcaps(FAR struct audio_lowerhalf_s *dev, int type,
                                 FAR struct audio_caps_s *caps)
 {
   FAR struct bk7258_audio_s *priv = (FAR struct bk7258_audio_s *)dev;
+  uint16_t want;
 
   (void)type;
 
   DEBUGASSERT(caps != NULL &&
               caps->ac_len >= sizeof(struct audio_caps_s));
+
+  /* Saved before the reply fields are cleared below.  ac_format.hw is both an
+   * input (which feature unit is being asked about) and an output, and the
+   * clearing is what a caps query needs -- so a case that matches on the input
+   * has to have read it first.  Getting this wrong made AUDIO_TYPE_FEATURE
+   * always miss and the volume read back as null on hardware while the mock,
+   * which has no such clearing, answered correctly.
+   */
+
+  want = caps->ac_format.hw;
 
   caps->ac_format.hw  = 0;
   caps->ac_controls.w = 0;
@@ -520,6 +531,37 @@ static int bk7258_audio_getcaps(FAR struct audio_lowerhalf_s *dev, int type,
               break;
           }
         break;
+
+      /* Read back what configure(AUDIO_FU_VOLUME) last set, in the same
+       * 0..1000 units it takes.  Without this a user interface can only show
+       * the value it sent itself, which is a different claim: it would still
+       * read 50% after something else changed the gain, and after a reboot it
+       * would show a remembered number rather than the 0 dB the device
+       * actually came up at.
+       */
+
+#ifndef CONFIG_AUDIO_EXCLUDE_VOLUME
+      case AUDIO_TYPE_FEATURE:
+        if (want == AUDIO_FU_VOLUME && priv->playback)
+          {
+            /* Rounded for the same reason as the other direction, and to the
+             * same half step, so set(x) followed by get() returns x for every
+             * value that is a real gain step.
+             */
+
+            caps->ac_controls.hw[0] =
+              (uint16_t)(((uint32_t)priv->cfg.dac_dig_gain * 1000u +
+                          BK7258_AUD_DAC_DIG_GAIN_MAX / 2) /
+                         BK7258_AUD_DAC_DIG_GAIN_MAX);
+            caps->ac_channels = 1;
+          }
+        else
+          {
+            caps->ac_subtype = 0;
+            caps->ac_channels = 0;
+          }
+        break;
+#endif
 
       default:
         caps->ac_subtype = 0;
@@ -640,7 +682,30 @@ static int bk7258_audio_configure(FAR struct audio_lowerhalf_s *dev,
                 volume = 1000;
               }
 
-            gain = (uint8_t)((volume * BK7258_AUD_DAC_DIG_GAIN_MAX) / 1000);
+            /* Rounded, not truncated.  Truncating loses a step in both
+             * directions and the two losses compound: 0 dB is gain 0x2d, which
+             * reports as 714, and 714 truncated back is 0x2c -- so asking for
+             * the value the device itself reported moved the gain down a step
+             * and reported 698, which no amount of clicking could get back to
+             * 714.  Half a step of rounding here makes the round trip stable,
+             * which is what a slider needs to be usable at all.
+             */
+
+            gain = (uint8_t)((volume * BK7258_AUD_DAC_DIG_GAIN_MAX + 500) /
+                             1000);
+
+            /* Kept in cfg as well as written to the register, because
+             * dac_setup() rewrites the same GAIN field from cfg on every
+             * AUDIO_TYPE_OUTPUT configure (bk7258_aud.c, the modifyreg32 over
+             * BK7258_AUD_DAC_GAIN_MASK).  Writing only the register made a
+             * volume last until the next playback started and then silently
+             * revert to 0 dB -- which is why audio_test has to send -v after
+             * its PCM configure rather than before.  Volume is a property of
+             * the device, so it has to survive being reconfigured.
+             */
+
+            priv->cfg.dac_dig_gain = gain;
+
             return bk7258_aud_dac_set_dig_gain(gain);
           }
 
