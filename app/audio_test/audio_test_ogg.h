@@ -112,8 +112,12 @@ int audio_test_ogg_encode(void *handle, const int16_t *pcm, size_t nsamples,
  * Input Parameters:
  *   pcm      - mono 16-bit samples
  *   nsamples - number of samples in pcm
- *   rate     - sample rate; must be one Opus accepts natively
- *   bitrate  - target bits per second for the encoder
+ *   rate      - sample rate; must be one Opus accepts natively
+ *   bitrate   - target bits per second for the encoder
+ *   save_path - NULL to print the file as base64, otherwise the path to
+ *               write it to instead.  The two are alternatives: the dump
+ *               paces itself to survive the console relay, so printing a
+ *               file that has already been stored would only add waiting.
  *
  * Returned Value:
  *   Zero on success, a negated errno on failure.
@@ -121,7 +125,8 @@ int audio_test_ogg_encode(void *handle, const int16_t *pcm, size_t nsamples,
  ****************************************************************************/
 
 int audio_test_ogg_opus_dump(const int16_t *pcm, size_t nsamples,
-                             unsigned int rate, unsigned int bitrate);
+                             unsigned int rate, unsigned int bitrate,
+                             const char *save_path);
 
 /****************************************************************************
  * Name: audio_test_ogg_redump
@@ -137,6 +142,27 @@ int audio_test_ogg_opus_dump(const int16_t *pcm, size_t nsamples,
  ****************************************************************************/
 
 int audio_test_ogg_redump(void);
+
+/****************************************************************************
+ * Name: audio_test_ogg_save
+ *
+ * Description:
+ *   Write the file the last encode produced to a path.
+ *
+ *   Added once the board gained a writable filesystem: until /mnt/sdnand
+ *   existed, base64 over the console and a socket were the only ways a file
+ *   could leave an encode, and both required something on the other end at
+ *   the time.  A file on the card does not, which is what makes a recording
+ *   reusable -- attaching one to a set of conversation records, for
+ *   instance, without recording it again for each.
+ *
+ * Returned Value:
+ *   Zero on success, -ENODATA if nothing has been encoded yet, else a
+ *   negated errno.
+ *
+ ****************************************************************************/
+
+int audio_test_ogg_save(const char *path);
 
 /****************************************************************************
  * Name: audio_test_ogg_send
