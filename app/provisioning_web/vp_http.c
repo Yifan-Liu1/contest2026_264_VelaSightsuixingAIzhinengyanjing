@@ -428,15 +428,22 @@ static size_t vp_wrap(char *buf, size_t buflen, int status,
   "border:1px solid #c7c7cc;border-radius:8px}"                         \
   "button{width:100%%;margin-top:20px;padding:12px;font-size:1rem;"      \
   "border:0;border-radius:8px;background:#0071e3;color:#fff}"           \
+  "a.button{display:block;box-sizing:border-box;text-align:center;"       \
+  "margin-top:20px;padding:12px;border-radius:8px;background:#6e6e73;"    \
+  "color:#fff;text-decoration:none}"                                     \
   "p.note{font-size:.85rem;color:#6e6e73;margin-top:16px}"              \
   "p.err{color:#b00020;font-size:.9rem;margin:0 0 8px}"                 \
   "</style></head><body><main>"
 
 #define VP_PAGE_TAIL "</main></body></html>"
 
-size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
+size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
+                                   const char *notice,
+                                   const char *current_ssid)
 {
   char escaped[256];
+  char escaped_ssid[VELASIGHT_PROV_SSID_MAX * 6 + 1];
+  char ssid_attr[VELASIGHT_PROV_SSID_MAX * 6 + 16];
   char body[VP_HTTP_BODY_BUILD];
   int bodylen;
 
@@ -446,6 +453,14 @@ size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
     }
 
   escaped[0] = '\0';
+  escaped_ssid[0] = '\0';
+  ssid_attr[0] = '\0';
+  if (current_ssid != NULL)
+    {
+      if (vp_html_escape(current_ssid, escaped_ssid, sizeof(escaped_ssid)) >= 0)
+        snprintf(ssid_attr, sizeof(ssid_attr), "value=\"%s\" ",
+                 escaped_ssid);
+    }
   if (notice != NULL && vp_html_escape(notice, escaped, sizeof(escaped)) < 0)
     {
       escaped[0] = '\0';
@@ -453,23 +468,30 @@ size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
 
   bodylen = snprintf(body, sizeof(body),
                      VP_PAGE_HEAD
-                     "<h1>连接 Wi-Fi</h1>"
+                      "<h1>设备配网</h1>"
+                      "<p class=\"note\">当前存储的 Wi-Fi：<strong>%s</strong></p>"
                      "%s%s%s"
                      "<form action=\"/save\" method=\"post\">"
                      "<label for=\"ssid\">网络名称（SSID）</label>"
-                     "<input id=\"ssid\" name=\"ssid\" type=\"text\" "
-                     "maxlength=\"32\" autocapitalize=\"off\" required>"
+                      "<input id=\"ssid\" name=\"ssid\" type=\"text\" "
+                      "maxlength=\"32\" %sautocapitalize=\"off\" required>"
                      "<label for=\"password\">密码（开放网络留空）</label>"
-                     "<input id=\"password\" name=\"password\" "
-                     "type=\"password\" maxlength=\"63\">"
+                      "<input id=\"password\" name=\"password\" "
+                      "type=\"password\" maxlength=\"63\">"
+                      "<label for=\"mimo_apikey\">MiMo API key（可选）</label>"
+                      "<input id=\"mimo_apikey\" name=\"mimo_apikey\" "
+                      "type=\"password\" maxlength=\"512\" "
+                      "autocomplete=\"off\">"
                      "<button type=\"submit\">保存</button>"
                      "</form>"
                      "<p class=\"note\">凭据保存在设备的持久存储中，"
                      "本页面不会切换 Wi-Fi 模式。</p>"
                      VP_PAGE_TAIL,
-                     escaped[0] != '\0' ? "<p class=\"err\">" : "",
-                     escaped,
-                     escaped[0] != '\0' ? "</p>" : "");
+                      escaped_ssid[0] != '\0' ? escaped_ssid : "未配置",
+                      escaped[0] != '\0' ? "<p class=\"err\">" : "",
+                      escaped,
+                      escaped[0] != '\0' ? "</p>" : "",
+                      ssid_attr);
 
   if (bodylen < 0)
     {
@@ -477,6 +499,11 @@ size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
     }
 
   return vp_wrap(buf, buflen, 200, body, (size_t)bodylen);
+}
+
+size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
+{
+  return vp_http_form_page_with_ssid(buf, buflen, notice, NULL);
 }
 
 size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
@@ -503,9 +530,10 @@ size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
                      "<p>加密：%s</p>"
                      "<p>第 %u 次保存</p>"
                      "<p class=\"note\">凭据已写入设备持久存储。"
-                     "切换回普通 Wi-Fi 模式由应用完成，此热点可能随之断开。"
-                     "</p>"
-                     VP_PAGE_TAIL,
+                      "当前仍处于配网热点模式，可继续修改配置。"
+                      "</p>"
+                      "<a class=\"button\" href=\"/\">返回配网输入主界面</a>"
+                      VP_PAGE_TAIL,
                      escaped, open_network ? "开放网络" : "有密码",
                      (unsigned)generation);
 
@@ -521,7 +549,7 @@ size_t vp_http_status_page(char *buf, size_t buflen, int status,
                            const char *message)
 {
   char escaped[256];
-  char body[1024];
+  char body[VP_HTTP_BODY_BUILD];
   int bodylen;
 
   if (buf == NULL)

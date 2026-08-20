@@ -71,9 +71,9 @@ bool bk7258_lcd_spi_write_data(int bus, const uint8_t *data, uint32_t len);
 bool bk7258_lcd_spi_write_cmd_data(int bus, uint8_t cmd,
                                    const uint8_t *data, uint32_t len);
 
-/* Streams one full frame to the panel: RAMWR with DC low, then the pixel
- * bytes through that controller's memory-mapped data window with CS held
- * low for the whole burst.  'len' must be a non-zero multiple of 4.  The
+/* Streams packed RGB565 pixels to the panel: RAMWR with DC low, then the
+ * pixel bytes through that controller's memory-mapped data window with CS
+ * held low for the whole burst. 'len' must be a non-zero multiple of 4. The
  * caller is responsible for having set the drawing window (CASET/RASET)
  * first.
  */

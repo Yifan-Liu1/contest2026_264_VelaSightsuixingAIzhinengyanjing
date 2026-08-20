@@ -226,8 +226,21 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
 
       if (key == VS_KEY_CONFIRM || key == VS_KEY_BACK)
         {
-          uint8_t progress = (uint8_t)(held * 100u /
-                                      CONFIG_VS_LONG_PRESS_MS);
+          uint32_t progress_ms;
+          uint32_t progress_range;
+          uint8_t progress;
+
+          if (held <= CONFIG_VS_SHORT_PRESS_MAX_MS)
+            {
+              continue;
+            }
+
+          progress_ms = held - CONFIG_VS_SHORT_PRESS_MAX_MS;
+          progress_range = CONFIG_VS_LONG_PRESS_MS >
+                           CONFIG_VS_SHORT_PRESS_MAX_MS ?
+                           CONFIG_VS_LONG_PRESS_MS -
+                           CONFIG_VS_SHORT_PRESS_MAX_MS : 1;
+          progress = (uint8_t)(progress_ms * 100u / progress_range);
 
           progress = (uint8_t)(progress / 4u * 4u);
           if (progress != state->last_progress)

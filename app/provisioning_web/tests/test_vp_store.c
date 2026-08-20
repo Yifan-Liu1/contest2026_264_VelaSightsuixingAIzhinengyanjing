@@ -37,6 +37,7 @@ static void fill(struct velasight_prov_credentials_s *cred,
   memset(cred, 0, sizeof(*cred));
   snprintf(cred->ssid, sizeof(cred->ssid), "%s", ssid);
   snprintf(cred->password, sizeof(cred->password), "%s", psk);
+  snprintf(cred->api_key, sizeof(cred->api_key), "%s", "tp-test-key");
   cred->generation   = generation;
   cred->open_network = cred->password[0] == '\0';
 }
@@ -69,7 +70,8 @@ static void test_record_roundtrip(void)
   memset(&out, 0xff, sizeof(out));
   CHECK(vp_record_decode(buf, sizeof(buf), &out) == 0 &&
         strcmp(out.ssid, "AIPC") == 0 &&
-        strcmp(out.password, "passphrase") == 0 &&
+         strcmp(out.password, "passphrase") == 0 &&
+         strcmp(out.api_key, "tp-test-key") == 0 &&
         out.generation == 7 && !out.open_network,
         "decode returns what encode was given");
 
@@ -111,10 +113,10 @@ static void test_record_corruption(void)
         "a flipped SSID byte fails the CRC");
   buf[14] ^= 0x01;
 
-  buf[113] ^= 0x80;
+  buf[VP_RECORD_SIZE - 1] ^= 0x80;
   CHECK(vp_record_decode(buf, sizeof(buf), &out) == -EBADMSG,
         "a flipped CRC byte is caught");
-  buf[113] ^= 0x80;
+  buf[VP_RECORD_SIZE - 1] ^= 0x80;
 
   CHECK(vp_record_decode(buf, sizeof(buf), &out) == 0,
         "the record is intact again after undoing the flips");
@@ -124,16 +126,16 @@ static void test_record_corruption(void)
    */
 
   buf[13] = 4;
-  buf[110] = 0;
-  buf[111] = 0;
-  buf[112] = 0;
-  buf[113] = 0;
+  buf[VP_RECORD_SIZE - 4] = 0;
+  buf[VP_RECORD_SIZE - 3] = 0;
+  buf[VP_RECORD_SIZE - 2] = 0;
+  buf[VP_RECORD_SIZE - 1] = 0;
   {
     uint32_t crc = vp_crc32(buf, VP_RECORD_SIZE - 4);
-    buf[110] = (uint8_t)(crc & 0xff);
-    buf[111] = (uint8_t)((crc >> 8) & 0xff);
-    buf[112] = (uint8_t)((crc >> 16) & 0xff);
-    buf[113] = (uint8_t)((crc >> 24) & 0xff);
+    buf[VP_RECORD_SIZE - 4] = (uint8_t)(crc & 0xff);
+    buf[VP_RECORD_SIZE - 3] = (uint8_t)((crc >> 8) & 0xff);
+    buf[VP_RECORD_SIZE - 2] = (uint8_t)((crc >> 16) & 0xff);
+    buf[VP_RECORD_SIZE - 1] = (uint8_t)((crc >> 24) & 0xff);
   }
 
   CHECK(vp_record_decode(buf, sizeof(buf), &out) == -EBADMSG,
@@ -142,13 +144,13 @@ static void test_record_corruption(void)
   fill(&in, "AIPC", "passphrase", 3);
   CHECK(vp_record_encode(buf, sizeof(buf), &in) == VP_RECORD_SIZE,
         "re-encode for the reserved byte case");
-  buf[109] = 1;
+  buf[VP_RECORD_SIZE - 5] = 1;
   {
     uint32_t crc = vp_crc32(buf, VP_RECORD_SIZE - 4);
-    buf[110] = (uint8_t)(crc & 0xff);
-    buf[111] = (uint8_t)((crc >> 8) & 0xff);
-    buf[112] = (uint8_t)((crc >> 16) & 0xff);
-    buf[113] = (uint8_t)((crc >> 24) & 0xff);
+    buf[VP_RECORD_SIZE - 4] = (uint8_t)(crc & 0xff);
+    buf[VP_RECORD_SIZE - 3] = (uint8_t)((crc >> 8) & 0xff);
+    buf[VP_RECORD_SIZE - 2] = (uint8_t)((crc >> 16) & 0xff);
+    buf[VP_RECORD_SIZE - 1] = (uint8_t)((crc >> 24) & 0xff);
   }
 
   CHECK(vp_record_decode(buf, sizeof(buf), &out) == -EBADMSG,
@@ -353,7 +355,7 @@ static void test_short_names(void)
   check_path_83(CONFIG_VELASIGHT_PROVISION_STORE,
                 "the default store path fits 8.3 on every component");
 
-  ret = vp_store_temp_path("/mnt/sdnand/prov/wifi.bin", tmp, sizeof(tmp));
+  ret = vp_store_temp_path("/mnt/sdnand/prov/vela.cfg", tmp, sizeof(tmp));
   CHECK(ret == 0, "a temp path is derived");
   CHECK(strcmp(tmp, "/mnt/sdnand/prov/vpsave.tmp") == 0,
         "the temp file is a fixed 8.3 name beside the record");
@@ -363,7 +365,7 @@ static void test_short_names(void)
   CHECK(ret == 0 && strcmp(tmp, "vpsave.tmp") == 0,
         "a bare filename gets a bare temp name");
 
-  CHECK(vp_store_temp_path("/mnt/sdnand/prov/wifi.bin", tmp, 8) == -E2BIG,
+  CHECK(vp_store_temp_path("/mnt/sdnand/prov/vela.cfg", tmp, 8) == -E2BIG,
         "a short buffer is refused");
 }
 

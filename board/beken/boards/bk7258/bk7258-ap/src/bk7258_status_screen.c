@@ -19,9 +19,9 @@
  *
  * What it draws
  * -------------
- *   left panel  (fb0): the state -- one word plus a state colour, so the
+ *   physical right panel (fb0): the state -- one word plus a state colour, so the
  *                      state is readable across the room.
- *   right panel (fb1): up to two lines of summary text.
+ *   physical left panel (fb1): up to two lines of summary text.
  *
  * Text uses the stroke font this board already has (hello_font.c).  That font
  * covers ASCII only, so Chinese summaries -- which is what the cloud actually

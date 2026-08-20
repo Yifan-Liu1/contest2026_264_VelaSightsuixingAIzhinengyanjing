@@ -19,21 +19,21 @@ static void on_saved(int status, uint32_t generation, void *arg)
       return;
     }
 
-  /* 页面已经发完、连接已经关闭，这里可以安全地切回 STA */
+  /* 页面已经发完、连接已经关闭。可以继续保持 SoftAP，也可以按产品
+   * 状态在这里请求切回 STA。 */
   struct velasight_prov_credentials_s cred;
 
   if (velasight_provisioning_load(&cred) == 0)
     {
       /* cred.ssid / cred.password / cred.open_network */
-      velasight_provisioning_stop();   /* 从回调里调用是安全的 */
-      /* 这里做你自己的 STA 切换与关联 */
+      /* 这里不必停止服务；用户可以返回表单继续提交。 */
     }
 }
 
 struct velasight_prov_config_s cfg =
 {
   .port       = 0,          /* 0 → 80 */
-  .one_shot   = false,      /* true = 成功保存一次后自动停止 */
+   .one_shot   = false,      /* false = 保存后继续提供配网页面 */
   .store_path = NULL,       /* NULL → CONFIG_VELASIGHT_PROVISION_STORE */
   .on_saved   = on_saved,
   .cb_arg     = NULL,
@@ -77,7 +77,7 @@ dhcpd_start wlan0            # 板子成为 192.168.10.1
 ```sh
 provision_web run            # 前台运行，Ctrl-C 停止
 provision_web run 8080       # 换端口
-provision_web run --one-shot # 成功保存一次后返回
+  provision_web run --one-shot # 测试用：成功保存一次后返回
 ```
 
 手机连上 `VelaSight_AP` 后浏览器打开 `http://192.168.10.1/`，填 SSID 和密码提交。
@@ -122,7 +122,7 @@ renew wlan0
 | 其他方法 | 405 |
 | 其他路径 | 404 |
 | 缺 `Content-Length` | 411 |
-| body > 512 字节 | 413 |
+| body > 1024 字节 | 413 |
 | 非表单 Content-Type | 415 |
 | 请求头 > 2048 字节 | 431 |
 | `Transfer-Encoding: chunked` | 400 |
@@ -135,7 +135,8 @@ SSID；**密码永不回显、永不进日志**。
 
 ## NAND 记录
 
-默认 `/mnt/sdnand/prov/wifi.bin`，固定 114 字节，小端：
+默认 `/mnt/sdnand/prov/vela.cfg`，固定 626 字节，小端。该文件是配网网页的唯一配置源：
+Wi-Fi 名称、Wi-Fi 密码和 MiMo API key 全部在此文件中读写。KVDB 是废弃功能，产品链路不使用。
 
 | 偏移 | 长度 | 字段 |
 |---|---|---|

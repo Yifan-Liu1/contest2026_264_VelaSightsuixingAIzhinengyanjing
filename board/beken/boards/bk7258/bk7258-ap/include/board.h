@@ -7,6 +7,8 @@
 
 #include <nuttx/config.h>
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define BOARD_NAME "bk7258-ap"
@@ -42,5 +44,16 @@ uint32_t board_button_initialize(void);
 void board_autoled_on(int led);
 void board_autoled_off(int led);
 void bk7258_led_initialize(void);
+
+#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+int bk7258_wifi_wait_ready(void);
+void bk7258_display_reveal(void);
+bool bk7258_ai_config_ready(void);
+void bk7258_nand_seed_agent_config(void);
+#endif
+
+#ifdef CONFIG_BK7258_SDIO
+int bk7258_mmcsd_status(bool *mounted, char *source, size_t source_len);
+#endif
 
 #endif

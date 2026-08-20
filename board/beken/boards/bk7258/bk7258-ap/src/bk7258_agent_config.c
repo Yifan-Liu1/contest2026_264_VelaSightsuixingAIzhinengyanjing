@@ -1,7 +1,8 @@
 /****************************************************************************
  * board/beken/boards/bk7258/bk7258-ap/src/bk7258_agent_config.c
  *
- * Hand the API key and endpoint stored in flash to ai_agent, by writing the
+ * Hand the API key stored in the unified SD-NAND provisioning file to ai_agent,
+ * by writing the
  * config file it already reads at start-up.
  *
  * Why it is done this way
@@ -38,7 +39,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include "bk7258_kvdb.h"
+#include "velasight_provisioning.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -66,23 +67,23 @@
  * Public Functions
  ****************************************************************************/
 
-void bk7258_kvdb_seed_agent_config(void)
+void bk7258_nand_seed_agent_config(void)
 {
-  char key[513];
+  struct velasight_prov_credentials_s credentials;
   char host[128];
   char model[64];
   FILE *f;
 
-  if (bk7258_kvdb_get(BK7258_KVDB_KEY_LLM_KEY, key, sizeof(key)) <= 0 ||
-      bk7258_kvdb_get(BK7258_KVDB_KEY_LLM_HOST, host, sizeof(host)) <= 0)
+  if (velasight_provisioning_load(&credentials) < 0 ||
+      credentials.api_key[0] == '\0')
     {
       return;
     }
 
-  if (bk7258_kvdb_get(BK7258_KVDB_KEY_LLM_MODEL, model, sizeof(model)) <= 0)
-    {
-      strlcpy(model, AGENT_DEFAULT_MODEL, sizeof(model));
-    }
+  snprintf(host, sizeof(host), "%s",
+           strncmp(credentials.api_key, "tp-", 3) == 0 ?
+           "token-plan-cn.xiaomimimo.com" : "api.xiaomimimo.com");
+  snprintf(model, sizeof(model), "%s", AGENT_DEFAULT_MODEL);
 
   /* mkdir the tree.  The agent does this itself as well, but it does it when
    * it starts, which is after this runs.
@@ -107,7 +108,7 @@ void bk7258_kvdb_seed_agent_config(void)
    */
 
   fprintf(f,
-          "{\"llm_router_profile\":\"kvdb\","
+          "{\"llm_router_profile\":\"auto\","
           "\"llm_backend_0\":\""
           "{\\\"host\\\":\\\"%s\\\","
           "\\\"path\\\":\\\"%s\\\","
@@ -116,10 +117,20 @@ void bk7258_kvdb_seed_agent_config(void)
           "\\\"model\\\":\\\"%s\\\","
           "\\\"priority\\\":0,"
           "\\\"cost_tier\\\":1}\"}",
-          host, AGENT_DEFAULT_PATH, AGENT_DEFAULT_PORT, key, model);
+           host, AGENT_DEFAULT_PATH, AGENT_DEFAULT_PORT,
+           credentials.api_key, model);
 
   fclose(f);
 
-  printf("kvdb: ai_agent configured from flash (host=%s model=%s, "
-         "key %zu bytes)\n", host, model, strlen(key));
+  printf("nand: ai_agent configured from %s (host=%s model=%s, key %zu bytes)\n",
+         CONFIG_VELASIGHT_PROVISION_STORE, host, model,
+         strlen(credentials.api_key));
+}
+
+bool bk7258_ai_config_ready(void)
+{
+  struct velasight_prov_credentials_s credentials;
+
+  return velasight_provisioning_load(&credentials) == 0 &&
+         credentials.api_key[0] != '\0';
 }

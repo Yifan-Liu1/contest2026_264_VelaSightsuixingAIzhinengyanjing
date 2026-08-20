@@ -11,6 +11,7 @@
 #include <nuttx/board.h>
 #include <nuttx/kthread.h>
 #include <nuttx/fs/fs.h>
+#include <nuttx/semaphore.h>
 #include <nuttx/video/fb.h>
 
 #include <arch/board/board.h>
@@ -22,7 +23,6 @@
 #include "bk7258_gc9d01_fb.h"
 #include "hardware/bk7258_mbox.h"
 #include "bk7258_wifi.h"
-#include "bk7258_kvdb.h"
 #include "bk7258_status_screen.h"
 #include "bk7258_net_autostart.h"
 
@@ -30,6 +30,32 @@ int weak_function velasight_autostart(void)
 {
   return -ENOSYS;
 }
+
+#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+static sem_t g_velasight_wifi_ready = SEM_INITIALIZER(0);
+static int g_velasight_wifi_result = -EINPROGRESS;
+static bool g_velasight_display_revealed;
+
+int bk7258_wifi_wait_ready(void)
+{
+  int ret = nxsem_wait_uninterruptible(&g_velasight_wifi_ready);
+
+  if (ret < 0)
+    return ret;
+
+  return g_velasight_wifi_result;
+}
+
+void bk7258_display_reveal(void)
+{
+  if (!g_velasight_display_revealed)
+    {
+      bk7258_gc9d01_backlight(true);
+      g_velasight_display_revealed = true;
+      printf("velasight: LVGL first frames ready, backlight on\n");
+    }
+}
+#endif
 
 #ifdef CONFIG_BK7258_TRNG
 #  include "bk7258_trng.h"
@@ -180,7 +206,8 @@ int bk7258_bringup(void)
              ret);
     }
 #endif
-#ifdef CONFIG_BK7258_WIFI
+#if defined(CONFIG_BK7258_WIFI) && \
+    !defined(CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT)
   ret = bk7258_wifi_initialize();
   if (ret < 0)
     {
@@ -239,7 +266,7 @@ int bk7258_bringup(void)
 }
 
 /****************************************************************************
- * Name: kvdb_loader
+ * Name: nand_config_loader
  *
  * Description:
  *   Injects the stored LLM settings into the agent's config file and joins
@@ -252,40 +279,39 @@ int bk7258_bringup(void)
  *
  *   The store is memory-only, so on a cold boot there is nothing to inject
  *   and nothing to join; both calls are no-ops until something is set with
- *   `kvdb set`.
+   *   the provisioning web page.
  *
  ****************************************************************************/
 
-static int kvdb_loader(int argc, FAR char *argv[])
+#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+static int nand_config_loader(int argc, FAR char *argv[])
 {
   UNUSED(argc);
   UNUSED(argv);
 
-  /* Seed regardless: bk7258_kvdb_load() only ever reports "memory only" now,
-   * and a value typed during this boot is just as good as a stored one.
-   * bk7258_kvdb_seed_agent_config() returns without writing when the keys
-   * are not there.
-   */
-
-  (void)bk7258_kvdb_load();
-  bk7258_kvdb_seed_agent_config();
+  /* The provisioning file is the sole product configuration source.  KVDB is
+   * deprecated and intentionally not initialized or read here. */
+  bk7258_nand_seed_agent_config();
 
 #ifdef CONFIG_BK7258_WIFI
+#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
   /* Whether or not the load worked: credentials typed during this boot are
    * just as usable as credentials read back from flash.
    *
    * Association, DHCP and the console service, in that order and from this
    * task -- see bk7258_net_autostart().  It replaced a bare
-   * bk7258_kvdb_apply_wifi() call here: associating without asking for an
+    * old key-value apply call here: associating without asking for an
    * address left the interface RUNNING at NuttX's default 10.0.0.2, which
    * looks configured and routes nowhere.
    */
 
   bk7258_net_autostart();
 #endif
+#endif
 
   return 0;
 }
+#endif
 
 /****************************************************************************
  * Name: bk7258_report_cache
@@ -397,7 +423,7 @@ void board_late_initialize(void)
         printf("fb: /dev/fb%d registered\n", display);
       }
 
-    /* Boot greeting, written out rather than simply appearing.
+    /* Non-product boot greeting, written out rather than simply appearing.
      *
      * The panel has no readable ID register, so "the init sequence was sent"
      * has never been evidence that it worked; something has to be drawn at
@@ -418,11 +444,60 @@ void board_late_initialize(void)
      * posix_spawn(), so bring-up has no way to start it.
      */
 
+#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
     if (registered != 0)
       {
         (void)bk7258_gc9d01_fb_hello_animate(registered, 8);
       }
+#else
+    /* Keep the backlight dark until both panel GRAMs contain a known frame.
+     * This reuses the same full-frame fill and push path that the historical
+     * greeting animation used before drawing its first stroke.  LVGL starts
+     * only after this temporary black frame is visible and then owns every
+     * subsequent update. */
+
+    for (display = 0; display < GC9D01_NDISPLAYS; display++)
+      {
+        if ((registered & (1 << display)) != 0)
+          {
+            ret = bk7258_gc9d01_fb_fill(display, 0x0000u);
+            if (ret < 0)
+              {
+                printf("gc9d01_fb[%d]: boot black fill failed: %d\n",
+                       display, ret);
+              }
+          }
+      }
+
+    if (registered == (1 << GC9D01_NDISPLAYS) - 1)
+      {
+        ret = velasight_autostart();
+        if (ret < 0)
+          {
+            printf("velasight autostart failed: %d\n", ret);
+          }
+      }
+    else
+      {
+        printf("velasight not started: both framebuffers are required\n");
+      }
+#endif
   }
+#endif
+
+#if defined(CONFIG_BK7258_WIFI) && \
+    defined(CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT)
+  /* VelaSight has already submitted its first LVGL frame.  Network setup is
+   * deliberately later so Wi-Fi cannot delay or suppress display ownership.
+   */
+
+  ret = bk7258_wifi_initialize();
+  g_velasight_wifi_result = ret;
+  nxsem_post(&g_velasight_wifi_ready);
+  if (ret < 0)
+    {
+      printf("Wi-Fi initialization failed, error=%d; UI remains active\n", ret);
+    }
 #endif
 
   /* GC2145 camera: registered as a standard V4L2 /dev/video0 node here
@@ -467,19 +542,15 @@ void board_late_initialize(void)
    * reset, which is what it did before this existed.
    */
 
-  /* In-memory store now; the flash side is done by kvdb_loader below.
-   * Nothing here may block on the CP -- see bk7258_kvdb_init().
-   */
-
-  (void)bk7258_kvdb_init();
-
   /* Leave the panels showing the product's own idle state rather than the
    * boot greeting.  From here on the screen is event driven: it is repainted
    * when a state or a result changes and at no other time, which is what the
    * spec requires ("屏幕仅事件触发刷新，不运行实时 Camera Preview").
    */
 
+#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
   (void)bk7258_status_screen_state(BK7258_STATUS_IDLE);
+#endif
 
 #ifdef CONFIG_BK7258_BLUETOOTH
   /* Last, so that nothing a user can see waits on the radio.  See
@@ -489,20 +560,14 @@ void board_late_initialize(void)
   bk7258_bt_bringup();
 #endif
 
-  /* Last, and detached: see kvdb_loader(). */
+  /* Legacy non-product configurations may still use the old network startup. */
 
-  if (kthread_create("kvdb_loader", SCHED_PRIORITY_DEFAULT, 3072,
-                     kvdb_loader, NULL) < 0)
+#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+  if (kthread_create("nand_cfg", SCHED_PRIORITY_DEFAULT, 3072,
+                     nand_config_loader, NULL) < 0)
     {
-      printf("bk7258_bringup: kvdb_loader not started; settings will not "
+      printf("bk7258_bringup: nand config loader not started; settings will not "
              "survive a reset\n");
-    }
-#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
-  /* The greeting is synchronous.  Start the app after board initialization. */
-  ret = velasight_autostart();
-  if (ret < 0)
-    {
-      printf("velasight autostart failed: %d\n", ret);
     }
 #endif
 }

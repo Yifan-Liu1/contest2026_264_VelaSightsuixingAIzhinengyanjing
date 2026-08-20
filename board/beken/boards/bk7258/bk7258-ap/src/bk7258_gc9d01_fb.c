@@ -235,20 +235,12 @@ static int gc9d01_push(FAR struct gc9d01_fb_s *priv)
 static int gc9d01_updatearea(FAR struct fb_vtable_s *vtable,
                              FAR const struct fb_area_s *area)
 {
-  /* Partial updates would need a per-row copy out of the framebuffer,
-   * because the panel expects a densely packed rectangle while the
-   * framebuffer rows are GC9D01_STRIDE apart.  At 51200 bytes a full frame
-   * is cheap enough that this always pushes everything and ignores the
-   * requested rectangle.
-   */
-
-  UNUSED(area);
-
   if (vtable == NULL)
     {
       return -EINVAL;
     }
 
+  UNUSED(area);
   return gc9d01_push(gc9d01_from_vtable(vtable));
 }
 #endif

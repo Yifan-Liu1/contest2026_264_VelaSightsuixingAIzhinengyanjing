@@ -21,7 +21,7 @@
  */
 
 #define VP_HTTP_MAX_HEADERS 2048
-#define VP_HTTP_MAX_BODY    512
+#define VP_HTTP_MAX_BODY    1024
 
 /* Enough for the form page plus the largest status page. */
 
@@ -81,6 +81,10 @@ int vp_html_escape(const char *in, char *out, size_t outlen);
  */
 
 size_t vp_http_form_page(char *buf, size_t buflen, const char *notice);
+
+size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
+                                   const char *notice,
+                                   const char *current_ssid);
 
 size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
                           uint32_t generation, bool open_network);

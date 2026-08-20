@@ -4,8 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define VS_TEXT_SHORT 32
-#define VS_TEXT_LONG  96
+#define VS_TEXT_SHORT 40
+#define VS_TEXT_LONG  128
 
 enum vs_key_e
 {
@@ -36,14 +36,23 @@ struct vs_input_event_s
 
 enum vs_page_e
 {
-  VS_PAGE_HISTORY = 0,
+  VS_PAGE_PREPARING = 0,
+  VS_PAGE_HISTORY,
+  VS_PAGE_HISTORY_BLANK,
   VS_PAGE_SOCIAL_ENTER,
+  VS_PAGE_SOCIAL_STARTING,
   VS_PAGE_SOCIAL_RUNNING,
+  VS_PAGE_SOCIAL_ALERT,
+  VS_PAGE_SOCIAL_PAUSING,
   VS_PAGE_SOCIAL_PAUSED,
+  VS_PAGE_SOCIAL_RESUMING,
   VS_PAGE_SOCIAL_EXITING,
+  VS_PAGE_SOCIAL_FINALIZING,
+  VS_PAGE_SOCIAL_RESULT,
   VS_PAGE_VOICE_LISTENING,
   VS_PAGE_VOICE_THINKING,
   VS_PAGE_VOICE_SPEAKING,
+  VS_PAGE_PHOTO_CAPTURE,
   VS_PAGE_NET_SWITCHING,
   VS_PAGE_SOFTAP,
   VS_PAGE_ERROR
@@ -78,7 +87,9 @@ struct vs_net_status_s
   enum vs_net_state_e state;
   int error;
   char ssid[33];
+  char password[64];
   char address[16];
+  char error_reason[VS_TEXT_SHORT];
 };
 
 struct vs_history_item_s
@@ -92,6 +103,29 @@ struct vs_history_item_s
   bool incomplete;
 };
 
+enum vs_emotion_e
+{
+  VS_EMOTION_NONE = 0,
+  VS_EMOTION_CALM,
+  VS_EMOTION_HAPPY,
+  VS_EMOTION_CONFUSED,
+  VS_EMOTION_TENSE
+};
+
+enum vs_progress_kind_e
+{
+  VS_PROGRESS_NONE = 0,
+  VS_PROGRESS_HOLD,
+  VS_PROGRESS_WAIT
+};
+
+struct vs_softkey_s
+{
+  bool visible;
+  bool highlighted;
+  char text[VS_TEXT_SHORT];
+};
+
 struct vs_ui_snapshot_s
 {
   enum vs_page_e page;
@@ -101,10 +135,25 @@ struct vs_ui_snapshot_s
   uint8_t history_index;
   uint8_t history_count;
   uint8_t progress;
-  bool network_target_ap;
-  bool show_progress;
-  char primary[VS_TEXT_SHORT];
-  char secondary[VS_TEXT_LONG];
+  enum vs_progress_kind_e progress_kind;
+  enum vs_emotion_e emotion;
+  uint32_t emotion_color;
+  bool history_is_blank;
+  bool photo_context;
+  bool error_retryable;
+  bool wifi_ready;
+  bool battery_present;
+  bool api_ready;
+  char error_reason[VS_TEXT_LONG];
+  bool response_active;
+  enum vs_key_e response_key;
+  struct vs_softkey_s softkey[VS_KEY_COUNT];
+  char content_title[VS_TEXT_SHORT];
+  char content_body[VS_TEXT_LONG];
+  char content_meta[VS_TEXT_SHORT];
+  char status_title[VS_TEXT_SHORT];
+  char status_value[VS_TEXT_SHORT];
+  char status_meta[VS_TEXT_SHORT];
 };
 
 #endif

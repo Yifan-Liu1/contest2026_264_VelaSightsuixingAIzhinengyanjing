@@ -30,18 +30,19 @@ extern "C"
 #define VELASIGHT_PROV_SSID_MAX 32
 #define VELASIGHT_PROV_PSK_MIN  8
 #define VELASIGHT_PROV_PSK_MAX  63
+#define VELASIGHT_PROV_API_KEY_MAX 512
 
 /* Where the record lives when the caller passes no path.  On SD-NAND, so it
  * survives a reset; /mnt itself is pseudo-filesystem and /mnt/ram is a PSRAM
  * ramdisk, neither of which would.
  *
  * Every component fits 8.3 because that SD-NAND is VFAT without long-name
- * support (CONFIG_FAT_LFN is not set): a "velasight" directory or a
- * "wifi-provision.bin" file is rejected outright with -EINVAL.
+ * support (CONFIG_FAT_LFN is not set). This single file contains Wi-Fi
+ * credentials and the MiMo API key; deprecated KVDB is not used.
  */
 
 #ifndef CONFIG_VELASIGHT_PROVISION_STORE
-#  define CONFIG_VELASIGHT_PROVISION_STORE "/mnt/sdnand/prov/wifi.bin"
+#  define CONFIG_VELASIGHT_PROVISION_STORE "/mnt/sdnand/prov/vela.cfg"
 #endif
 
 #ifndef CONFIG_VELASIGHT_PROVISION_PORT
@@ -52,13 +53,15 @@ struct velasight_prov_credentials_s
 {
   char     ssid[VELASIGHT_PROV_SSID_MAX + 1];
   char     password[VELASIGHT_PROV_PSK_MAX + 1];
+  char     api_key[VELASIGHT_PROV_API_KEY_MAX + 1];
   uint32_t generation;   /* Monotonic save counter, first save is 1 */
   bool     open_network; /* Password is empty */
 };
 
 /* Called after the success page has been written and the connection closed,
- * never before: the application is expected to leave SoftAP from here, and
- * doing that mid-response is what makes a phone show "submit failed" for a
+ * never before.  The application may leave SoftAP from here, but keeping the
+ * listener alive is also valid and lets the user submit another record. Doing
+ * radio work mid-response is what makes a phone show "submit failed" for a
  * save that actually happened.
  *
  * status is 0 on success or a negative errno.  Credentials are deliberately
@@ -67,7 +70,7 @@ struct velasight_prov_credentials_s
  */
 
 typedef void (*velasight_prov_saved_cb_t)(int status, uint32_t generation,
-                                          void *arg);
+                                           void *arg);
 
 struct velasight_prov_config_s
 {

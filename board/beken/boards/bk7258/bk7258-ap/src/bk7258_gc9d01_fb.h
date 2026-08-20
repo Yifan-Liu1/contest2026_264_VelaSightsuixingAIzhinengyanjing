@@ -81,9 +81,10 @@ bool bk7258_gc9d01_window_full(int display);
 void bk7258_gc9d01_backlight(bool on);
 
 /* Bring-up helpers: fill one display's framebuffer with a solid colour, or
- * draw a four-quadrant test pattern, and push it.  These exist because
- * GC9D01 has no readable ID register -- until something is visible on the
- * glass there is no evidence the init sequence took effect.
+ * draw a four-quadrant test pattern, and push it.  VelaSight uses a black
+ * fill before enabling the shared backlight, then hands all updates to LVGL.
+ * These also exist because GC9D01 has no readable ID register -- until
+ * something is pushed there is no evidence the init sequence took effect.
  */
 
 int bk7258_gc9d01_fb_fill(int display, uint16_t rgb565);

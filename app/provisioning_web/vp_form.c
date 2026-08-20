@@ -15,7 +15,7 @@
  * on length, instead of arriving truncated to something legal.
  */
 
-#define VP_FORM_VALUE_MAX 128
+#define VP_FORM_VALUE_MAX 640
 #define VP_FORM_NAME_MAX  32
 
 static int vp_hexval(char c)
@@ -144,10 +144,21 @@ int vp_credentials_validate(
 {
   size_t len;
   size_t i;
+  size_t api_len;
 
   if (cred == NULL)
     {
       return -EINVAL;
+    }
+
+  api_len = vp_strnlen(cred->api_key, sizeof(cred->api_key));
+  if (api_len > VELASIGHT_PROV_API_KEY_MAX)
+    return -EINVAL;
+  for (i = 0; i < api_len; i++)
+    {
+      if ((unsigned char)cred->api_key[i] < 0x20 ||
+          (unsigned char)cred->api_key[i] > 0x7e)
+        return -EINVAL;
     }
 
   len = vp_strnlen(cred->ssid, sizeof(cred->ssid));
@@ -203,6 +214,7 @@ int vp_form_parse(const char *body, size_t bodylen,
   unsigned nfields = 0;
   bool have_ssid = false;
   bool have_psk = false;
+  bool have_api_key = false;
   size_t pos = 0;
 
   if (body == NULL || cred == NULL)
@@ -262,7 +274,8 @@ int vp_form_parse(const char *body, size_t bodylen,
           goto next;
         }
 
-      if (strcmp(name, "ssid") != 0 && strcmp(name, "password") != 0)
+      if (strcmp(name, "ssid") != 0 && strcmp(name, "password") != 0 &&
+          strcmp(name, "mimo_apikey") != 0)
         {
           goto next;
         }
@@ -289,7 +302,7 @@ int vp_form_parse(const char *body, size_t bodylen,
 
           memcpy(cred->ssid, value, (size_t)decoded + 1);
         }
-      else
+      else if (strcmp(name, "password") == 0)
         {
           if (have_psk)
             {
@@ -303,6 +316,14 @@ int vp_form_parse(const char *body, size_t bodylen,
             }
 
           memcpy(cred->password, value, (size_t)decoded + 1);
+        }
+      else
+        {
+          if (have_api_key || (size_t)decoded >= sizeof(cred->api_key))
+            return -EINVAL;
+
+          have_api_key = true;
+          memcpy(cred->api_key, value, (size_t)decoded + 1);
         }
 
 next:

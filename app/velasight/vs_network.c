@@ -1,6 +1,7 @@
 #include <nuttx/config.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -13,9 +14,12 @@
 #include <wireless/wapi.h>
 #include <nuttx/wireless/wireless.h>
 
+#include <arch/board/board.h>
+
 #include "velasight_provisioning.h"
 #include "include/vs_config.h"
 #include "include/vs_network.h"
+
 
 #define VS_DHCP_TRIES       3
 #define VS_DHCP_RETRY_MS    1500
@@ -48,8 +52,16 @@ static int vs_network_stop_dhcp(struct vs_network_s *network)
   return 0;
 }
 
-static int vs_network_failed(const char *step, int ret)
+static int vs_network_failed(struct vs_network_s *network,
+                             const char *step, int ret)
 {
+  if (network != NULL)
+    {
+      snprintf(network->status.error_reason,
+               sizeof(network->status.error_reason), "%s (%d)", step, ret);
+      network->status.error = ret;
+    }
+
   printf("velasight: network %s failed: %d\n", step, ret);
   return ret;
 }
@@ -70,6 +82,47 @@ static int vs_network_stop_provisioning(struct vs_network_s *network)
 
   return ret;
 }
+
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+static int vs_network_random_ap_password(char *password, size_t size)
+{
+  static const char alphabet[] =
+    "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  const size_t alphabet_len = sizeof(alphabet) - 1;
+  uint8_t byte;
+  size_t index = 0;
+  int fd;
+  ssize_t n;
+
+  if (password == NULL || size < 9)
+    return -EINVAL;
+
+  fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0)
+    return -errno;
+
+  while (index < 8)
+    {
+      n = read(fd, &byte, sizeof(byte));
+      if (n != (ssize_t)sizeof(byte))
+        {
+          int ret = n < 0 ? -errno : -EIO;
+          close(fd);
+          return ret;
+        }
+
+      /* Reject the incomplete final bucket to avoid modulo bias. */
+      if (byte >= (uint8_t)(256u - (256u % alphabet_len)))
+        continue;
+
+      password[index++] = alphabet[byte % alphabet_len];
+    }
+
+  password[8] = '\0';
+  close(fd);
+  return 0;
+}
+#endif
 
 static void vs_network_provision_saved(int status, uint32_t generation,
                                        void *arg)
@@ -111,6 +164,7 @@ static int vs_network_consume_saved(struct vs_network_s *network,
     return ret;
 
   network->config = config;
+  bk7258_nand_seed_agent_config();
   return 0;
 }
 
@@ -121,15 +175,17 @@ static int vs_network_apply_sta(struct vs_network_s *network)
   int ret;
 
   if (network->config.sta_ssid[0] == '\0')
-    return -EBADMSG;
+    return vs_network_failed(network, "STA配置", -EBADMSG);
 
   ret = wapi_set_ifdown(network->sock, "wlan0");
-  if (ret < 0 && ret != -ENODEV)
-    return vs_network_failed("STA ifdown", ret);
+  if (ret < 0 && ret != -ENODEV && ret != -ETIMEDOUT)
+    return vs_network_failed(network, "STA关闭接口", ret);
+  if (ret == -ETIMEDOUT)
+    printf("velasight: STA ifdown timed out; continuing interface reset\n");
 
   ret = wapi_set_ifup(network->sock, "wlan0");
   if (ret < 0)
-    return vs_network_failed("STA ifup", ret);
+     return vs_network_failed(network, "STA开启接口", ret);
 
   memset(&wifi, 0, sizeof(wifi));
   wifi.ifname = "wlan0";
@@ -148,7 +204,7 @@ static int vs_network_apply_sta(struct vs_network_s *network)
 
   ret = wpa_driver_wext_associate(&wifi);
   if (ret < 0)
-    return vs_network_failed("STA associate", ret);
+     return vs_network_failed(network, "STA连接", ret);
 
   ret = -ETIMEDOUT;
   for (attempt = 0; attempt < VS_DHCP_TRIES; attempt++)
@@ -168,7 +224,7 @@ static int vs_network_apply_sta(struct vs_network_s *network)
     }
 
   if (ret < 0)
-    return vs_network_failed("STA DHCP", ret);
+     return vs_network_failed(network, "STA获取地址", ret);
 
   network->mode = VS_NET_STA;
   network->status.mode = VS_NET_STA;
@@ -191,15 +247,24 @@ static int vs_network_apply_ap(struct vs_network_s *network)
 
   if (network->config.ap_channel < 1 || network->config.ap_channel > 14 ||
       network->config.ap_ssid[0] == '\0')
-    return -EINVAL;
+    return vs_network_failed(network, "AP配置", -EINVAL);
 
-  ret = wapi_set_ifdown(network->sock, "wlan0");
-  if (ret < 0 && ret != -ENODEV)
-    return vs_network_failed("AP ifdown", ret);
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+  ret = vs_network_random_ap_password(network->config.ap_password,
+                                      sizeof(network->config.ap_password));
+  if (ret < 0)
+    return vs_network_failed(network, "AP随机密码", ret);
+#endif
+
+   ret = wapi_set_ifdown(network->sock, "wlan0");
+   if (ret < 0 && ret != -ENODEV && ret != -ETIMEDOUT)
+     return vs_network_failed(network, "AP关闭接口", ret);
+   if (ret == -ETIMEDOUT)
+     printf("velasight: AP ifdown timed out; continuing cleanup\n");
 
   ret = wapi_set_ifup(network->sock, "wlan0");
   if (ret < 0)
-    return vs_network_failed("AP ifup", ret);
+    return vs_network_failed(network, "AP开启接口", ret);
 
   memset(&wifi, 0, sizeof(wifi));
   wifi.ifname = "wlan0";
@@ -220,7 +285,7 @@ static int vs_network_apply_ap(struct vs_network_s *network)
   ret = wpa_driver_wext_associate(&wifi);
   if (ret < 0)
     {
-      vs_network_failed("AP start", ret);
+       vs_network_failed(network, "AP启动", ret);
       goto fail;
     }
 
@@ -229,33 +294,33 @@ static int vs_network_apply_ap(struct vs_network_s *network)
   ret = netlib_set_ipv4addr("wlan0", &address);
   if (ret < 0)
     {
-      vs_network_failed("AP IPv4 address", ret);
+       vs_network_failed(network, "AP地址", ret);
       goto fail;
     }
 
   ret = netlib_set_ipv4netmask("wlan0", &netmask);
   if (ret < 0)
     {
-      vs_network_failed("AP netmask", ret);
+       vs_network_failed(network, "AP掩码", ret);
       goto fail;
     }
 
   ret = dhcpd_start("wlan0");
   if (ret < 0)
     {
-      vs_network_failed("AP DHCP server", ret);
+       vs_network_failed(network, "AP DHCP", ret);
       goto fail;
     }
 
   network->dhcp_running = true;
   memset(&provision, 0, sizeof(provision));
-  provision.one_shot = true;
+  provision.one_shot = false;
   provision.on_saved = vs_network_provision_saved;
   provision.cb_arg = network;
   ret = velasight_provisioning_start(&provision);
   if (ret < 0)
     {
-      vs_network_failed("AP provisioning server", ret);
+       vs_network_failed(network, "AP配网服务", ret);
       goto fail;
     }
 
@@ -333,6 +398,8 @@ int vs_network_request_mode(struct vs_network_s *network,
   if (network == NULL)
     return -EINVAL;
 
+  network->status.error = 0;
+  network->status.error_reason[0] = '\0';
   network->status.state = VS_NET_SWITCHING;
 
   if (network->mode == VS_NET_AP && mode == VS_NET_STA)
@@ -340,6 +407,9 @@ int vs_network_request_mode(struct vs_network_s *network,
       ret = vs_network_stop_provisioning(network);
       if (ret < 0)
         {
+          snprintf(network->status.error_reason,
+                   sizeof(network->status.error_reason),
+                   "AP provisioning stop (%d)", ret);
           network->status.state = VS_NET_ERROR;
           network->status.error = ret;
           return ret;
@@ -352,6 +422,9 @@ int vs_network_request_mode(struct vs_network_s *network,
       ret = vs_network_consume_saved(network, true);
       if (ret < 0 && ret != -ENOENT)
         {
+          snprintf(network->status.error_reason,
+                   sizeof(network->status.error_reason),
+                   "保存WiFi配置 (%d)", ret);
           network->status.state = VS_NET_ERROR;
           network->status.error = ret;
           return ret;
@@ -361,6 +434,8 @@ int vs_network_request_mode(struct vs_network_s *network,
   ret = vs_network_stop_dhcp(network);
   if (ret < 0)
     {
+      snprintf(network->status.error_reason,
+               sizeof(network->status.error_reason), "DHCP停止 (%d)", ret);
       network->status.state = VS_NET_ERROR;
       network->status.error = ret;
       return ret;
@@ -377,9 +452,13 @@ int vs_network_request_mode(struct vs_network_s *network,
 
   ret = mode == VS_NET_AP ? vs_network_apply_ap(network) :
                              vs_network_apply_sta(network);
-  if (ret < 0)
-    {
-      network->status.state = VS_NET_ERROR;
+    if (ret < 0)
+      {
+        if (network->status.error_reason[0] == '\0')
+          snprintf(network->status.error_reason,
+                   sizeof(network->status.error_reason),
+                   "网络切换 (%d)", ret);
+        network->status.state = VS_NET_ERROR;
       network->status.error = ret;
     }
 
@@ -404,8 +483,9 @@ int vs_network_process_events(struct vs_network_s *network)
       return ret;
     }
 
-  ret = vs_network_request_mode(network, VS_NET_STA);
-  return ret < 0 ? ret : 1;
+  /* Keep AP and the provisioning listener alive after a save.  The saved STA
+   * credentials are applied only when the user explicitly exits AP mode. */
+  return 0;
 }
 
 int vs_network_get_status(struct vs_network_s *network,

@@ -1,6 +1,10 @@
 /****************************************************************************
  * board/beken/chips/bk7258/include/bk7258_kvdb.h
  *
+ * DEPRECATED: legacy key-value configuration kept in the AP's own flash.
+ * VelaSight provisioning no longer reads or writes this store. Its unified
+ * configuration is stored in the SD-NAND vela.cfg file.
+ *
  * Key-value configuration that survives a reset, kept in the AP's own flash
  * partition.  See bk7258_kvdb.c for the layout and for why nothing here is
  * compiled into the image any more.

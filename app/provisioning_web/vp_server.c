@@ -228,7 +228,15 @@ static void vp_handle(int fd, bool *saved, int *save_status,
     }
   else if (req.action == VP_HTTP_ACTION_PAGE)
     {
-      len = vp_http_form_page(g_response, sizeof(g_response), NULL);
+       {
+         struct velasight_prov_credentials_s current;
+         const char *ssid = NULL;
+
+         if (velasight_provisioning_load(&current) == 0)
+           ssid = current.ssid;
+         len = vp_http_form_page_with_ssid(g_response, sizeof(g_response),
+                                           NULL, ssid);
+       }
     }
   else if (req.action == VP_HTTP_ACTION_REJECT)
     {
@@ -252,9 +260,17 @@ static void vp_handle(int fd, bool *saved, int *save_status,
            * repeating a passphrase back over an open network.
            */
 
-          len = vp_http_form_page(g_response, sizeof(g_response),
-                                  "SSID 需 1-32 字节，密码需留空或 8-63 字节，"
-                                  "请检查后重试。");
+           {
+             struct velasight_prov_credentials_s current;
+             const char *ssid = NULL;
+
+             if (velasight_provisioning_load(&current) == 0)
+               ssid = current.ssid;
+             len = vp_http_form_page_with_ssid(
+                 g_response, sizeof(g_response),
+                 "SSID 需 1-32 字节，密码需留空或 8-63 字节，"
+                 "API key 需为可打印字符，请检查后重试。", ssid);
+           }
           if (len > 0)
             {
               /* Reuse the form page body but answer 400, so a client that
@@ -266,9 +282,20 @@ static void vp_handle(int fd, bool *saved, int *save_status,
                                         "8-63 字节。");
             }
         }
-      else
-        {
-          cred.generation = vp_store_next_generation(g_server.store_path);
+        else
+          {
+            struct velasight_prov_credentials_s previous;
+
+            /* The API key field is intentionally never pre-filled in HTML.
+             * An ordinary Wi-Fi-only resubmit must not erase the existing key. */
+            if (cred.api_key[0] == '\0' &&
+                velasight_provisioning_load(&previous) == 0)
+              {
+                snprintf(cred.api_key, sizeof(cred.api_key), "%s",
+                         previous.api_key);
+              }
+
+            cred.generation = vp_store_next_generation(g_server.store_path);
           ret = vp_store_save(g_server.store_path, &cred);
           if (ret < 0)
             {
@@ -373,9 +400,9 @@ static void *vp_thread(void *arg)
       printf("provision_web: accepted client\n");
       vp_handle(fd, &saved, &save_status, &generation);
 
-      /* Close before notifying.  The application is expected to leave SoftAP
-       * from the callback, and doing that with the response still in flight is
-       * what makes a successful save look like a failed submit on the phone.
+       /* Close before notifying.  The application may leave SoftAP from the
+        * callback, and doing that with the response still in flight is what
+        * makes a successful save look like a failed submit on the phone.
        */
 
       shutdown(fd, SHUT_RDWR);

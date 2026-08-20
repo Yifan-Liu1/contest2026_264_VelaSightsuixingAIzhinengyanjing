@@ -21,8 +21,9 @@
 #define VP_OFF_PSK_LEN   13
 #define VP_OFF_SSID      14
 #define VP_OFF_PSK       46
-#define VP_OFF_RESERVED  109
-#define VP_OFF_CRC       110
+#define VP_OFF_API       109
+#define VP_OFF_RESERVED  621
+#define VP_OFF_CRC       622
 
 #define VP_STORE_PATH_MAX 192
 
@@ -92,6 +93,7 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
 {
   size_t ssid_len;
   size_t psk_len;
+  size_t api_len;
   int ret;
 
   if (buf == NULL || cred == NULL)
@@ -112,6 +114,7 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
 
   ssid_len = vp_len(cred->ssid, sizeof(cred->ssid));
   psk_len  = vp_len(cred->password, sizeof(cred->password));
+  api_len  = vp_len(cred->api_key, sizeof(cred->api_key));
 
   memset(buf, 0, VP_RECORD_SIZE);
   memcpy(buf + VP_OFF_MAGIC, VP_RECORD_MAGIC, 4);
@@ -123,6 +126,7 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
   buf[VP_OFF_PSK_LEN]  = (uint8_t)psk_len;
   memcpy(buf + VP_OFF_SSID, cred->ssid, ssid_len);
   memcpy(buf + VP_OFF_PSK, cred->password, psk_len);
+  memcpy(buf + VP_OFF_API, cred->api_key, api_len);
   vp_put32(buf + VP_OFF_CRC, vp_crc32(buf, VP_RECORD_SIZE - 4));
   return VP_RECORD_SIZE;
 }
@@ -149,6 +153,7 @@ int vp_record_decode(const uint8_t *buf, size_t len,
   struct velasight_prov_credentials_s parsed;
   size_t ssid_len;
   size_t psk_len;
+  size_t api_len;
   uint16_t flags;
 
   if (buf == NULL || cred == NULL)
@@ -180,6 +185,8 @@ int vp_record_decode(const uint8_t *buf, size_t len,
   flags    = vp_get16(buf + VP_OFF_FLAGS);
   ssid_len = buf[VP_OFF_SSID_LEN];
   psk_len  = buf[VP_OFF_PSK_LEN];
+  api_len  = vp_len((const char *)(buf + VP_OFF_API),
+                    VELASIGHT_PROV_API_KEY_MAX);
 
   if ((flags & ~(uint16_t)VP_RECORD_FLAG_OPEN) != 0)
     {
@@ -210,9 +217,17 @@ int vp_record_decode(const uint8_t *buf, size_t len,
       return -EBADMSG;
     }
 
+  if (api_len > VELASIGHT_PROV_API_KEY_MAX ||
+      !vp_padding_is_zero(buf, VP_OFF_API, api_len,
+                          VELASIGHT_PROV_API_KEY_MAX))
+    {
+      return -EBADMSG;
+    }
+
   memset(&parsed, 0, sizeof(parsed));
   memcpy(parsed.ssid, buf + VP_OFF_SSID, ssid_len);
   memcpy(parsed.password, buf + VP_OFF_PSK, psk_len);
+  memcpy(parsed.api_key, buf + VP_OFF_API, api_len);
   parsed.generation   = vp_get32(buf + VP_OFF_GEN);
   parsed.open_network = psk_len == 0;
 

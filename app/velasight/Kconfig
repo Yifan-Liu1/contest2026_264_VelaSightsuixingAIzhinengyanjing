@@ -3,9 +3,15 @@ config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	default n
 	depends on VIDEO_FB
 	depends on ARCH_BUTTONS
+	depends on NET_TCP && NET_TCPBACKLOG
+	depends on NET_IPv4 && NET_UDP && NETUTILS_DHCPC
+	depends on ARCH_CHIP_BK7258 && BK7258_WIFI
+	depends on BK7258_SDIO && BK7258_SDNAND_AUTOMOUNT && FS_FAT
 	select GRAPHICS_LVGL
 	select WIRELESS_WAPI
 	select NETUTILS_DHCPD
+	select SCHED_WAITPID
+	select LVX_USE_DEMO_CONTEST2026_264_PROVISION_WEB
 	---help---
 		First-stage VelaSight UI for the dual GC9D01 framebuffer panels.
 
@@ -38,6 +44,14 @@ config VS_COMBO_PRESS_MS
  default 2000
 	range 1000 10000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_AP_RANDOM_PASSWORD
+	bool "Generate a random eight-character AP password"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Generate a new eight-character alphanumeric password on every AP start.
+		Disabled by default while AP provisioning is in testing.
 
 config VS_STA_SSID
 	string "VelaSight development STA SSID"

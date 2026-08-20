@@ -364,6 +364,14 @@ int bk7258_gc9d01_panels_init(int displays)
       return (displays & ((1 << GC9D01_NDISPLAYS) - 1)) != 0 ? OK : -EINVAL;
     }
 
+#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+  /* Do not rely on the reset value of the shared backlight GPIO.  Force the
+   * glass dark before powering or resetting either controller; bring-up will
+   * enable it only after both panel GRAMs have received a black frame. */
+
+  bk7258_gc9d01_backlight(false);
+#endif
+
   /* Power first, and only once: the rail is shared, so take a reference on
    * behalf of the display subsystem as a whole rather than per panel.
    */
@@ -459,7 +467,7 @@ int bk7258_gc9d01_panels_init(int displays)
 
       g_panel_ready[display] = true;
 
-      printf("gc9d01[%d/%s]: init sequence sent, backlight on\n", display,
+      printf("gc9d01[%d/%s]: init sequence sent\n", display,
              g_panels[display].footprint);
     }
 
@@ -468,11 +476,14 @@ int bk7258_gc9d01_panels_init(int displays)
       return -EIO;
     }
 
-  /* Backlight is shared, so switching it on for one panel switches it on
-   * for both.  Harmless to repeat.
+#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+  /* Diagnostic configurations reveal the initialized panels immediately.
+   * VelaSight keeps the shared backlight off until both framebuffer memories
+   * have been pushed as black, so uninitialized panel GRAM is never visible.
    */
 
   bk7258_gc9d01_backlight(true);
+#endif
 
   return OK;
 }

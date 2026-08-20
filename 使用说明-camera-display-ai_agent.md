@@ -347,27 +347,20 @@ sha256sum cmake_out/bk7258-ap_ai_agent/nuttx.bin \
 `apply.sh` 实测幂等：重复执行报 `already applied`，`--revert` 报 `reverted`，再执行报
 `applied`。
 
-## 配置持久化：`kvdb`（2026-08-17）
+## 配置持久化：NAND 配网文件（KVDB 已废弃）
 
-密钥和 Wi-Fi 口令不再写进代码或编译期头文件，改由 `kvdb` 保管，并自动写成 ai_agent 启动时
-读的配置文件（`/mnt/sdnand/ai_agent/config/config.json` 的 `llm_backend_0` 槽），所以密钥不进镜像、
-也不进公共仓 `packages/ai_agent`。
+VelaSight 产品不使用 KVDB。配网网页一次提交 Wi-Fi 名称、Wi-Fi 密码和 MiMo API key，统一写入
+SD-NAND 文件 `/mnt/sdnand/prov/vela.cfg`。应用和 ai_agent 都从这一个文件读取，避免配置分裂。
+提交成功后，应用重新生成 ai_agent 的 `llm_backend_0` 配置；API key 不进入镜像，也不进入公共仓。
 
 ```bash
-kvdb                                  # 列出，.key/.psk 自动打码
-kvdb set llm.host token-plan-cn.xiaomimimo.com
-kvdb set llm.key  tp-xxxxxxxx
-kvdb set llm.model mimo-v2.5
-kvdb set wifi.ssid <2.4G SSID>
-kvdb set wifi.psk  <密码>
-kvdb get llm.key --raw                # 明文要显式要求
-kvdb del llm.key
-kvdb wifi                             # 立刻用存好的凭据关联（开机也会自动做）
+provision_web run --one-shot           # SoftAP 中打开网页完成配置
+provision_web show                     # 显示已存 Wi-Fi 名称，不显示密码和 API key
+provision_web path                     # 显示统一 NAND 文件路径
 ```
 
-**Wi-Fi 不用再手工配网。** `wifi.ssid`/`wifi.psk` 存进去之后，开机时 `kvdb_loader` 会自己
-`ifup wlan0` → 下发口令 → 关联（就是原来那两条 `wapi` 命令，走同样的 ioctl）。刚输完想立刻
-生效不必复位，跑一次 `kvdb wifi`。
+配网提交后，应用读取同一 `vela.cfg`，异步执行 STA 关联和 DHCP。未成功连接 Wi-Fi 时保持离线
+主页，不把普通连接失败显示为错误页面。
 
 **只有 IP 地址还需要一条命令**：DHCP 客户端在 apps 侧，内核侧取不到，所以关联之后仍要
 `renew wlan0`（首次可能失败一次，重试即可，见 `docs/WiFi使用说明.md`）。
@@ -376,23 +369,8 @@ kvdb wifi                             # 立刻用存好的凭据关联（开机�
 kvdb: associating with <SSID> (WPA2) -- run `renew wlan0` for an address
 ```
 
-**flash 后端状态**：`easyflash_ap` 分区，8KB @ 0x007FC000，由 `CONFIG_BK7258_KVDB_FLASH`
-控制。`nsh` 配置**已打开**，`ai_agent` 配置仍关闭，等 `nsh` 上板验证过再打开。本轮修掉了
-四处（payload CRC-32 变体与服务端不一致、写请求把 AP 堆指针交给 CP、共享窗口没有 MPU
-region、`MB_CHNL_FLASH` 通知通道没注册），细节见
-`docs/superpowers/plans/2026-08-14-vela-kvdb-persistent-config.md` 第 6 节。
-
-关掉时 `kvdb set` 会明确告知，开机日志也会说明当前模式：
-
-```
-kvdb: in-memory only (flash backend disabled)
-```
-
-打开且读到内容时是：
-
-```
-kvdb: 5 key(s) loaded from flash, 214 bytes used
-```
+旧 `kvdb` 命令和 AP flash KVDB 代码仅为历史/诊断兼容保留，不属于 VelaSight 配置链路，后续不应
+在产品代码中新增调用。
 
 ## 十、2026-08-17 复测：一处驱动缺陷已修，六处判据更新
 

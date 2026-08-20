@@ -159,8 +159,9 @@ static void test_pages(void)
   CHECK(strstr(buf, "Content-Length: ") != NULL,
         "the form page declares its length");
   CHECK(strstr(buf, "name=\"ssid\"") != NULL &&
-        strstr(buf, "name=\"password\"") != NULL,
-        "the form has both inputs");
+        strstr(buf, "name=\"password\"") != NULL &&
+        strstr(buf, "name=\"mimo_apikey\"") != NULL,
+        "the form has Wi-Fi and API inputs");
   CHECK(strstr(buf, "action=\"/save\"") != NULL &&
         strstr(buf, "method=\"post\"") != NULL,
         "the form posts to /save");
@@ -176,6 +177,9 @@ static void test_pages(void)
         strstr(buf, "HTTP/1.1 200 OK") != NULL,
         "the success page shows the SSID");
   CHECK(strstr(buf, "3") != NULL, "the success page shows the generation");
+  CHECK(strstr(buf, "href=\"/\"") != NULL &&
+        strstr(buf, "返回配网输入主界面") != NULL,
+        "the success page links back to the provisioning form");
 
   len = vp_http_saved_page(buf, sizeof(buf), "<script>", 1, true);
   CHECK(len > 0 && strstr(buf, "<script>") == NULL &&

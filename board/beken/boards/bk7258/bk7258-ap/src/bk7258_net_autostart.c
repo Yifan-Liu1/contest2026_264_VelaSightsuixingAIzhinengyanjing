@@ -133,7 +133,7 @@ static int net_spawn_builtin(FAR const char *name, FAR char * const *argv,
  *   Must be called from a task and never from bring-up: association blocks on
  *   the CP and DHCP blocks on the network, and an AP that stops servicing the
  *   mailbox loses the heartbeat, after which the CP's 8-second watchdog resets
- *   the chip.  That is the same constraint that made kvdb_loader a task, so
+ *   the chip.  That is the same constraint that makes the NAND config loader a task, so
  *   this is called from the end of it -- which also guarantees the credentials
  *   have already come back from flash.
  *
@@ -150,10 +150,12 @@ void bk7258_net_autostart(void)
    * not worth a scary message.
    */
 
-  ret = bk7258_kvdb_apply_wifi();
+   /* VelaSight uses vs_network.c and the unified vela.cfg record.  This legacy
+    * console autostart path is retained only for non-product configurations. */
+   ret = -ENOENT;
   if (ret == -ENOENT)
     {
-      printf("net: no wifi.ssid stored; run `kvdb set wifi.ssid ...`\n");
+      printf("net: no NAND Wi-Fi configuration stored\n");
       return;
     }
 

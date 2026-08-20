@@ -620,7 +620,7 @@ bool bk7258_lcd_spi_write_frame(int bus, const void *frame, size_t len)
              (unsigned int)b->frames,
              (unsigned int)getreg32(b->base + QSPI_OFF_CONFIG),
              (unsigned int)words, frame,
-             (unsigned int)(src[0] & 0xffff),
+              (unsigned int)(src[0] & 0xffff),
              (unsigned int)g_swap_bytes);
     }
 

@@ -14,5 +14,6 @@
 | `BK7258_OPENVELA_SDIO_PORTING_PLAN.md` | SDIO、SD-NAND、MMCSD 和 VFAT |
 | `BK7258_OPENVELA_MIMO_NETWORK_PORTING_PLAN.md` | MiMo 多模态云端网络与 TLS |
 | `VELASIGHT_MCU_APP_DEVELOPMENT_PLAN.md` | 三键双圆屏、历史记录、社交辅助和 STA/AP 的 MCU App 计划 |
+| `VELASIGHT_UI_DESIGN_INSTRUCTION.md` | 历史记录空白页、单张照片多模态问答、社交辅助、闲时助手与双屏软键 UI 设计规范 |
 CPU2 SMP 的独立历史方案已归档到 `docs/archive/`；当前 SMP 结论已并入 AP 总体
 方案和实际代码，不再维护第二份活跃方案。

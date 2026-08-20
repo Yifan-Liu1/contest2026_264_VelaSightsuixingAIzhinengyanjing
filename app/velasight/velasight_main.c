@@ -11,7 +11,7 @@ int main(int argc, FAR char *argv[])
 {
   (void)argc;
   (void)argv;
-  printf("velasight: starting after board display initialization\n");
+  printf("velasight: taking ownership of both displays\n");
   return vs_app_run();
 }
 

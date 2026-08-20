@@ -48,6 +48,8 @@ endif()
 target_sources(board PRIVATE ${SRCS})
 target_include_directories(board PRIVATE
   ${NUTTX_BOARD_ABS_DIR}/include
+  ${NUTTX_APPS_DIR}/packages/demos/contest2026_264_provision_web/include
+  ${NUTTX_APPS_DIR}/packages/demos/contest2026_264_provision_web/include
   ${NUTTX_CHIP_ABS_DIR}
   ${NUTTX_CHIP_ABS_DIR}/include
   ${NUTTX_CHIP_ABS_DIR}/hardware)
