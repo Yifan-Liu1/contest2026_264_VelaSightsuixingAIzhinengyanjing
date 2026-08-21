@@ -34,11 +34,17 @@ int weak_function velasight_autostart(void)
 #ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 static sem_t g_velasight_wifi_ready = SEM_INITIALIZER(0);
 static int g_velasight_wifi_result = -EINPROGRESS;
+static bool g_velasight_wifi_done;
 static bool g_velasight_display_revealed;
 
 int bk7258_wifi_wait_ready(void)
 {
-  int ret = nxsem_wait_uninterruptible(&g_velasight_wifi_ready);
+  int ret;
+
+  if (g_velasight_wifi_done)
+    return g_velasight_wifi_result;
+
+  ret = nxsem_wait_uninterruptible(&g_velasight_wifi_ready);
 
   if (ret < 0)
     return ret;
@@ -493,6 +499,7 @@ void board_late_initialize(void)
 
   ret = bk7258_wifi_initialize();
   g_velasight_wifi_result = ret;
+  g_velasight_wifi_done = true;
   nxsem_post(&g_velasight_wifi_ready);
   if (ret < 0)
     {

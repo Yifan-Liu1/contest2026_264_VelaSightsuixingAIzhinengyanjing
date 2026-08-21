@@ -20,6 +20,7 @@
 #define VS_INPUT_EVENT_QUEUE_SIZE 64
 #define VS_INPUT_EVENTS_PER_FRAME 8
 #define VS_RESPONSE_VISIBLE_MS 200
+#define VS_WIFI_RETRY_MS 20000
 
 static const struct vs_history_item_s g_history[] =
 {
@@ -171,6 +172,7 @@ struct vs_runtime_s
   enum vs_page_e error_return_page;
   bool network_busy;
   enum vs_net_mode_e network_target_mode;
+  uint32_t wifi_retry_at_ms;
   uint32_t next_request_id;
   uint32_t active_request_id;
   bool api_ready;
@@ -312,7 +314,27 @@ static int vs_start_network_worker(struct vs_runtime_s *runtime,
   pthread_detach(thread);
   runtime->network_busy = true;
   runtime->network_target_mode = mode;
+  if (mode == VS_NET_AP)
+    runtime->wifi_retry_at_ms = 0;
   return 0;
+}
+
+static void vs_update_wifi_retry(struct vs_runtime_s *runtime)
+{
+  if (runtime->network.mode == VS_NET_STA &&
+      runtime->network.state != VS_NET_STA_READY &&
+      runtime->network.wifi_issue != VS_WIFI_ISSUE_PASSWORD &&
+      runtime->network.error != -EINVAL &&
+      runtime->network.error != -EBADMSG)
+    {
+      runtime->wifi_retry_at_ms = vs_app_now_ms() + VS_WIFI_RETRY_MS;
+      printf("velasight: STA retry scheduled in %u ms\n",
+             VS_WIFI_RETRY_MS);
+    }
+  else
+    {
+      runtime->wifi_retry_at_ms = 0;
+    }
 }
 
 static unsigned int vs_history_count(void)
@@ -640,7 +662,9 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "热点");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "%s",
                  runtime->network.ssid);
-        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "待连接");
+        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "%s",
+                 runtime->network.ap_client_count != 0 ? "已连接" :
+                                                          "待连接");
         vs_key_set(snapshot, VS_KEY_BACK, "按住返回");
         break;
 
@@ -924,9 +948,16 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
           (void)vs_network_get_status(network, &runtime->network);
         runtime->error = 0;
         runtime->error_retryable = false;
-        runtime->page = runtime->network.mode == VS_NET_AP ? VS_PAGE_SOFTAP :
-                        runtime->history_blank ? VS_PAGE_HISTORY_BLANK :
-                                                 VS_PAGE_HISTORY;
+        runtime->wifi_retry_at_ms = 0;
+        if (runtime->page == VS_PAGE_PREPARING ||
+            runtime->page == VS_PAGE_NET_SWITCHING ||
+            runtime->page == VS_PAGE_SOFTAP)
+          {
+            runtime->page = runtime->network.mode == VS_NET_AP ?
+                            VS_PAGE_SOFTAP :
+                            runtime->history_blank ? VS_PAGE_HISTORY_BLANK :
+                                                     VS_PAGE_HISTORY;
+          }
         runtime->progress = 0;
         break;
 
@@ -944,8 +975,15 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
             runtime->error = event->error;
             runtime->error_retryable = false;
             runtime->error_reason[0] = '\0';
-            runtime->page = runtime->history_blank ? VS_PAGE_HISTORY_BLANK :
-                                                     VS_PAGE_HISTORY;
+            if (network == NULL)
+              runtime->network.error = event->error;
+            vs_update_wifi_retry(runtime);
+            if (runtime->page == VS_PAGE_PREPARING ||
+                runtime->page == VS_PAGE_NET_SWITCHING)
+              {
+                runtime->page = runtime->history_blank ?
+                                VS_PAGE_HISTORY_BLANK : VS_PAGE_HISTORY;
+              }
             printf("velasight: STA unavailable (%d), continuing offline\n",
                    event->error);
           }
@@ -1315,6 +1353,12 @@ int vs_app_run(void)
              "offline\n", ret);
     }
 
+  /* The preparation page is a display state, not a network gate. */
+  runtime.page = VS_PAGE_HISTORY_BLANK;
+  runtime.progress = 0;
+  runtime.network.wifi_issue = VS_WIFI_ISSUE_DISCONNECTED;
+  vs_render(display, &runtime);
+
   bk7258_nand_seed_agent_config();
   runtime.api_ready = bk7258_ai_config_ready();
   runtime.agent = velaclaw_client_open("velasight");
@@ -1379,17 +1423,24 @@ int vs_app_run(void)
                 }
               else
                 {
-                  runtime.page = VS_PAGE_NET_SWITCHING;
-                  runtime.progress = 100;
-                  ret = vs_start_network_worker(&runtime, network, VS_NET_STA);
-                  if (ret < 0)
-                    {
-                      runtime.error_target_mode = VS_NET_STA;
-                      vs_set_error(&runtime, ret, VS_PAGE_SOFTAP, true);
-                    }
+                  vs_update_wifi_retry(&runtime);
                 }
               vs_render(display, &runtime);
             }
+        }
+
+      if (!runtime.network_busy &&
+          runtime.wifi_retry_at_ms != 0 &&
+          (int32_t)(vs_app_now_ms() - runtime.wifi_retry_at_ms) >= 0)
+        {
+          runtime.wifi_retry_at_ms = 0;
+          printf("velasight: retrying STA connection\n");
+          ret = vs_start_network_worker(&runtime, network, VS_NET_STA);
+          if (ret < 0)
+            {
+              runtime.wifi_retry_at_ms = vs_app_now_ms() + VS_WIFI_RETRY_MS;
+            }
+          vs_render(display, &runtime);
         }
 
       vs_display_tick(display);

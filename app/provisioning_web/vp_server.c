@@ -31,12 +31,19 @@
 
 #define VP_ACCEPT_POLL_MS  200
 #define VP_REQUEST_TIMEOUT_MS 1500
+#define VP_RESPONSE_RETRY_MS 25
+#define VP_RESPONSE_TIMEOUT_MS 1000
+#define VP_SOCKET_TIMEOUT_SEC 2
+#define VP_SOCKET_LINGER_SEC 1
 #define VP_STORE_PATH_MAX  192
 #define VP_THREAD_STACK    8192
 
 struct vp_server_s
 {
   int       listenfd;
+  int       clientfd;
+  int       stoprd;
+  int       stopwr;
   pthread_t thread;
   int       state;
   bool      stopping;
@@ -50,6 +57,9 @@ struct vp_server_s
 static struct vp_server_s g_server =
 {
   .listenfd = -1,
+  .clientfd = -1,
+  .stoprd   = -1,
+  .stopwr   = -1,
   .state    = VP_STATE_IDLE,
 };
 
@@ -62,18 +72,79 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_request[VP_HTTP_MAX_HEADERS + VP_HTTP_MAX_BODY + 1];
 static char g_response[VP_HTTP_RESPONSE_MAX];
 
+static bool vp_stopping(void)
+{
+  bool stopping;
+
+  pthread_mutex_lock(&g_lock);
+  stopping = g_server.stopping;
+  pthread_mutex_unlock(&g_lock);
+  return stopping;
+}
+
+static int vp_wait_stop(int timeout_ms)
+{
+  struct pollfd pfd;
+  int ret;
+
+  pfd.fd = g_server.stoprd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  do
+    {
+      ret = poll(&pfd, 1, timeout_ms);
+    }
+  while (ret < 0 && errno == EINTR);
+
+  if (ret > 0 || vp_stopping())
+    {
+      return -ECANCELED;
+    }
+
+  return ret < 0 ? -errno : 0;
+}
+
 static int vp_write_all(int fd, const char *data, size_t len)
 {
   size_t sent = 0;
+  int waited = 0;
 
   while (sent < len)
     {
-      ssize_t n = write(fd, data + sent, len - sent);
+      int flags = MSG_DONTWAIT;
+      ssize_t n;
+
+#ifdef MSG_NOSIGNAL
+      flags |= MSG_NOSIGNAL;
+#endif
+      n = send(fd, data + sent, len - sent, flags);
 
       if (n < 0)
         {
           if (errno == EINTR)
             {
+              continue;
+            }
+
+          /* NuttX's buffered TCP send returns ENOMEM when the global socket
+           * callback pool is momentarily busy, and EAGAIN/ENOBUFS when the
+           * WRB or IOB pool is busy.  Phone browsers create short connection
+           * bursts, so give completed closes a bounded chance to release
+           * those resources.  The stop pipe makes this retry immediately
+           * interruptible when the application leaves SoftAP.
+           */
+
+          if ((errno == ENOMEM || errno == EAGAIN || errno == ENOBUFS) &&
+              waited < VP_RESPONSE_TIMEOUT_MS)
+            {
+              int ret = vp_wait_stop(VP_RESPONSE_RETRY_MS);
+
+              if (ret < 0)
+                {
+                  return ret;
+                }
+
+              waited += VP_RESPONSE_RETRY_MS;
               continue;
             }
 
@@ -109,7 +180,7 @@ static int vp_read_request(int fd, struct vp_http_request_s *req)
 
   for (; ; )
     {
-      struct pollfd pfd;
+      struct pollfd pfd[2];
       ssize_t n;
       int ret;
 
@@ -132,10 +203,13 @@ static int vp_read_request(int fd, struct vp_http_request_s *req)
           return -E2BIG;
         }
 
-      pfd.fd = fd;
-      pfd.events = POLLIN;
-      pfd.revents = 0;
-      ret = poll(&pfd, 1, VP_ACCEPT_POLL_MS);
+      pfd[0].fd = fd;
+      pfd[0].events = POLLIN;
+      pfd[0].revents = 0;
+      pfd[1].fd = g_server.stoprd;
+      pfd[1].events = POLLIN;
+      pfd[1].revents = 0;
+      ret = poll(pfd, 2, VP_ACCEPT_POLL_MS);
       if (ret < 0)
         {
           if (errno == EINTR)
@@ -155,6 +229,11 @@ static int vp_read_request(int fd, struct vp_http_request_s *req)
             }
 
           continue;
+        }
+
+      if (pfd[1].revents != 0 || vp_stopping())
+        {
+          return -ECANCELED;
         }
 
       n = read(fd, g_request + total, sizeof(g_request) - 1 - total);
@@ -321,14 +400,14 @@ static void vp_handle(int fd, bool *saved, int *save_status,
       ret = vp_write_all(fd, g_response, len);
       if (ret < 0)
         {
-          /* Keep AP mode available when the phone disconnected before it
-           * received the result page.  The record itself was already saved.
+          /* Transport failure does not undo a completed persistent save.
+           * In particular, NuttX may return ENOMEM when TCP write buffers are
+           * temporarily exhausted by repeated phone connections.  Report the
+           * stored result to the application; only vp_store_save() decides
+           * whether the credentials were saved.
            */
-          if (*saved)
-            {
-              *saved = false;
-            }
-          *save_status = ret;
+
+          printf("provision_web: response write failed: %d\n", ret);
         }
     }
 }
@@ -339,7 +418,7 @@ static void *vp_thread(void *arg)
 
   for (; ; )
     {
-      struct pollfd pfd;
+      struct pollfd pfd[2];
       uint32_t generation = 0;
       int save_status = 0;
       bool saved = false;
@@ -355,9 +434,12 @@ static void *vp_thread(void *arg)
           break;
         }
 
-      pfd.fd = g_server.listenfd;
-      pfd.events = POLLIN;
-      pfd.revents = 0;
+      pfd[0].fd = g_server.listenfd;
+      pfd[0].events = POLLIN;
+      pfd[0].revents = 0;
+      pfd[1].fd = g_server.stoprd;
+      pfd[1].events = POLLIN;
+      pfd[1].revents = 0;
 
       /* Polling rather than blocking in accept(): stop() then needs no signal
        * and no socket shutdown trick that may or may not wake accept on a
@@ -370,7 +452,7 @@ static void *vp_thread(void *arg)
        * "listening" and then answered nothing.
        */
 
-      ret = poll(&pfd, 1, VP_ACCEPT_POLL_MS);
+      ret = poll(pfd, 2, VP_ACCEPT_POLL_MS);
       if (ret < 0)
         {
           if (errno == EINTR)
@@ -386,6 +468,11 @@ static void *vp_thread(void *arg)
           continue;
         }
 
+      if (pfd[1].revents != 0 || vp_stopping())
+        {
+          break;
+        }
+
       fd = accept(g_server.listenfd, NULL, NULL);
       if (fd < 0)
         {
@@ -397,6 +484,45 @@ static void *vp_thread(void *arg)
           break;
         }
 
+      {
+        struct linger linger;
+        struct timeval tv;
+
+        tv.tv_sec = VP_SOCKET_TIMEOUT_SEC;
+        tv.tv_usec = 0;
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        /* NuttX otherwise leaves an active HTTP close, its send callback and
+         * its close callback alive for the 120-second TIME_WAIT default.  A
+         * one-second linger deadline preserves the normal graceful response
+         * path, but forcibly reclaims a phone connection that never finishes
+         * closing.  This is essential because callbacks are a global pool.
+         */
+
+        linger.l_onoff = 1;
+        linger.l_linger = VP_SOCKET_LINGER_SEC;
+        if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger,
+                       sizeof(linger)) < 0)
+          {
+            printf("provision_web: SO_LINGER failed: %d\n", -errno);
+          }
+      }
+
+      stopping = vp_stopping();
+      if (stopping)
+        {
+          close(fd);
+          break;
+        }
+
+      pthread_mutex_lock(&g_lock);
+      if (!g_server.stopping)
+        {
+          g_server.clientfd = fd;
+        }
+      pthread_mutex_unlock(&g_lock);
+
       printf("provision_web: accepted client\n");
       vp_handle(fd, &saved, &save_status, &generation);
 
@@ -405,7 +531,12 @@ static void *vp_thread(void *arg)
         * makes a successful save look like a failed submit on the phone.
        */
 
-      shutdown(fd, SHUT_RDWR);
+      pthread_mutex_lock(&g_lock);
+      if (g_server.clientfd == fd)
+        {
+          g_server.clientfd = -1;
+        }
+      pthread_mutex_unlock(&g_lock);
       close(fd);
 
       if (saved)
@@ -444,6 +575,12 @@ static void *vp_thread(void *arg)
       g_server.listenfd = -1;
     }
 
+  if (g_server.stoprd >= 0)
+    {
+      close(g_server.stoprd);
+      g_server.stoprd = -1;
+    }
+
   g_server.state = VP_STATE_FINISHED;
   pthread_mutex_unlock(&g_lock);
   return NULL;
@@ -460,6 +597,12 @@ static void vp_reap_locked(void)
       pthread_mutex_unlock(&g_lock);
       pthread_join(thread, NULL);
       pthread_mutex_lock(&g_lock);
+      if (g_server.stopwr >= 0)
+        {
+          close(g_server.stopwr);
+          g_server.stopwr = -1;
+        }
+
       g_server.state = VP_STATE_IDLE;
     }
 }
@@ -471,6 +614,7 @@ int velasight_provisioning_start(
   struct sockaddr_in addr;
   pthread_attr_t attr;
   uint16_t port;
+  int stopfds[2];
   int one = 1;
   int fd;
   int ret;
@@ -495,6 +639,13 @@ int velasight_provisioning_start(
       return -EALREADY;
     }
 
+  if (pipe(stopfds) < 0)
+    {
+      ret = -errno;
+      pthread_mutex_unlock(&g_lock);
+      return ret;
+    }
+
   port = cfg.port != 0 ? cfg.port :
          (uint16_t)CONFIG_VELASIGHT_PROVISION_PORT;
 
@@ -502,6 +653,8 @@ int velasight_provisioning_start(
   if (fd < 0)
     {
       ret = -errno;
+      close(stopfds[0]);
+      close(stopfds[1]);
       pthread_mutex_unlock(&g_lock);
       return ret;
     }
@@ -518,6 +671,8 @@ int velasight_provisioning_start(
     {
       ret = -errno;
       close(fd);
+      close(stopfds[0]);
+      close(stopfds[1]);
       pthread_mutex_unlock(&g_lock);
       return ret;
     }
@@ -528,6 +683,9 @@ int velasight_provisioning_start(
   g_server.generation = 0;
   g_server.on_saved   = cfg.on_saved;
   g_server.cb_arg     = cfg.cb_arg;
+  g_server.stoprd     = stopfds[0];
+  g_server.stopwr     = stopfds[1];
+  g_server.clientfd   = -1;
   snprintf(g_server.store_path, sizeof(g_server.store_path), "%s",
            cfg.store_path != NULL ? cfg.store_path :
            CONFIG_VELASIGHT_PROVISION_STORE);
@@ -540,7 +698,12 @@ int velasight_provisioning_start(
   if (ret != 0)
     {
       close(fd);
+      close(stopfds[0]);
+      close(stopfds[1]);
       g_server.listenfd = -1;
+      g_server.clientfd = -1;
+      g_server.stoprd = -1;
+      g_server.stopwr = -1;
       g_server.state = VP_STATE_IDLE;
       pthread_mutex_unlock(&g_lock);
       return -ret;
@@ -568,6 +731,30 @@ int velasight_provisioning_stop(void)
   g_server.stopping = true;
   thread = g_server.thread;
 
+  /* The stop pipe interrupts request parsing and response retries.  If the
+   * request was already in close(), turn that close into an abortive close so
+   * SO_LINGER cannot make the network-switch worker wait for a phone ACK. */
+
+  if (g_server.clientfd >= 0)
+    {
+      struct linger linger;
+
+      linger.l_onoff = 1;
+      linger.l_linger = 0;
+      (void)setsockopt(g_server.clientfd, SOL_SOCKET, SO_LINGER,
+                       &linger, sizeof(linger));
+    }
+
+  if (g_server.stopwr >= 0)
+    {
+      char wake = 1;
+
+      while (write(g_server.stopwr, &wake, sizeof(wake)) < 0 &&
+             errno == EINTR)
+        {
+        }
+    }
+
   /* Called from the saved callback, which runs on the listener thread: joining
    * ourselves would deadlock, so only ask the loop to end and let the normal
    * exit path close the socket.  A later stop() from the application reaps it.
@@ -583,6 +770,12 @@ int velasight_provisioning_stop(void)
   pthread_join(thread, NULL);
 
   pthread_mutex_lock(&g_lock);
+  if (g_server.stopwr >= 0)
+    {
+      close(g_server.stopwr);
+      g_server.stopwr = -1;
+    }
+
   g_server.state = VP_STATE_IDLE;
   pthread_mutex_unlock(&g_lock);
   return 0;

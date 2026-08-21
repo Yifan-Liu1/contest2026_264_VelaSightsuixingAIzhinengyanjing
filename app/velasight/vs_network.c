@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <netutils/dhcpd.h>
@@ -15,6 +16,7 @@
 #include <nuttx/wireless/wireless.h>
 
 #include <arch/board/board.h>
+#include <arch/chip/bk7258_wifi.h>
 
 #include "velasight_provisioning.h"
 #include "include/vs_config.h"
@@ -23,6 +25,7 @@
 
 #define VS_DHCP_TRIES       3
 #define VS_DHCP_RETRY_MS    1500
+#define VS_STA_ASSOC_TIMEOUT_MS 15000
 
 struct vs_network_s
 {
@@ -31,11 +34,149 @@ struct vs_network_s
   struct vs_net_status_s status;
   struct vs_wifi_config_s config;
   pthread_mutex_t event_lock;
+  pthread_cond_t wifi_cond;
   bool dhcp_running;
   bool provision_running;
   bool provision_event;
   int provision_status;
+  bool wifi_event;
+  bool sta_connected;
+  bool sta_ipv4_ready;
+  int sta_disconnect_reason;
+  bool ignore_sta_disconnect;
+  bool ap_client_event;
+  uint8_t ap_client_count;
 };
+
+static void vs_network_wifi_event(enum bk7258_wifi_event_e event,
+                                  unsigned int value, void *arg)
+{
+  struct vs_network_s *network = arg;
+
+  if (network == NULL)
+    {
+      return;
+    }
+
+  pthread_mutex_lock(&network->event_lock);
+  if (event == BK7258_WIFI_EVENT_STA_CONNECTED ||
+      event == BK7258_WIFI_EVENT_STA_DISCONNECTED)
+    {
+      if (event == BK7258_WIFI_EVENT_STA_DISCONNECTED &&
+          network->ignore_sta_disconnect)
+        {
+          pthread_mutex_unlock(&network->event_lock);
+          return;
+        }
+
+      network->wifi_event = true;
+      network->sta_connected = event == BK7258_WIFI_EVENT_STA_CONNECTED;
+      if (network->sta_connected)
+        {
+          network->sta_disconnect_reason = 0;
+        }
+      else
+        {
+          network->sta_ipv4_ready = false;
+          if (network->sta_disconnect_reason !=
+              (int)BK7258_WIFI_REASON_NO_AP_FOUND &&
+              network->sta_disconnect_reason !=
+              (int)BK7258_WIFI_REASON_WRONG_PASSWORD &&
+              (value != 0 || network->sta_disconnect_reason == 0))
+            {
+              network->sta_disconnect_reason = (int)value;
+            }
+        }
+
+      pthread_cond_signal(&network->wifi_cond);
+    }
+  else if (event == BK7258_WIFI_EVENT_AP_CLIENTS_CHANGED)
+    {
+      network->ap_client_event = true;
+      network->ap_client_count = value > UINT8_MAX ? UINT8_MAX :
+                                                       (uint8_t)value;
+    }
+  else if (event == BK7258_WIFI_EVENT_AP_STOPPED)
+    {
+      network->ap_client_event = true;
+      network->ap_client_count = 0;
+    }
+  pthread_mutex_unlock(&network->event_lock);
+}
+
+static enum vs_wifi_issue_e vs_network_sta_issue(
+    struct vs_network_s *network, enum vs_wifi_issue_e fallback)
+{
+  int reason;
+
+  pthread_mutex_lock(&network->event_lock);
+  reason = network->sta_disconnect_reason;
+  pthread_mutex_unlock(&network->event_lock);
+  if (reason == (int)BK7258_WIFI_REASON_NO_AP_FOUND)
+    {
+      return VS_WIFI_ISSUE_SSID_NOT_FOUND;
+    }
+  if (reason == (int)BK7258_WIFI_REASON_WRONG_PASSWORD)
+    {
+      return VS_WIFI_ISSUE_PASSWORD;
+    }
+
+  return fallback;
+}
+
+static int vs_network_wait_sta_association(struct vs_network_s *network)
+{
+  struct timespec deadline;
+  bool connected;
+  int reason;
+  int ret;
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += VS_STA_ASSOC_TIMEOUT_MS / 1000;
+  deadline.tv_nsec += (VS_STA_ASSOC_TIMEOUT_MS % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L)
+    {
+      deadline.tv_sec++;
+      deadline.tv_nsec -= 1000000000L;
+    }
+
+  pthread_mutex_lock(&network->event_lock);
+  while (!network->wifi_event)
+    {
+      ret = pthread_cond_timedwait(&network->wifi_cond,
+                                   &network->event_lock, &deadline);
+      if (ret != 0)
+        {
+          pthread_mutex_unlock(&network->event_lock);
+          return ret == ETIMEDOUT ? -ETIMEDOUT : -ret;
+        }
+    }
+
+  connected = network->sta_connected;
+  reason = network->sta_disconnect_reason;
+  network->wifi_event = false;
+  pthread_mutex_unlock(&network->event_lock);
+
+  if (connected)
+    {
+      return 0;
+    }
+
+  if (reason == (int)BK7258_WIFI_REASON_NO_AP_FOUND)
+    {
+      network->status.wifi_issue = VS_WIFI_ISSUE_SSID_NOT_FOUND;
+      return -ENETUNREACH;
+    }
+
+  if (reason == (int)BK7258_WIFI_REASON_WRONG_PASSWORD)
+    {
+      network->status.wifi_issue = VS_WIFI_ISSUE_PASSWORD;
+      return -EACCES;
+    }
+
+  network->status.wifi_issue = VS_WIFI_ISSUE_DISCONNECTED;
+  return -ENOTCONN;
+}
 
 static int vs_network_stop_dhcp(struct vs_network_s *network)
 {
@@ -174,10 +315,20 @@ static int vs_network_apply_sta(struct vs_network_s *network)
   unsigned int attempt;
   int ret;
 
+  network->status.wifi_issue = VS_WIFI_ISSUE_DISCONNECTED;
   if (network->config.sta_ssid[0] == '\0')
     return vs_network_failed(network, "STA配置", -EBADMSG);
 
+  pthread_mutex_lock(&network->event_lock);
+  network->ignore_sta_disconnect = true;
+  pthread_mutex_unlock(&network->event_lock);
   ret = wapi_set_ifdown(network->sock, "wlan0");
+  pthread_mutex_lock(&network->event_lock);
+  network->ignore_sta_disconnect = false;
+  network->wifi_event = false;
+  network->sta_ipv4_ready = false;
+  network->sta_disconnect_reason = 0;
+  pthread_mutex_unlock(&network->event_lock);
   if (ret < 0 && ret != -ENODEV && ret != -ETIMEDOUT)
     return vs_network_failed(network, "STA关闭接口", ret);
   if (ret == -ETIMEDOUT)
@@ -206,6 +357,17 @@ static int vs_network_apply_sta(struct vs_network_s *network)
   if (ret < 0)
      return vs_network_failed(network, "STA连接", ret);
 
+  ret = vs_network_wait_sta_association(network);
+  if (ret < 0)
+    {
+      (void)wapi_set_ifdown(network->sock, "wlan0");
+      return vs_network_failed(network,
+          network->status.wifi_issue == VS_WIFI_ISSUE_PASSWORD ?
+          "WiFi密码错误" :
+          network->status.wifi_issue == VS_WIFI_ISSUE_SSID_NOT_FOUND ?
+          "SSID未扫描到" : "STA关联", ret);
+    }
+
   ret = -ETIMEDOUT;
   for (attempt = 0; attempt < VS_DHCP_TRIES; attempt++)
     {
@@ -224,11 +386,22 @@ static int vs_network_apply_sta(struct vs_network_s *network)
     }
 
   if (ret < 0)
-     return vs_network_failed(network, "STA获取地址", ret);
+    {
+      network->status.wifi_issue = vs_network_sta_issue(
+          network, VS_WIFI_ISSUE_DISCONNECTED);
+      (void)wapi_set_ifdown(network->sock, "wlan0");
+      return vs_network_failed(network,
+          network->status.wifi_issue == VS_WIFI_ISSUE_PASSWORD ?
+          "WiFi密码错误" : "STA获取地址", ret);
+    }
 
   network->mode = VS_NET_STA;
   network->status.mode = VS_NET_STA;
   network->status.state = VS_NET_STA_READY;
+  network->status.wifi_issue = VS_WIFI_ISSUE_NONE;
+  pthread_mutex_lock(&network->event_lock);
+  network->sta_ipv4_ready = true;
+  pthread_mutex_unlock(&network->event_lock);
   snprintf(network->status.ssid, sizeof(network->status.ssid), "%s",
            network->config.sta_ssid);
   network->status.password[0] = '\0';
@@ -329,6 +502,10 @@ static int vs_network_apply_ap(struct vs_network_s *network)
   network->mode = VS_NET_AP;
   network->status.mode = VS_NET_AP;
   network->status.state = VS_NET_AP_READY;
+  network->status.wifi_issue = VS_WIFI_ISSUE_NONE;
+  pthread_mutex_lock(&network->event_lock);
+  network->status.ap_client_count = network->ap_client_count;
+  pthread_mutex_unlock(&network->event_lock);
   snprintf(network->status.ssid, sizeof(network->status.ssid), "%s",
            network->config.ap_ssid);
   snprintf(network->status.password, sizeof(network->status.password), "%s",
@@ -365,10 +542,19 @@ int vs_network_open(struct vs_network_s **network)
       return -ret;
     }
 
+  ret = pthread_cond_init(&n->wifi_cond, NULL);
+  if (ret != 0)
+    {
+      pthread_mutex_destroy(&n->event_lock);
+      free(n);
+      return -ret;
+    }
+
   n->sock = wapi_make_socket();
   if (n->sock < 0)
     {
       ret = n->sock;
+      pthread_cond_destroy(&n->wifi_cond);
       pthread_mutex_destroy(&n->event_lock);
       free(n);
       return ret;
@@ -378,6 +564,7 @@ int vs_network_open(struct vs_network_s **network)
   if (ret < 0)
     {
       close(n->sock);
+      pthread_cond_destroy(&n->wifi_cond);
       pthread_mutex_destroy(&n->event_lock);
       free(n);
       return ret;
@@ -386,6 +573,16 @@ int vs_network_open(struct vs_network_s **network)
   n->mode = VS_NET_STA;
   n->status.mode = VS_NET_STA;
   n->status.state = VS_NET_DOWN;
+  n->status.wifi_issue = VS_WIFI_ISSUE_DISCONNECTED;
+  ret = bk7258_wifi_register_event_callback(vs_network_wifi_event, n);
+  if (ret < 0)
+    {
+      close(n->sock);
+      pthread_cond_destroy(&n->wifi_cond);
+      pthread_mutex_destroy(&n->event_lock);
+      free(n);
+      return ret;
+    }
   *network = n;
   return 0;
 }
@@ -467,14 +664,66 @@ int vs_network_request_mode(struct vs_network_s *network,
 
 int vs_network_process_events(struct vs_network_s *network)
 {
+  bool ap_client_event;
+  bool sta_connected;
+  bool sta_ipv4_ready;
+  bool wifi_event;
+  uint8_t ap_client_count;
+  bool changed = false;
+  int disconnect_reason;
   int ret;
 
   if (network == NULL)
     return 0;
 
+  pthread_mutex_lock(&network->event_lock);
+  wifi_event = network->wifi_event;
+  sta_connected = network->sta_connected;
+  sta_ipv4_ready = network->sta_ipv4_ready;
+  disconnect_reason = network->sta_disconnect_reason;
+  network->wifi_event = false;
+  ap_client_event = network->ap_client_event;
+  ap_client_count = network->ap_client_count;
+  network->ap_client_event = false;
+  pthread_mutex_unlock(&network->event_lock);
+
+  if (network->mode == VS_NET_STA && wifi_event)
+    {
+      if (sta_connected)
+        {
+          network->status.state = sta_ipv4_ready ? VS_NET_STA_READY :
+                                                   VS_NET_DOWN;
+          network->status.wifi_issue = sta_ipv4_ready ?
+                                       VS_WIFI_ISSUE_NONE :
+                                       VS_WIFI_ISSUE_DISCONNECTED;
+          if (sta_ipv4_ready)
+            {
+              network->status.error = 0;
+              network->status.error_reason[0] = '\0';
+            }
+          changed = true;
+        }
+      else
+        {
+          network->status.state = VS_NET_DOWN;
+          network->status.wifi_issue =
+              disconnect_reason == (int)BK7258_WIFI_REASON_NO_AP_FOUND ?
+              VS_WIFI_ISSUE_SSID_NOT_FOUND :
+              disconnect_reason == (int)BK7258_WIFI_REASON_WRONG_PASSWORD ?
+              VS_WIFI_ISSUE_PASSWORD : VS_WIFI_ISSUE_DISCONNECTED;
+          changed = true;
+        }
+    }
+
+  if (network->mode == VS_NET_AP && ap_client_event)
+    {
+      network->status.ap_client_count = ap_client_count;
+      changed = true;
+    }
+
   ret = vs_network_consume_saved(network, false);
   if (ret == -ENOENT)
-    return 0;
+    return changed ? 1 : 0;
 
   if (ret < 0)
     {
@@ -485,7 +734,7 @@ int vs_network_process_events(struct vs_network_s *network)
 
   /* Keep AP and the provisioning listener alive after a save.  The saved STA
    * credentials are applied only when the user explicitly exits AP mode. */
-  return 0;
+  return 1;
 }
 
 int vs_network_get_status(struct vs_network_s *network,
@@ -503,12 +752,14 @@ void vs_network_close(struct vs_network_s *network)
   if (network == NULL)
     return;
 
+  bk7258_wifi_unregister_event_callback(vs_network_wifi_event, network);
   (void)vs_network_stop_provisioning(network);
   if (vs_network_stop_dhcp(network) < 0)
     printf("velasight: DHCP server did not stop cleanly\n");
 
   (void)wapi_set_ifdown(network->sock, "wlan0");
   close(network->sock);
+  pthread_cond_destroy(&network->wifi_cond);
   pthread_mutex_destroy(&network->event_lock);
   free(network);
 }

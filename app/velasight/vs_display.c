@@ -150,7 +150,7 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
   for (int line = 0; line < 2; line++)
     {
       vs_label_style(panel->status_line[line], vs_rgb(155, 175, 187),
-                     8, 110 + line * 20, 144, VS_LOWER_ROW_HEIGHT);
+                     28, 110 + line * 20, 104, VS_LOWER_ROW_HEIGHT);
       lv_label_set_long_mode(panel->status_line[line], LV_LABEL_LONG_CLIP);
       lv_obj_add_flag(panel->status_line[line], LV_OBJ_FLAG_HIDDEN);
     }
@@ -245,7 +245,9 @@ static bool vs_content_changed(const struct vs_ui_snapshot_s *current,
   return current->page != previous->page ||
          current->history_is_blank != previous->history_is_blank ||
          current->wifi_ready != previous->wifi_ready ||
-         current->api_ready != previous->api_ready ||
+         current->network.wifi_issue != previous->network.wifi_issue ||
+         current->network.ap_client_count !=
+         previous->network.ap_client_count ||
          strcmp(current->content_title, previous->content_title) != 0 ||
          strcmp(current->content_body, previous->content_body) != 0 ||
          strcmp(current->content_meta, previous->content_meta) != 0 ||
@@ -346,9 +348,29 @@ static void vs_render_content(struct vs_panel_s *panel,
     {
       char line[VS_TEXT_LONG];
 
-      snprintf(line, sizeof(line), "wifi:%s api:%s",
-               snapshot->wifi_ready ? "已连接" : "未连接",
-               snapshot->api_ready ? "可用" : "错误");
+      if (snapshot->network.mode == VS_NET_AP)
+        {
+          snprintf(line, sizeof(line), "WiFi %s",
+                   snapshot->network.ap_client_count != 0 ?
+                   "已连接" : "待连接");
+        }
+      else if (snapshot->network.wifi_issue == VS_WIFI_ISSUE_SSID_NOT_FOUND)
+        {
+          snprintf(line, sizeof(line), "SSID未扫描到");
+        }
+      else if (snapshot->network.wifi_issue == VS_WIFI_ISSUE_PASSWORD)
+        {
+          snprintf(line, sizeof(line), "WiFi密码错误");
+        }
+      else if (snapshot->network.wifi_issue == VS_WIFI_ISSUE_DISCONNECTED)
+        {
+          snprintf(line, sizeof(line), "WiFi已断开");
+        }
+      else
+        {
+          snprintf(line, sizeof(line), "WiFi %s",
+                   snapshot->wifi_ready ? "已连接" : "未连接");
+        }
       vs_set_label(panel->status_line[0], line);
       vs_set_hidden(panel->status_line[0], false);
     }

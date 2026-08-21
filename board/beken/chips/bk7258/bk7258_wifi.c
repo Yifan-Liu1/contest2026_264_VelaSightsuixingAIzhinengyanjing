@@ -135,6 +135,7 @@ struct wifi_driver
 {
   struct netdev_lowerhalf_s lower;
   mutex_t command_lock;
+  mutex_t event_lock;
   mutex_t packet_lock;
   mutex_t scan_lock;
   sem_t command_sem;
@@ -187,6 +188,26 @@ static struct wifi_driver g_wifi;
 static volatile int g_worker_result;
 static unsigned int g_wifi_rx_trace;
 static unsigned int g_wifi_tx_trace;
+static bk7258_wifi_event_cb_t g_wifi_event_callback;
+static void *g_wifi_event_arg;
+
+static void wifi_notify_event(enum bk7258_wifi_event_e event,
+                              unsigned int value)
+{
+  bk7258_wifi_event_cb_t callback;
+  void *arg;
+
+  nxmutex_lock(&g_wifi.event_lock);
+  callback = g_wifi_event_callback;
+  arg = g_wifi_event_arg;
+
+  if (callback != NULL)
+    {
+      callback(event, value, arg);
+    }
+
+  nxmutex_unlock(&g_wifi.event_lock);
+}
 
 _Static_assert(sizeof(g_wifi.command_data) >=
                sizeof(struct bk7258_wifi_scan_page_response),
@@ -542,6 +563,7 @@ static bool wifi_tx_busy(void)
 
 static void wifi_role_deactivate(enum wifi_role role)
 {
+  enum wifi_role deactivated_role = WIFI_ROLE_NONE;
   bool deactivated = false;
   irqstate_t flags;
 
@@ -549,6 +571,7 @@ static void wifi_role_deactivate(enum wifi_role role)
   flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
   if (role == WIFI_ROLE_NONE || g_wifi.active_role == role)
     {
+      deactivated_role = g_wifi.active_role;
       g_wifi.active_role = WIFI_ROLE_NONE;
       g_wifi.role_state = WIFI_ROLE_IDLE;
       g_wifi.tx_gate = false;
@@ -566,10 +589,14 @@ static void wifi_role_deactivate(enum wifi_role role)
     {
       nxsem_post(&g_wifi.role_sem);
       wifi_set_carrier(false);
+      if (deactivated_role == WIFI_ROLE_SOFTAP)
+        {
+          wifi_notify_event(BK7258_WIFI_EVENT_AP_STOPPED, 0);
+        }
     }
 }
 
-static void wifi_sta_event(bool connected)
+static void wifi_sta_event(bool connected, unsigned int reason)
 {
   bool carrier = false;
   bool handled = false;
@@ -608,6 +635,11 @@ static void wifi_sta_event(bool connected)
               g_wifi.role_state = WIFI_ROLE_STARTING;
             }
         }
+      else
+        {
+          /* Ignore a late connected indication from the role being stopped. */
+          handled = false;
+        }
     }
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
@@ -618,6 +650,9 @@ static void wifi_sta_event(bool connected)
   if (handled)
     {
       wifi_set_carrier(carrier);
+      wifi_notify_event(connected ? BK7258_WIFI_EVENT_STA_CONNECTED :
+                                    BK7258_WIFI_EVENT_STA_DISCONNECTED,
+                        connected ? 0 : reason);
     }
 }
 
@@ -635,9 +670,15 @@ static void wifi_ap_start_event(bool started)
       handled = true;
       if (started && g_wifi.role_state != WIFI_ROLE_STOPPING)
         {
+          bool newly_started = g_wifi.role_state != WIFI_ROLE_ACTIVE ||
+                               !g_wifi.ap_started;
+
           g_wifi.role_state = WIFI_ROLE_ACTIVE;
           g_wifi.ap_started = true;
-          g_wifi.ap_client_count = 0;
+          if (newly_started)
+            {
+              g_wifi.ap_client_count = 0;
+            }
           g_wifi.tx_gate = g_wifi.admin_up;
           carrier = g_wifi.admin_up;
         }
@@ -664,11 +705,14 @@ static void wifi_ap_start_event(bool started)
   if (handled)
     {
       wifi_set_carrier(carrier);
+      wifi_notify_event(started ? BK7258_WIFI_EVENT_AP_STARTED :
+                                  BK7258_WIFI_EVENT_AP_STOPPED, 0);
     }
 }
 
 static void wifi_ap_client_event(bool associated)
 {
+  unsigned int client_count;
   irqstate_t flags;
 
   nxmutex_lock(&g_wifi.packet_lock);
@@ -692,8 +736,11 @@ static void wifi_ap_client_event(bool associated)
                  g_wifi.ap_client_count);
         }
     }
+  client_count = g_wifi.ap_client_count;
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_notify_event(BK7258_WIFI_EVENT_AP_CLIENTS_CHANGED,
+                    client_count);
 }
 
 static void wifi_scan_cache_clear(void)
@@ -1083,25 +1130,48 @@ static void wifi_handle_command(uint32_t cpdu_address,
     }
   else if (event.id == BK7258_WIFI_EVT_IPV4_IND)
     {
-      wifi_sta_event(true);
+      wifi_sta_event(true, 0);
     }
   else if (event.id == BK7258_WIFI_EVT_WIFI_EVENT_IND && copied >= 4)
     {
       uint16_t event_id;
+      uint16_t data_length;
 
       memcpy(&event_id, data, sizeof(event_id));
+      memcpy(&data_length, data + sizeof(event_id), sizeof(data_length));
       if (event_id == BK7258_WIFI_EVENT_CONNECTED)
         {
-          wifi_sta_event(true);
+          wifi_sta_event(true, 0);
         }
       else if (event_id == BK7258_WIFI_EVENT_DISCONNECTED)
         {
-          wifi_sta_event(false);
+          unsigned int reason = 0;
+
+          if (data_length >= sizeof(int32_t) &&
+              copied >= 4 + sizeof(int32_t))
+            {
+              int32_t reported;
+
+              memcpy(&reported, data + 4, sizeof(reported));
+              reason = (unsigned int)reported;
+            }
+
+          wifi_sta_event(false, reason);
         }
     }
   else if (event.id == BK7258_WIFI_EVT_DISCONNECT_IND)
     {
-      wifi_sta_event(false);
+      unsigned int reason = 0;
+
+      if (copied >= sizeof(int32_t))
+        {
+          int32_t reported;
+
+          memcpy(&reported, data, sizeof(reported));
+          reason = (unsigned int)reported;
+        }
+
+      wifi_sta_event(false, reason);
     }
   else if (event.id == BK7258_WIFI_EVT_START_AP_IND && copied >= 1)
     {
@@ -2138,6 +2208,16 @@ static int wifi_connect(struct netdev_lowerhalf_s *lower)
 
   if (role == WIFI_ROLE_STA)
     {
+      bool auto_reconnect = false;
+
+      ret = wifi_command(BK7258_WIFI_CMD_SET_AUTO_RECONNECT,
+                         &auto_reconnect, sizeof(auto_reconnect),
+                         NULL, 0, NULL);
+      if (ret < 0)
+        {
+          goto connect_failed;
+        }
+
       memset(payload, 0, sizeof(payload));
       memcpy(payload, config.ssid, ssid_length);
       memcpy(payload + 33, config.password, password_length);
@@ -2186,6 +2266,7 @@ static int wifi_connect(struct netdev_lowerhalf_s *lower)
         }
     }
 
+connect_failed:
   if (ret < 0)
     {
       wifi_role_deactivate(role);
@@ -2695,6 +2776,7 @@ int bk7258_wifi_initialize(void)
 
   memset(&g_wifi, 0, sizeof(g_wifi));
   nxmutex_init(&g_wifi.command_lock);
+  nxmutex_init(&g_wifi.event_lock);
   nxmutex_init(&g_wifi.packet_lock);
   nxmutex_init(&g_wifi.scan_lock);
   nxsem_init(&g_wifi.command_sem, 0, 0);
@@ -2790,6 +2872,46 @@ int bk7258_wifi_initialize(void)
   g_wifi.carrier_notified = !g_wifi.carrier;
   wifi_notify_carrier();
   return OK;
+}
+
+int bk7258_wifi_register_event_callback(bk7258_wifi_event_cb_t callback,
+                                        void *arg)
+{
+  if (callback == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (!g_wifi.initialized)
+    {
+      return -ENODEV;
+    }
+
+  nxmutex_lock(&g_wifi.event_lock);
+  if (g_wifi_event_callback != NULL &&
+      (g_wifi_event_callback != callback || g_wifi_event_arg != arg))
+    {
+      nxmutex_unlock(&g_wifi.event_lock);
+      return -EBUSY;
+    }
+
+  g_wifi_event_arg = arg;
+  g_wifi_event_callback = callback;
+  nxmutex_unlock(&g_wifi.event_lock);
+  return OK;
+}
+
+void bk7258_wifi_unregister_event_callback(bk7258_wifi_event_cb_t callback,
+                                           void *arg)
+{
+  nxmutex_lock(&g_wifi.event_lock);
+  if (g_wifi_event_callback == callback && g_wifi_event_arg == arg)
+    {
+      g_wifi_event_callback = NULL;
+      g_wifi_event_arg = NULL;
+    }
+
+  nxmutex_unlock(&g_wifi.event_lock);
 }
 
 #endif /* CONFIG_BK7258_WIFI */

@@ -11,7 +11,7 @@
 #include "velasight_provisioning.h"
 #include "vp_http.h"
 
-#define VP_HTTP_BODY_BUILD 3072
+#define VP_HTTP_BODY_BUILD 2048
 
 static const char g_form_type[] = "application/x-www-form-urlencoded";
 
@@ -413,33 +413,25 @@ static size_t vp_wrap(char *buf, size_t buflen, int status,
  */
 
 #define VP_PAGE_HEAD                                                   \
-  "<!DOCTYPE html><html lang=\"zh-CN\"><head>"                         \
-  "<meta charset=\"utf-8\">"                                           \
-  "<meta name=\"viewport\" content=\"width=device-width,"               \
-  "initial-scale=1\">"                                                 \
+  "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"  \
+  "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" \
   "<title>VelaSight 配网</title><style>"                                \
-  "body{font-family:system-ui,sans-serif;margin:0;padding:24px;"        \
-  "background:#f5f5f7;color:#1d1d1f}"                                   \
-  "main{max-width:22rem;margin:0 auto;background:#fff;border-radius:"   \
-  "12px;padding:20px}"                                                  \
-  "h1{font-size:1.25rem;margin:0 0 16px}"                               \
-  "label{display:block;margin:12px 0 4px;font-size:.9rem}"              \
-  "input{width:100%%;box-sizing:border-box;padding:10px;font-size:1rem;" \
-  "border:1px solid #c7c7cc;border-radius:8px}"                         \
-  "button{width:100%%;margin-top:20px;padding:12px;font-size:1rem;"      \
-  "border:0;border-radius:8px;background:#0071e3;color:#fff}"           \
-  "a.button{display:block;box-sizing:border-box;text-align:center;"       \
-  "margin-top:20px;padding:12px;border-radius:8px;background:#6e6e73;"    \
-  "color:#fff;text-decoration:none}"                                     \
-  "p.note{font-size:.85rem;color:#6e6e73;margin-top:16px}"              \
-  "p.err{color:#b00020;font-size:.9rem;margin:0 0 8px}"                 \
+  "body{font-family:system-ui;margin:0;padding:20px;background:#f5f5f7}" \
+  "main{max-width:22rem;margin:auto;background:#fff;padding:20px;"       \
+  "border-radius:12px}h1{font-size:1.25rem;margin:0 0 12px}"            \
+  "label{display:block;margin:10px 0 4px}input,button{width:100%%;"       \
+  "box-sizing:border-box;padding:10px;font-size:1rem;border-radius:8px}" \
+  "input{border:1px solid #bbb}button{margin-top:18px;border:0;"         \
+  "background:#0676df;color:#fff}.note{font-size:.85rem;color:#666}"    \
+  ".err{color:#b00020}.ok{color:#16833b;font-weight:600}"               \
   "</style></head><body><main>"
 
 #define VP_PAGE_TAIL "</main></body></html>"
 
-size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
-                                   const char *notice,
-                                   const char *current_ssid)
+static size_t vp_http_form_page_notice(char *buf, size_t buflen,
+                                       const char *notice,
+                                       const char *current_ssid,
+                                       bool saved)
 {
   char escaped[256];
   char escaped_ssid[VELASIGHT_PROV_SSID_MAX * 6 + 1];
@@ -470,7 +462,7 @@ size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
                      VP_PAGE_HEAD
                       "<h1>设备配网</h1>"
                       "<p class=\"note\">当前存储的 Wi-Fi：<strong>%s</strong></p>"
-                     "%s%s%s"
+                      "%s%s%s"
                      "<form action=\"/save\" method=\"post\">"
                      "<label for=\"ssid\">网络名称（SSID）</label>"
                       "<input id=\"ssid\" name=\"ssid\" type=\"text\" "
@@ -478,17 +470,17 @@ size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
                      "<label for=\"password\">密码（开放网络留空）</label>"
                       "<input id=\"password\" name=\"password\" "
                       "type=\"password\" maxlength=\"63\">"
-                      "<label for=\"mimo_apikey\">MiMo API key（可选）</label>"
+                       "<label for=\"mimo_apikey\">MiMo API key（可选）</label>"
                       "<input id=\"mimo_apikey\" name=\"mimo_apikey\" "
                       "type=\"password\" maxlength=\"512\" "
                       "autocomplete=\"off\">"
                      "<button type=\"submit\">保存</button>"
                      "</form>"
-                     "<p class=\"note\">凭据保存在设备的持久存储中，"
-                     "本页面不会切换 Wi-Fi 模式。</p>"
-                     VP_PAGE_TAIL,
+                      "<p class=\"note\">保存后可在设备上长按返回。</p>"
+                      VP_PAGE_TAIL,
                       escaped_ssid[0] != '\0' ? escaped_ssid : "未配置",
-                      escaped[0] != '\0' ? "<p class=\"err\">" : "",
+                      escaped[0] != '\0' ? saved ? "<p class=\"ok\">" :
+                                                   "<p class=\"err\">" : "",
                       escaped,
                       escaped[0] != '\0' ? "</p>" : "",
                       ssid_attr);
@@ -501,6 +493,13 @@ size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
   return vp_wrap(buf, buflen, 200, body, (size_t)bodylen);
 }
 
+size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
+                                   const char *notice,
+                                   const char *current_ssid)
+{
+  return vp_http_form_page_notice(buf, buflen, notice, current_ssid, false);
+}
+
 size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
 {
   return vp_http_form_page_with_ssid(buf, buflen, notice, NULL);
@@ -509,40 +508,9 @@ size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
 size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
                           uint32_t generation, bool open_network)
 {
-  char escaped[VELASIGHT_PROV_SSID_MAX * 6 + 1];
-  char body[VP_HTTP_BODY_BUILD];
-  int bodylen;
-
-  if (buf == NULL || ssid == NULL)
-    {
-      return 0;
-    }
-
-  if (vp_html_escape(ssid, escaped, sizeof(escaped)) < 0)
-    {
-      return 0;
-    }
-
-  bodylen = snprintf(body, sizeof(body),
-                     VP_PAGE_HEAD
-                     "<h1>已保存</h1>"
-                     "<p>网络：<strong>%s</strong></p>"
-                     "<p>加密：%s</p>"
-                     "<p>第 %u 次保存</p>"
-                     "<p class=\"note\">凭据已写入设备持久存储。"
-                      "当前仍处于配网热点模式，可继续修改配置。"
-                      "</p>"
-                      "<a class=\"button\" href=\"/\">返回配网输入主界面</a>"
-                      VP_PAGE_TAIL,
-                     escaped, open_network ? "开放网络" : "有密码",
-                     (unsigned)generation);
-
-  if (bodylen < 0)
-    {
-      return 0;
-    }
-
-  return vp_wrap(buf, buflen, 200, body, (size_t)bodylen);
+  (void)generation;
+  (void)open_network;
+  return vp_http_form_page_notice(buf, buflen, "已保存", ssid, true);
 }
 
 size_t vp_http_status_page(char *buf, size_t buflen, int status,

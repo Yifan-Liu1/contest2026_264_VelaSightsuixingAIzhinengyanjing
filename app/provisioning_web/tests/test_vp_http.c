@@ -154,6 +154,7 @@ static void test_pages(void)
 
   len = vp_http_form_page(buf, sizeof(buf), NULL);
   CHECK(len > 0 && len < sizeof(buf), "the form page is generated");
+  CHECK(len < 1514, "the form response fits in one IOB-sized write");
   CHECK(strncmp(buf, "HTTP/1.1 200 OK\r\n", 17) == 0,
         "the form page carries a 200 status line");
   CHECK(strstr(buf, "Content-Length: ") != NULL,
@@ -174,12 +175,14 @@ static void test_pages(void)
 
   len = vp_http_saved_page(buf, sizeof(buf), "AIPC", 3, false);
   CHECK(len > 0 && strstr(buf, "AIPC") != NULL &&
-        strstr(buf, "HTTP/1.1 200 OK") != NULL,
-        "the success page shows the SSID");
-  CHECK(strstr(buf, "3") != NULL, "the success page shows the generation");
-  CHECK(strstr(buf, "href=\"/\"") != NULL &&
-        strstr(buf, "返回配网输入主界面") != NULL,
-        "the success page links back to the provisioning form");
+         strstr(buf, "HTTP/1.1 200 OK") != NULL,
+        "the saved form shows the SSID");
+  CHECK(strstr(buf, "class=\"ok\">已保存") != NULL,
+        "the saved form shows a green success notice");
+  CHECK(strstr(buf, "name=\"password\"") != NULL &&
+        strstr(buf, "href=\"/\"") == NULL,
+        "saving stays on the input form without a return link");
+  CHECK(len < 1514, "the saved response fits in one IOB-sized write");
 
   len = vp_http_saved_page(buf, sizeof(buf), "<script>", 1, true);
   CHECK(len > 0 && strstr(buf, "<script>") == NULL &&

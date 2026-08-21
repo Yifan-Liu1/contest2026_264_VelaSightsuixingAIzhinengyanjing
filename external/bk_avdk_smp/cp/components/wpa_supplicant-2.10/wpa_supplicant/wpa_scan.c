@@ -2903,7 +2903,7 @@ wpa_supplicant_get_scan_results(struct wpa_supplicant *wpa_s,
 				sta_disconnected.disconnect_reason = linkinfo.reason_code;
 				sta_disconnected.local_generated = true;
 
-				#if CONFIG_WIFI_VNET_CONTROLLER && !CONFIG_WIFI_VNET_AP_IPV4
+				#if CONFIG_WIFI_VNET_CONTROLLER
 				cif_handle_bk_cmd_wifi_event_ind(CIF_WIFI_EVT_STA_DISCONNECTED,
 								 &sta_disconnected,
 								 sizeof(sta_disconnected));

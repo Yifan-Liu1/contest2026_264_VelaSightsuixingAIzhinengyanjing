@@ -201,6 +201,83 @@ static void test_lifecycle(void)
         "a second stop reports -EALREADY");
 }
 
+static void test_stop_interrupts_client(void)
+{
+  struct velasight_prov_config_s cfg;
+  struct sockaddr_in addr;
+  struct timespec start;
+  struct timespec end;
+  long elapsed_ms;
+  int fd;
+
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.store_path = g_path;
+  CHECK(start_on_free_port(&cfg) == 0,
+        "the service starts for an interrupted client");
+
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  CHECK(fd >= 0, "the stalled client socket opens");
+  if (fd < 0)
+    {
+      (void)velasight_provisioning_stop();
+      return;
+    }
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(g_port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  CHECK(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0,
+        "the stalled client connects");
+  CHECK(write(fd, "POST /save HTTP/1.1\r\n", 21) == 21,
+        "the stalled client sends an incomplete request");
+  usleep(50000);
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  CHECK(velasight_provisioning_stop() == 0,
+        "stop interrupts an active client");
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  elapsed_ms = (end.tv_sec - start.tv_sec) * 1000L +
+               (end.tv_nsec - start.tv_nsec) / 1000000L;
+  CHECK(elapsed_ms < 500,
+        "stop does not wait for the client request timeout");
+  close(fd);
+}
+
+static void test_connection_burst_and_stop(void)
+{
+  struct velasight_prov_config_s cfg;
+  struct timespec start;
+  struct timespec end;
+  char reply[8192];
+  long elapsed_ms;
+  int request;
+
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.store_path = g_path;
+  CHECK(start_on_free_port(&cfg) == 0,
+        "the service starts for a browser connection burst");
+
+  for (request = 0; request < 24; request++)
+    {
+      int len = http_exchange(
+          "GET / HTTP/1.1\r\nHost: 192.168.10.1\r\n"
+          "Connection: close\r\n\r\n", reply, sizeof(reply));
+
+      CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL,
+            "every short browser connection receives the form");
+    }
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  CHECK(velasight_provisioning_stop() == 0,
+        "the service stops after the connection burst");
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  elapsed_ms = (end.tv_sec - start.tv_sec) * 1000L +
+               (end.tv_nsec - start.tv_nsec) / 1000000L;
+  CHECK(elapsed_ms < 500,
+        "connection cleanup cannot hold the network switch worker");
+}
+
 static void test_get_and_save(void)
 {
   struct velasight_prov_credentials_s cred;
@@ -282,6 +359,54 @@ static void test_get_and_save(void)
         "the replacement is what is stored");
 
   CHECK(velasight_provisioning_stop() == 0, "the service stops after saves");
+}
+
+static void test_repeated_password_save_cycles(void)
+{
+  struct velasight_prov_credentials_s cred;
+  struct velasight_prov_config_s cfg;
+  char path[sizeof(g_path) + 16];
+  char reply[8192];
+  int cycle;
+
+  snprintf(path, sizeof(path), "%s.cycles", g_path);
+  unlink(path);
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.store_path = path;
+  cfg.on_saved = on_saved;
+
+  for (cycle = 0; cycle < 4; cycle++)
+    {
+      int wait;
+      int len;
+
+      reset_callback();
+      CHECK(start_on_free_port(&cfg) == 0,
+            "the service restarts for a password save cycle");
+      len = http_exchange(
+          "POST /save HTTP/1.1\r\n"
+          "Content-Type: application/x-www-form-urlencoded\r\n"
+          "Content-Length: 35\r\n\r\n"
+          "ssid=CycleNet&password=cyclepass123", reply, sizeof(reply));
+      CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL,
+            "the password save cycle returns success");
+      for (wait = 0; wait < 200 && cb_calls() == 0; wait++)
+        {
+          usleep(10000);
+        }
+
+      CHECK(cb_calls() == 1 && g_cb_status == 0,
+            "the password save cycle reports persistence success");
+      CHECK(velasight_provisioning_stop() == 0,
+            "the service stops after a password save cycle");
+    }
+
+  CHECK(velasight_provisioning_load_from(path, &cred) == 0 &&
+        strcmp(cred.ssid, "CycleNet") == 0 &&
+        strcmp(cred.password, "cyclepass123") == 0 &&
+        cred.generation == 4,
+        "repeated password saves retain the latest valid record");
+  unlink(path);
 }
 
 static void test_rejections(void)
@@ -426,7 +551,10 @@ int main(void)
   snprintf(g_path, sizeof(g_path), "%s/wifi-provision.bin", g_dir);
 
   test_lifecycle();
+  test_stop_interrupts_client();
+  test_connection_burst_and_stop();
   test_get_and_save();
+  test_repeated_password_save_cycles();
   test_rejections();
   test_one_shot();
   test_store_failure_is_reported();

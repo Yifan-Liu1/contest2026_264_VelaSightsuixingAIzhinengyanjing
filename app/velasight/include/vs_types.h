@@ -83,6 +83,14 @@ enum vs_net_state_e
   VS_NET_ERROR
 };
 
+enum vs_wifi_issue_e
+{
+  VS_WIFI_ISSUE_NONE = 0,
+  VS_WIFI_ISSUE_SSID_NOT_FOUND,
+  VS_WIFI_ISSUE_PASSWORD,
+  VS_WIFI_ISSUE_DISCONNECTED
+};
+
 struct vs_net_status_s
 {
   enum vs_net_mode_e mode;
@@ -92,6 +100,8 @@ struct vs_net_status_s
   char password[64];
   char address[16];
   char error_reason[VS_TEXT_SHORT];
+  enum vs_wifi_issue_e wifi_issue;
+  uint8_t ap_client_count;
 };
 
 struct vs_history_item_s

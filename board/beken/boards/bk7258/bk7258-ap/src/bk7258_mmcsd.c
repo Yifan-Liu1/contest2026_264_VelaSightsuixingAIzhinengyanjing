@@ -20,6 +20,8 @@
 #include <nuttx/signal.h>
 #include <nuttx/wqueue.h>
 
+#include <arch/board/board.h>
+
 #include "bk7258_sdio.h"
 
 #define BK7258_MMCSD_PROBE_WAIT_MS 7000
@@ -454,6 +456,9 @@ static void bk7258_mmcsd_worker(FAR void *arg)
   else
     {
       printf("SD-NAND delayed initialization complete\n");
+#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+      bk7258_nand_seed_agent_config();
+#endif
     }
 }
 
