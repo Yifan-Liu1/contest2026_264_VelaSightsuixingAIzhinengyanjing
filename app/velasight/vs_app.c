@@ -19,7 +19,7 @@
 
 #define VS_INPUT_EVENT_QUEUE_SIZE 64
 #define VS_INPUT_EVENTS_PER_FRAME 8
-#define VS_RESPONSE_VISIBLE_MS 120
+#define VS_RESPONSE_VISIBLE_MS 200
 
 static const struct vs_history_item_s g_history[] =
 {
@@ -429,7 +429,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
                  "%02u/%02u", runtime->index + 1, vs_history_count());
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "已保存");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "询问");
-        vs_key_set(snapshot, VS_KEY_BACK, "返回");
+        vs_key_set(snapshot, VS_KEY_BACK, "上一条");
         vs_key_set(snapshot, VS_KEY_NEXT, "下一条");
         break;
 
@@ -444,7 +444,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
                  "照片问答");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "准备好");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "拍照提问");
-        vs_key_set(snapshot, VS_KEY_BACK, "返回");
+        vs_key_set(snapshot, VS_KEY_BACK, "上一条");
         vs_key_set(snapshot, VS_KEY_NEXT, "下一条");
         break;
 
@@ -1089,7 +1089,16 @@ static void vs_handle_event(struct vs_display_s *display,
                   }
               }
             else if (event->key == VS_KEY_BACK)
-              runtime->page = VS_PAGE_HISTORY;
+              {
+                if (runtime->index == 0)
+                  {
+                    runtime->history_blank = true;
+                    runtime->index = vs_history_count() - 1;
+                    runtime->page = VS_PAGE_HISTORY_BLANK;
+                  }
+                else
+                  runtime->index--;
+              }
             break;
 
           case VS_PAGE_HISTORY_BLANK:

@@ -19,6 +19,8 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_DISPLAY_COUNT 2
 #define VS_CONTENT_PANEL 0
 #define VS_STATUS_PANEL  1
+#define VS_MAX_FPS             10
+#define VS_FRAME_INTERVAL_MS   (1000 / VS_MAX_FPS)
 #define VS_TOP_DIVIDER_Y     32
 #define VS_BOTTOM_DIVIDER_Y  108
 #define VS_TITLE_X           48
@@ -152,6 +154,9 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
       lv_label_set_long_mode(panel->status_line[line], LV_LABEL_LONG_CLIP);
       lv_obj_add_flag(panel->status_line[line], LV_OBJ_FLAG_HIDDEN);
     }
+  lv_obj_set_pos(panel->status_line[1], 28, VS_LOWER_BOTTOM_Y);
+  lv_obj_set_width(panel->status_line[1], 104);
+  lv_obj_set_style_text_color(panel->status_line[1], vs_rgb(52, 201, 173), 0);
   vs_divider_style(panel->divider[0], 20, VS_TOP_DIVIDER_Y, 120);
   vs_divider_style(panel->divider[1], 12, VS_BOTTOM_DIVIDER_Y, 136);
 
@@ -184,6 +189,8 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
   lv_obj_set_style_arc_width(panel->progress, 4, LV_PART_INDICATOR);
   lv_obj_set_style_opa(panel->progress, LV_OPA_TRANSP, LV_PART_KNOB);
   lv_obj_add_flag(panel->progress, LV_OBJ_FLAG_HIDDEN);
+  lv_timer_set_period(lv_display_get_refr_timer(display),
+                      VS_FRAME_INTERVAL_MS);
   return 0;
 }
 
@@ -242,8 +249,7 @@ static bool vs_content_changed(const struct vs_ui_snapshot_s *current,
          strcmp(current->content_title, previous->content_title) != 0 ||
          strcmp(current->content_body, previous->content_body) != 0 ||
          strcmp(current->content_meta, previous->content_meta) != 0 ||
-         vs_key_changed(&current->softkey[VS_KEY_BACK],
-                        &previous->softkey[VS_KEY_BACK]);
+         strcmp(current->status_meta, previous->status_meta) != 0;
 }
 
 static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
@@ -255,7 +261,8 @@ static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
          current->emotion_color != previous->emotion_color ||
          strcmp(current->status_title, previous->status_title) != 0 ||
          strcmp(current->status_value, previous->status_value) != 0 ||
-         strcmp(current->status_meta, previous->status_meta) != 0 ||
+         vs_key_changed(&current->softkey[VS_KEY_BACK],
+                        &previous->softkey[VS_KEY_BACK]) ||
          vs_key_changed(&current->softkey[VS_KEY_CONFIRM],
                         &previous->softkey[VS_KEY_CONFIRM]) ||
          vs_key_changed(&current->softkey[VS_KEY_NEXT],
@@ -285,24 +292,27 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
     {
       bool visible = snapshot->softkey[key].visible;
 
-      /* The left physical screen carries back.  The right physical screen
-       * carries the power/confirm action and next from left to right. */
+      /* The left footer carries metadata and short status only.  The right
+       * footer is fixed: back/next on the first row, confirm on the second. */
       if (content_panel)
+        visible = false;
+      else
         {
-          visible = key == VS_KEY_BACK && visible;
           if (key == VS_KEY_BACK)
+            {
+              lv_obj_set_pos(panel->key[key], 8, VS_LOWER_TOP_Y);
+              lv_obj_set_width(panel->key[key], 64);
+            }
+          else if (key == VS_KEY_NEXT)
+            {
+              lv_obj_set_pos(panel->key[key], 88, VS_LOWER_TOP_Y);
+              lv_obj_set_width(panel->key[key], 64);
+            }
+          else
             {
               lv_obj_set_pos(panel->key[key], 28, VS_LOWER_BOTTOM_Y);
               lv_obj_set_width(panel->key[key], 104);
             }
-        }
-      else
-        {
-          visible = key != VS_KEY_BACK && visible;
-          if (key == VS_KEY_CONFIRM)
-            lv_obj_set_pos(panel->key[key], 8, VS_LOWER_TOP_Y);
-          else if (key == VS_KEY_NEXT)
-            lv_obj_set_pos(panel->key[key], 88, VS_LOWER_TOP_Y);
         }
 
       if (snapshot->progress_kind != VS_PROGRESS_NONE &&
@@ -323,8 +333,8 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
 static void vs_render_content(struct vs_panel_s *panel,
                               const struct vs_ui_snapshot_s *snapshot)
 {
-  /* The wider upper row carries metadata.  Back uses the centered lower
-   * chord so it remains separate from the right screen's action row. */
+  /* The wider upper row carries metadata; the lower row carries the short
+   * status moved from the right screen. */
 
   lv_obj_set_y(panel->meta, VS_LOWER_TOP_Y);
   vs_set_label(panel->title, snapshot->content_title);
@@ -342,6 +352,8 @@ static void vs_render_content(struct vs_panel_s *panel,
       vs_set_label(panel->status_line[0], line);
       vs_set_hidden(panel->status_line[0], false);
     }
+  vs_set_label(panel->status_line[1], snapshot->status_meta);
+  vs_set_hidden(panel->status_line[1], snapshot->status_meta[0] == '\0');
   vs_panel_set_progress(panel, snapshot, false);
   vs_panel_set_keys(panel, snapshot, true);
 }
@@ -369,10 +381,9 @@ static void vs_render_status(struct vs_panel_s *panel,
                       VS_STATUS_LONG_HEIGHT);
     }
 
-  lv_obj_set_y(panel->meta, VS_LOWER_BOTTOM_Y);
   vs_set_label(panel->title, snapshot->status_title);
   vs_set_label(panel->body, value);
-  vs_set_label(panel->meta, snapshot->status_meta);
+  vs_set_label(panel->meta, "");
   vs_set_text_color(panel->body, vs_color(snapshot->emotion_color));
   vs_panel_set_progress(panel, snapshot, progress &&
                         snapshot->progress_kind == VS_PROGRESS_HOLD);
@@ -467,18 +478,8 @@ int vs_display_render(struct vs_display_s *display,
 #endif
       display->revealed = true;
     }
-  else
-    {
-      /* State changes normally wait for LVGL's 33 ms refresh timer.  That
-       * timer is too coarse for button feedback, and a full-frame LCD push
-       * can make the next timer pass arrive even later.  Flush only the
-       * panels changed by this snapshot now; the regular timer remains
-       * responsible for its own animations such as the waiting suffix. */
-      if (status_dirty)
-        lv_refr_now(display->panel[VS_STATUS_PANEL].display);
-      if (content_dirty)
-        lv_refr_now(display->panel[VS_CONTENT_PANEL].display);
-    }
+  /* After reveal, LVGL's 100 ms display timers coalesce invalidations and cap
+   * each panel at 10 FPS.  Only the hidden boot hand-off bypasses that cap. */
   display->previous = *snapshot;
   display->previous_valid = true;
   display->waiting = snapshot->progress_kind == VS_PROGRESS_WAIT;
@@ -507,7 +508,7 @@ void vs_display_tick(struct vs_display_s *display)
 
           snprintf(meta, sizeof(meta), "%s%s", display->wait_meta,
                    phases[display->wait_phase]);
-          vs_set_label(display->panel[VS_STATUS_PANEL].meta,
+          vs_set_label(display->panel[VS_CONTENT_PANEL].status_line[1],
                        meta);
           display->wait_phase = (display->wait_phase + 1) % 4;
           display->wait_next_ms = now + 350;
