@@ -11,7 +11,7 @@
 
 #define BK7258_FLASH_BASE          0x02000000u
 #define BK7258_AP_FLASH_BASE       0x02150000u
-#define BK7258_AP_FLASH_SIZE       0x00110000u
+#define BK7258_AP_FLASH_SIZE       0x003d0000u
 
 #define BK7258_AP_RAM_BASE         0x28010000u
 #define BK7258_AP_RAM_SIZE         0x00054000u

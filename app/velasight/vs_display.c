@@ -19,8 +19,6 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_DISPLAY_COUNT 2
 #define VS_CONTENT_PANEL 0
 #define VS_STATUS_PANEL  1
-#define VS_STATUS_SCALE  384
-
 #define VS_TOP_DIVIDER_Y     32
 #define VS_BOTTOM_DIVIDER_Y  108
 #define VS_TITLE_X           48
@@ -37,10 +35,10 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_META_X            28
 #define VS_META_WIDTH        104
 
-#define VS_STATUS_SHORT_X       28
-#define VS_STATUS_SHORT_Y       52
-#define VS_STATUS_SHORT_WIDTH   104
-#define VS_STATUS_SHORT_HEIGHT  32
+#define VS_STATUS_SHORT_X       2
+#define VS_STATUS_SHORT_Y       44
+#define VS_STATUS_SHORT_WIDTH   156
+#define VS_STATUS_SHORT_HEIGHT  48
 #define VS_STATUS_LONG_X        16
 #define VS_STATUS_LONG_Y        43
 #define VS_STATUS_LONG_WIDTH    128
@@ -63,6 +61,8 @@ struct vs_display_s
 {
   struct vs_panel_s panel[VS_DISPLAY_COUNT];
   lv_nuttx_result_t nuttx;
+  struct vs_ui_snapshot_s previous;
+  bool previous_valid;
   bool revealed;
   bool waiting;
   uint8_t wait_phase;
@@ -193,7 +193,77 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
 
 static void vs_set_label(lv_obj_t *label, const char *text)
 {
-  lv_label_set_text(label, text != NULL ? text : "");
+  const char *value = text != NULL ? text : "";
+
+  if (strcmp(lv_label_get_text(label), value) != 0)
+    lv_label_set_text(label, value);
+}
+
+static void vs_set_hidden(lv_obj_t *obj, bool hidden)
+{
+  if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) == hidden)
+    return;
+
+  if (hidden)
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+  else
+    lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void vs_set_text_color(lv_obj_t *obj, lv_color_t color)
+{
+  if (!lv_color_eq(lv_obj_get_style_text_color(obj, 0), color))
+    lv_obj_set_style_text_color(obj, color, 0);
+}
+
+static void vs_set_bg_color(lv_obj_t *obj, lv_color_t color)
+{
+  if (!lv_color_eq(lv_obj_get_style_bg_color(obj, 0), color))
+    lv_obj_set_style_bg_color(obj, color, 0);
+}
+
+static void vs_set_bg_opa(lv_obj_t *obj, lv_opa_t opa)
+{
+  if (lv_obj_get_style_bg_opa(obj, 0) != opa)
+    lv_obj_set_style_bg_opa(obj, opa, 0);
+}
+
+static bool vs_key_changed(const struct vs_softkey_s *current,
+                           const struct vs_softkey_s *previous)
+{
+  return current->visible != previous->visible ||
+         current->highlighted != previous->highlighted ||
+         strcmp(current->text, previous->text) != 0;
+}
+
+static bool vs_content_changed(const struct vs_ui_snapshot_s *current,
+                               const struct vs_ui_snapshot_s *previous)
+{
+  return current->page != previous->page ||
+         current->history_is_blank != previous->history_is_blank ||
+         current->wifi_ready != previous->wifi_ready ||
+         current->api_ready != previous->api_ready ||
+         strcmp(current->content_title, previous->content_title) != 0 ||
+         strcmp(current->content_body, previous->content_body) != 0 ||
+         strcmp(current->content_meta, previous->content_meta) != 0 ||
+         vs_key_changed(&current->softkey[VS_KEY_CONFIRM],
+                        &previous->softkey[VS_KEY_CONFIRM]);
+}
+
+static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
+                              const struct vs_ui_snapshot_s *previous)
+{
+  return current->page != previous->page ||
+         current->progress != previous->progress ||
+         current->progress_kind != previous->progress_kind ||
+         current->emotion_color != previous->emotion_color ||
+         strcmp(current->status_title, previous->status_title) != 0 ||
+         strcmp(current->status_value, previous->status_value) != 0 ||
+         strcmp(current->status_meta, previous->status_meta) != 0 ||
+         vs_key_changed(&current->softkey[VS_KEY_BACK],
+                        &previous->softkey[VS_KEY_BACK]) ||
+         vs_key_changed(&current->softkey[VS_KEY_NEXT],
+                        &previous->softkey[VS_KEY_NEXT]);
 }
 
 static void vs_panel_set_progress(struct vs_panel_s *panel,
@@ -202,11 +272,11 @@ static void vs_panel_set_progress(struct vs_panel_s *panel,
 {
   if (visible)
     {
-      lv_obj_remove_flag(panel->progress, LV_OBJ_FLAG_HIDDEN);
+      vs_set_hidden(panel->progress, false);
       lv_arc_set_value(panel->progress, snapshot->progress);
     }
   else
-    lv_obj_add_flag(panel->progress, LV_OBJ_FLAG_HIDDEN);
+    vs_set_hidden(panel->progress, true);
 }
 
 static void vs_panel_set_keys(struct vs_panel_s *panel,
@@ -240,13 +310,13 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
         visible = false;
 
       vs_set_label(panel->key[key], visible ? snapshot->softkey[key].text : "");
-      lv_obj_set_style_text_color(panel->key[key],
+      vs_set_text_color(panel->key[key],
           snapshot->softkey[key].highlighted ? vs_rgb(7, 12, 21) :
-          vs_rgb(155, 175, 187), 0);
-      lv_obj_set_style_bg_color(panel->key[key], vs_rgb(53, 199, 174), 0);
-      lv_obj_set_style_bg_opa(panel->key[key],
+          vs_rgb(155, 175, 187));
+      vs_set_bg_color(panel->key[key], vs_rgb(53, 199, 174));
+      vs_set_bg_opa(panel->key[key],
           snapshot->softkey[key].highlighted && visible ? LV_OPA_COVER :
-          LV_OPA_TRANSP, 0);
+          LV_OPA_TRANSP);
     }
 }
 
@@ -261,7 +331,7 @@ static void vs_render_content(struct vs_panel_s *panel,
   vs_set_label(panel->body, snapshot->content_body);
   vs_set_label(panel->meta, snapshot->content_meta);
   for (int line = 0; line < 2; line++)
-    lv_obj_add_flag(panel->status_line[line], LV_OBJ_FLAG_HIDDEN);
+    vs_set_hidden(panel->status_line[line], true);
   if (snapshot->page == VS_PAGE_HISTORY_BLANK)
     {
       char line[VS_TEXT_LONG];
@@ -274,7 +344,7 @@ static void vs_render_content(struct vs_panel_s *panel,
        * fabricated percentage while the measurement source is unavailable. */
       vs_set_label(panel->status_line[1], "电量:错误");
       for (int status_line = 0; status_line < 2; status_line++)
-        lv_obj_remove_flag(panel->status_line[status_line], LV_OBJ_FLAG_HIDDEN);
+        vs_set_hidden(panel->status_line[status_line], false);
     }
   vs_panel_set_progress(panel, snapshot, false);
   vs_panel_set_keys(panel, snapshot, true);
@@ -295,25 +365,19 @@ static void vs_render_status(struct vs_panel_s *panel,
       lv_obj_set_pos(panel->body, VS_STATUS_SHORT_X, VS_STATUS_SHORT_Y);
       lv_obj_set_size(panel->body, VS_STATUS_SHORT_WIDTH,
                       VS_STATUS_SHORT_HEIGHT);
-      lv_obj_set_style_transform_scale(panel->body, VS_STATUS_SCALE, 0);
-      lv_obj_set_style_transform_pivot_x(panel->body,
-                                         VS_STATUS_SHORT_WIDTH / 2, 0);
-      lv_obj_set_style_transform_pivot_y(panel->body,
-                                         VS_STATUS_SHORT_HEIGHT / 2, 0);
     }
   else
     {
       lv_obj_set_pos(panel->body, VS_STATUS_LONG_X, VS_STATUS_LONG_Y);
       lv_obj_set_size(panel->body, VS_STATUS_LONG_WIDTH,
                       VS_STATUS_LONG_HEIGHT);
-      lv_obj_set_style_transform_scale(panel->body, LV_SCALE_NONE, 0);
     }
 
   lv_obj_set_y(panel->meta, VS_LOWER_BOTTOM_Y);
   vs_set_label(panel->title, snapshot->status_title);
   vs_set_label(panel->body, value);
   vs_set_label(panel->meta, snapshot->status_meta);
-  lv_obj_set_style_text_color(panel->body, vs_color(snapshot->emotion_color), 0);
+  vs_set_text_color(panel->body, vs_color(snapshot->emotion_color));
   vs_panel_set_progress(panel, snapshot, progress &&
                         snapshot->progress_kind == VS_PROGRESS_HOLD);
   vs_panel_set_keys(panel, snapshot, false);
@@ -375,13 +439,22 @@ fail_status:
 int vs_display_render(struct vs_display_s *display,
                       const struct vs_ui_snapshot_s *snapshot)
 {
+  bool content_dirty;
+  bool status_dirty;
+
   if (display == NULL || snapshot == NULL)
     return -EINVAL;
 
   /* fb1 is the physical left content display; fb0 is the physical right
    * status display. */
-  vs_render_content(&display->panel[VS_CONTENT_PANEL], snapshot);
-  vs_render_status(&display->panel[VS_STATUS_PANEL], snapshot);
+  content_dirty = !display->previous_valid ||
+                  vs_content_changed(snapshot, &display->previous);
+  status_dirty = !display->previous_valid ||
+                 vs_status_changed(snapshot, &display->previous);
+  if (content_dirty)
+    vs_render_content(&display->panel[VS_CONTENT_PANEL], snapshot);
+  if (status_dirty)
+    vs_render_status(&display->panel[VS_STATUS_PANEL], snapshot);
 
   if (!display->revealed)
     {
@@ -398,6 +471,20 @@ int vs_display_render(struct vs_display_s *display,
 #endif
       display->revealed = true;
     }
+  else
+    {
+      /* State changes normally wait for LVGL's 33 ms refresh timer.  That
+       * timer is too coarse for button feedback, and a full-frame LCD push
+       * can make the next timer pass arrive even later.  Flush only the
+       * panels changed by this snapshot now; the regular timer remains
+       * responsible for its own animations such as the waiting suffix. */
+      if (status_dirty)
+        lv_refr_now(display->panel[VS_STATUS_PANEL].display);
+      if (content_dirty)
+        lv_refr_now(display->panel[VS_CONTENT_PANEL].display);
+    }
+  display->previous = *snapshot;
+  display->previous_valid = true;
   display->waiting = snapshot->progress_kind == VS_PROGRESS_WAIT;
   snprintf(display->wait_meta, sizeof(display->wait_meta), "%s",
            snapshot->status_meta);
@@ -406,8 +493,6 @@ int vs_display_render(struct vs_display_s *display,
       display->wait_phase = 0;
       display->wait_next_ms = 0;
     }
-  if (display->revealed)
-    lv_timer_handler();
   return 0;
 }
 

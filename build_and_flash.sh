@@ -58,16 +58,22 @@ cd "$OPENVELA_ROOT"
 
 test -s "$AP_BIN" || die "missing AP binary: $AP_BIN"
 grep -q '^CONFIG_LV_TXT_ENC_UTF8=y$' "$AP_OUT/.config" || die 'UTF-8 is disabled'
-grep -q '^CONFIG_LV_FONT_FMT_TXT_LARGE=y$' "$AP_OUT/.config" || die 'large LVGL font format is disabled'
+grep -q '^# CONFIG_LV_FONT_FMT_TXT_LARGE is not set$' "$AP_OUT/.config" || die 'large LVGL font format wastes flash'
 grep -q '^CONFIG_VS_SHORT_PRESS_MAX_MS=500$' "$AP_OUT/.config" || die 'short-press limit is not 500 ms'
+for app in KVDB_TOOL AGENT_CAMERA AUDIO_TEST CONV CAMERA_PREVIEW CTRLC_TEST \
+           HELLO_SCREEN PERIPH_SELFTEST SOCIAL_CUE SDNAND_INIT WEB_TOOL; do
+  grep -q "^CONFIG_LVX_USE_DEMO_CONTEST2026_264_${app}=y$" \
+    "$AP_OUT/.config" || die "restored app is not enabled: $app"
+done
 grep -q 'velasight_font_16_ui' "$AP_OUT/System.map" || die 'UI font is not linked'
-grep -q -- '--range 0x4e00-0x9fff' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'full CJK font range is missing'
+grep -q '^ \* Bpp: 1$' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not 1bpp'
+grep -q -- '--no-prefilter' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not the pixel-font build'
 grep -q 'voice_vad_process' "$AP_OUT/System.map" || die 'VAD is not linked'
 grep -q 'velaclaw_client_open' "$AP_OUT/System.map" || die 'local ai_agent client is not linked'
 
 AP_SIZE=$(stat -c%s -- "$AP_BIN")
 AP_LIMIT=$((3904 * 1024))
-[ "$AP_SIZE" -le "$AP_LIMIT" ] || die "AP binary exceeds 3904K raw linker region: $AP_SIZE > $AP_LIMIT"
+[ "$AP_SIZE" -le "$AP_LIMIT" ] || die "AP binary exceeds MPU flash region: $AP_SIZE > $AP_LIMIT"
 
 mkdir -p "$(dirname -- "$AP_INPUT")"
 cp -- "$AP_BIN" "$AP_INPUT"

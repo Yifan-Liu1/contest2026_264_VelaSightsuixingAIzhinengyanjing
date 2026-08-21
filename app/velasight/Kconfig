@@ -17,13 +17,13 @@ config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 
 config VS_INPUT_POLL_MS
 	int "VelaSight input polling interval (ms)"
-	default 10
+	default 5
 	range 5 100
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 
 config VS_SHORT_PRESS_MIN_MS
 	int "VelaSight short press minimum (ms)"
-	default 80
+	default 20
 	range 10 1000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 

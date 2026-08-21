@@ -1,9 +1,12 @@
 #include <nuttx/config.h>
+#include <nuttx/sched.h>
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <velaclaw/client.h>
@@ -13,6 +16,9 @@
 #include "include/vs_display.h"
 #include "include/vs_input.h"
 #include "include/vs_network.h"
+
+#define VS_INPUT_EVENT_QUEUE_SIZE 64
+#define VS_INPUT_EVENTS_PER_FRAME 8
 
 static const struct vs_history_item_s g_history[] =
 {
@@ -38,6 +44,113 @@ static struct
 static struct vs_network_s *g_network_result;
 static uint32_t g_active_request_id;
 
+static struct
+{
+  pthread_mutex_t lock;
+  struct vs_input_event_s event[VS_INPUT_EVENT_QUEUE_SIZE];
+  uint8_t read;
+  uint8_t write;
+  uint8_t count;
+} g_input_events =
+{
+  .lock = PTHREAD_MUTEX_INITIALIZER
+};
+
+static struct vs_input_s *g_input_worker_state;
+
+static void vs_input_queue_reset(void)
+{
+  pthread_mutex_lock(&g_input_events.lock);
+  g_input_events.read = 0;
+  g_input_events.write = 0;
+  g_input_events.count = 0;
+  pthread_mutex_unlock(&g_input_events.lock);
+}
+
+static void vs_input_queue_push(const struct vs_input_event_s *event)
+{
+  pthread_mutex_lock(&g_input_events.lock);
+
+  /* Progress is state, not an action.  If the UI is blocked on LCD I/O,
+   * retain the newest progress value instead of filling the queue with stale
+   * intermediate values. */
+  if (event->type == VS_INPUT_PROGRESS ||
+      event->type == VS_INPUT_COMBO_PROGRESS)
+    {
+      uint8_t index;
+      uint8_t i;
+
+      for (i = 0, index = g_input_events.read;
+           i < g_input_events.count;
+           i++, index = (index + 1) % VS_INPUT_EVENT_QUEUE_SIZE)
+        {
+          if (g_input_events.event[index].type == event->type &&
+              g_input_events.event[index].key == event->key)
+            {
+              g_input_events.event[index] = *event;
+              pthread_mutex_unlock(&g_input_events.lock);
+              return;
+            }
+        }
+    }
+
+  if (g_input_events.count == VS_INPUT_EVENT_QUEUE_SIZE)
+    {
+      /* Keep action events by discarding the oldest queued event.  Progress
+       * events are coalesced above and are safe to lose when saturated. */
+      g_input_events.read =
+        (g_input_events.read + 1) % VS_INPUT_EVENT_QUEUE_SIZE;
+      g_input_events.count--;
+    }
+
+  g_input_events.event[g_input_events.write] = *event;
+  g_input_events.write =
+    (g_input_events.write + 1) % VS_INPUT_EVENT_QUEUE_SIZE;
+  g_input_events.count++;
+  pthread_mutex_unlock(&g_input_events.lock);
+}
+
+static bool vs_input_queue_pop(struct vs_input_event_s *event)
+{
+  bool available = false;
+
+  pthread_mutex_lock(&g_input_events.lock);
+  if (g_input_events.count != 0)
+    {
+      *event = g_input_events.event[g_input_events.read];
+      g_input_events.read =
+        (g_input_events.read + 1) % VS_INPUT_EVENT_QUEUE_SIZE;
+      g_input_events.count--;
+      available = true;
+    }
+  pthread_mutex_unlock(&g_input_events.lock);
+  return available;
+}
+
+static int vs_input_worker(int argc, FAR char *argv[])
+{
+  struct vs_input_event_s event;
+
+  (void)argc;
+  (void)argv;
+  while (g_input_worker_state != NULL)
+    {
+      if (vs_input_poll(g_input_worker_state, &event) > 0)
+        vs_input_queue_push(&event);
+      usleep(CONFIG_VS_INPUT_POLL_MS * 1000);
+    }
+
+  return 0;
+}
+
+static uint32_t vs_app_now_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
 struct vs_runtime_s
 {
   enum vs_page_e page;
@@ -59,7 +172,7 @@ struct vs_runtime_s
   enum vs_net_mode_e network_target_mode;
   uint32_t next_request_id;
   uint32_t active_request_id;
-  uint8_t response_ticks;
+  uint32_t response_until_ms;
   enum vs_key_e response_key;
   struct vs_net_status_s network;
   char alert_text[VS_TEXT_LONG];
@@ -269,7 +382,9 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
   snapshot->photo_context = runtime->photo_context;
   snapshot->progress = runtime->progress;
   snapshot->emotion = runtime->emotion;
-  snapshot->response_active = runtime->response_ticks != 0;
+  snapshot->response_active = runtime->response_until_ms != 0 &&
+                              (int32_t)(runtime->response_until_ms -
+                                        vs_app_now_ms()) > 0;
   snapshot->response_key = runtime->response_key;
   snapshot->error_retryable = runtime->error_retryable;
   snapshot->wifi_ready = runtime->network.state == VS_NET_STA_READY ||
@@ -543,7 +658,8 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
 
   if (snapshot->progress_kind == VS_PROGRESS_HOLD)
     snapshot->progress = runtime->progress;
-  if (runtime->response_ticks != 0)
+  if (runtime->response_until_ms != 0 &&
+      (int32_t)(runtime->response_until_ms - vs_app_now_ms()) > 0)
     snapshot->softkey[runtime->response_key].highlighted = true;
 }
 
@@ -556,10 +672,17 @@ static void vs_render(struct vs_display_s *display,
   (void)vs_display_render(display, &snapshot);
 }
 
+static void vs_expire_response(struct vs_runtime_s *runtime)
+{
+  if (runtime->response_until_ms != 0 &&
+      (int32_t)(runtime->response_until_ms - vs_app_now_ms()) <= 0)
+    runtime->response_until_ms = 0;
+}
+
 static void vs_set_response(struct vs_runtime_s *runtime, enum vs_key_e key)
 {
   runtime->response_key = key;
-  runtime->response_ticks = 1;
+  runtime->response_until_ms = vs_app_now_ms() + 120;
 }
 
 static void vs_acknowledge(struct vs_display_s *display,
@@ -573,10 +696,6 @@ static void vs_acknowledge(struct vs_display_s *display,
     return;
 
   vs_set_response(runtime, key);
-  vs_render(display, runtime);
-  usleep(120000);
-  runtime->response_ticks = 0;
-  vs_render(display, runtime);
 }
 
 static void vs_set_error(struct vs_runtime_s *runtime, int error,
@@ -830,6 +949,12 @@ static void vs_handle_event(struct vs_display_s *display,
                             struct vs_network_s *network,
                             const struct vs_input_event_s *event)
 {
+  if (event->type == VS_INPUT_PRESS)
+    {
+      vs_acknowledge(display, runtime, event->key);
+      return;
+    }
+
   if (event->type == VS_INPUT_COMBO_PROGRESS &&
       (runtime->page == VS_PAGE_HISTORY || runtime->page == VS_PAGE_HISTORY_BLANK ||
        (runtime->page == VS_PAGE_NET_SWITCHING && !runtime->network_busy)))
@@ -1129,6 +1254,7 @@ int vs_app_run(void)
   struct vs_app_event_s app_event;
   int ret;
 
+  memset(&event, 0, sizeof(event));
   memset(&runtime, 0, sizeof(runtime));
   runtime.page = VS_PAGE_PREPARING;
   runtime.view = VS_HISTORY_SUMMARY;
@@ -1144,6 +1270,17 @@ int vs_app_run(void)
   ret = vs_input_open(&input);
   if (ret < 0)
     goto fail;
+
+  vs_input_queue_reset();
+  g_input_worker_state = input;
+  ret = task_create("velasight_input", SCHED_PRIORITY_DEFAULT + 1, 2048,
+                    vs_input_worker, NULL);
+  if (ret < 0)
+    {
+      g_input_worker_state = NULL;
+      printf("velasight: input worker unavailable (%d)\n", ret);
+      goto fail;
+    }
 
   ret = vs_start_network_worker(&runtime, NULL, VS_NET_STA);
   if (ret < 0)
@@ -1198,15 +1335,32 @@ int vs_app_run(void)
             }
         }
 
-      if (vs_input_poll(input, &event) > 0)
+      /* Apply a bounded batch before rendering so continuous progress events
+       * cannot starve lv_timer_handler(). */
+      {
+        unsigned int input_count = 0;
+
+        while (input_count < VS_INPUT_EVENTS_PER_FRAME &&
+               vs_input_queue_pop(&event))
+          {
+            vs_handle_event(display, &runtime, network, &event);
+            input_count++;
+          }
+
+        if (input_count != 0)
+          {
+            vs_render(display, &runtime);
+          }
+      }
+      if (runtime.response_until_ms != 0)
         {
-          enum vs_page_e previous = runtime.page;
-          vs_handle_event(display, &runtime, network, &event);
-          if (runtime.page != previous || event.type == VS_INPUT_LONG ||
-              event.type == VS_INPUT_CANCEL)
-            printf("velasight: input type=%u key=%u progress=%u page=%u->%u\n",
-                   event.type, event.key, event.progress, previous, runtime.page);
-          vs_render(display, &runtime);
+          uint32_t now = vs_app_now_ms();
+
+          if ((int32_t)(runtime.response_until_ms - now) <= 0)
+            {
+              vs_expire_response(&runtime);
+              vs_render(display, &runtime);
+            }
         }
       vs_display_tick(display);
       usleep(CONFIG_VS_INPUT_POLL_MS * 1000);

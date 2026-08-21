@@ -11,7 +11,7 @@
 
 #include "include/vs_input.h"
 
-#define VS_INPUT_DEBOUNCE_SAMPLES 3
+#define VS_INPUT_DEBOUNCE_SAMPLES 2
 
 struct vs_key_state_s
 {
@@ -110,6 +110,10 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
               state->pressed_ms = now;
               state->long_sent = false;
               state->last_progress = 0xff;
+              event->type = VS_INPUT_PRESS;
+              event->key = key;
+              event->held_ms = 0;
+              return 1;
             }
           else if (!state->long_sent && !input->combo_sent &&
                    !input->combo_started &&
@@ -118,6 +122,7 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
             {
               event->type = VS_INPUT_SHORT;
               event->key = key;
+              event->held_ms = now - state->pressed_ms;
               return 1;
             }
           else if (!state->long_sent && !input->combo_sent &&
@@ -127,6 +132,7 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
               state->long_sent = true;
               event->type = VS_INPUT_CANCEL;
               event->key = key;
+              event->held_ms = now - state->pressed_ms;
               return 1;
             }
         }
@@ -151,6 +157,7 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
           event->type = VS_INPUT_COMBO_PROGRESS;
           event->key = VS_KEY_BACK;
           event->progress = 0;
+          event->held_ms = 0;
           return 1;
         }
 
@@ -162,12 +169,13 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
         }
 
       if (!input->combo_sent && progress < 100 &&
-          progress / 4u * 4u != input->key[VS_KEY_BACK].last_progress)
+          progress / 2u * 2u != input->key[VS_KEY_BACK].last_progress)
         {
-          input->key[VS_KEY_BACK].last_progress = progress / 4u * 4u;
+          input->key[VS_KEY_BACK].last_progress = progress / 2u * 2u;
           event->type = VS_INPUT_COMBO_PROGRESS;
           event->key = VS_KEY_BACK;
           event->progress = input->key[VS_KEY_BACK].last_progress;
+          event->held_ms = held;
           return 1;
         }
 
@@ -177,6 +185,7 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
           input->key[VS_KEY_BACK].long_sent = true;
           input->key[VS_KEY_NEXT].long_sent = true;
           event->type = VS_INPUT_NET_TOGGLE;
+          event->held_ms = held;
           return 1;
         }
     }
@@ -190,10 +199,12 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
       if (held >= CONFIG_VS_COMBO_PRESS_MS)
         {
           event->type = VS_INPUT_NET_TOGGLE;
+          event->held_ms = held;
           return 1;
         }
 
       event->type = VS_INPUT_COMBO_CANCEL;
+      event->held_ms = held;
       return 1;
     }
   else if (!input->key[VS_KEY_BACK].stable &&
@@ -221,6 +232,7 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
           event->type = VS_INPUT_LONG;
           event->key = key;
           event->progress = 100;
+          event->held_ms = held;
           return 1;
         }
 
@@ -242,13 +254,14 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
                            CONFIG_VS_SHORT_PRESS_MAX_MS : 1;
           progress = (uint8_t)(progress_ms * 100u / progress_range);
 
-          progress = (uint8_t)(progress / 4u * 4u);
+          progress = (uint8_t)(progress / 2u * 2u);
           if (progress != state->last_progress)
             {
               state->last_progress = progress;
               event->type = VS_INPUT_PROGRESS;
               event->key = key;
               event->progress = progress;
+              event->held_ms = held;
               return 1;
             }
         }

@@ -18,6 +18,7 @@ enum vs_key_e
 enum vs_input_event_e
 {
   VS_INPUT_NONE = 0,
+  VS_INPUT_PRESS,
   VS_INPUT_SHORT,
   VS_INPUT_LONG,
   VS_INPUT_PROGRESS,
@@ -32,6 +33,7 @@ struct vs_input_event_s
   enum vs_input_event_e type;
   enum vs_key_e key;
   uint8_t progress;
+  uint32_t held_ms;
 };
 
 enum vs_page_e

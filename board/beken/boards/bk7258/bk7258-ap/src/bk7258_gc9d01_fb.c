@@ -77,6 +77,9 @@ struct gc9d01_fb_s
   int bus;
   FAR uint8_t *fbmem;
   uint32_t updates;
+  uint32_t report_updates;
+  uint32_t report_ms;
+  uint32_t report_max_ms;
 };
 
 /****************************************************************************
@@ -211,6 +214,32 @@ static int gc9d01_push(FAR struct gc9d01_fb_s *priv)
     }
 
   priv->updates++;
+
+  {
+    uint32_t ms = TICK2MSEC(clock_systime_ticks() - start);
+
+    priv->report_updates++;
+    priv->report_ms += ms;
+    if (ms > priv->report_max_ms)
+      {
+        priv->report_max_ms = ms;
+      }
+
+    /* Report a rolling bus cost without logging every frame.  This makes it
+     * possible to distinguish LVGL scheduling delay from LCD transfer time
+     * during a long-press test. */
+    if ((priv->updates % 32u) == 0)
+      {
+        printf("gc9d01_fb[%d]: 32 updates avg=%ums max=%ums total=%u\n",
+               priv->display,
+               (unsigned int)(priv->report_ms / priv->report_updates),
+               (unsigned int)priv->report_max_ms,
+               (unsigned int)priv->updates);
+        priv->report_updates = 0;
+        priv->report_ms = 0;
+        priv->report_max_ms = 0;
+      }
+  }
 
   /* First few pushes get a timing report: it is the only way to know the
    * real cost of a frame on this bus, which decides whether the preview
