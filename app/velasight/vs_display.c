@@ -161,13 +161,9 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
       if (panel->key[key] == NULL)
         return -ENOMEM;
 
-      if (key == VS_KEY_CONFIRM)
-        vs_label_style(panel->key[key], vs_rgb(155, 175, 187),
-                     28, VS_LOWER_TOP_Y, 104, VS_LOWER_ROW_HEIGHT);
-      else
-        vs_label_style(panel->key[key], vs_rgb(155, 175, 187),
-                       key == VS_KEY_BACK ? 16 : 80, VS_LOWER_TOP_Y, 64,
-                       VS_LOWER_ROW_HEIGHT);
+      vs_label_style(panel->key[key], vs_rgb(155, 175, 187),
+                     key == VS_KEY_NEXT ? 80 : 16, VS_LOWER_TOP_Y, 64,
+                     VS_LOWER_ROW_HEIGHT);
       lv_label_set_long_mode(panel->key[key], LV_LABEL_LONG_CLIP);
       lv_obj_set_style_bg_opa(panel->key[key], LV_OPA_TRANSP, 0);
     }
@@ -246,8 +242,8 @@ static bool vs_content_changed(const struct vs_ui_snapshot_s *current,
          strcmp(current->content_title, previous->content_title) != 0 ||
          strcmp(current->content_body, previous->content_body) != 0 ||
          strcmp(current->content_meta, previous->content_meta) != 0 ||
-         vs_key_changed(&current->softkey[VS_KEY_CONFIRM],
-                        &previous->softkey[VS_KEY_CONFIRM]);
+         vs_key_changed(&current->softkey[VS_KEY_BACK],
+                        &previous->softkey[VS_KEY_BACK]);
 }
 
 static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
@@ -260,8 +256,8 @@ static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
          strcmp(current->status_title, previous->status_title) != 0 ||
          strcmp(current->status_value, previous->status_value) != 0 ||
          strcmp(current->status_meta, previous->status_meta) != 0 ||
-         vs_key_changed(&current->softkey[VS_KEY_BACK],
-                        &previous->softkey[VS_KEY_BACK]) ||
+         vs_key_changed(&current->softkey[VS_KEY_CONFIRM],
+                        &previous->softkey[VS_KEY_CONFIRM]) ||
          vs_key_changed(&current->softkey[VS_KEY_NEXT],
                         &previous->softkey[VS_KEY_NEXT]);
 }
@@ -289,24 +285,28 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
     {
       bool visible = snapshot->softkey[key].visible;
 
-      /* The left physical screen carries the confirm action.  The right
-       * physical screen carries back and next, so the shared key row does not
-       * duplicate a core action. */
+      /* The left physical screen carries back.  The right physical screen
+       * carries the power/confirm action and next from left to right. */
       if (content_panel)
         {
-          visible = key == VS_KEY_CONFIRM && visible;
-          if (snapshot->page == VS_PAGE_HISTORY_BLANK)
-            visible = false;
-          if (key == VS_KEY_CONFIRM)
-            lv_obj_set_y(panel->key[key], VS_LOWER_BOTTOM_Y);
+          visible = key == VS_KEY_BACK && visible;
+          if (key == VS_KEY_BACK)
+            {
+              lv_obj_set_pos(panel->key[key], 28, VS_LOWER_BOTTOM_Y);
+              lv_obj_set_width(panel->key[key], 104);
+            }
         }
       else
         {
-          visible = key != VS_KEY_CONFIRM && visible;
-          lv_obj_set_y(panel->key[key], VS_LOWER_TOP_Y);
+          visible = key != VS_KEY_BACK && visible;
+          if (key == VS_KEY_CONFIRM)
+            lv_obj_set_pos(panel->key[key], 8, VS_LOWER_TOP_Y);
+          else if (key == VS_KEY_NEXT)
+            lv_obj_set_pos(panel->key[key], 88, VS_LOWER_TOP_Y);
         }
 
-      if (snapshot->progress_kind != VS_PROGRESS_NONE)
+      if (snapshot->progress_kind != VS_PROGRESS_NONE &&
+          !(snapshot->response_active && snapshot->response_key == key))
         visible = false;
 
       vs_set_label(panel->key[key], visible ? snapshot->softkey[key].text : "");
@@ -323,8 +323,8 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
 static void vs_render_content(struct vs_panel_s *panel,
                               const struct vs_ui_snapshot_s *snapshot)
 {
-  /* The wider upper row of the circular footer carries dates and other long
-   * metadata.  The confirm action uses the shorter bottom chord. */
+  /* The wider upper row carries metadata.  Back uses the centered lower
+   * chord so it remains separate from the right screen's action row. */
 
   lv_obj_set_y(panel->meta, VS_LOWER_TOP_Y);
   vs_set_label(panel->title, snapshot->content_title);
@@ -340,11 +340,7 @@ static void vs_render_content(struct vs_panel_s *panel,
                snapshot->wifi_ready ? "已连接" : "未连接",
                snapshot->api_ready ? "可用" : "错误");
       vs_set_label(panel->status_line[0], line);
-      /* Battery ADC is not initialized on this board yet; never show a
-       * fabricated percentage while the measurement source is unavailable. */
-      vs_set_label(panel->status_line[1], "电量:错误");
-      for (int status_line = 0; status_line < 2; status_line++)
-        vs_set_hidden(panel->status_line[status_line], false);
+      vs_set_hidden(panel->status_line[0], false);
     }
   vs_panel_set_progress(panel, snapshot, false);
   vs_panel_set_keys(panel, snapshot, true);

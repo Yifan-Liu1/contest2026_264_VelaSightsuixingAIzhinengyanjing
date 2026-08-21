@@ -233,21 +233,35 @@ else
 fi
 
 GOT_BUS=0
+
+# Both current shells accept reboot.  The AP implementation resets the whole
+# chip directly through the AON watchdog, so try the current owner first and
+# avoid the asynchronous AP-to-CP console hand-off when it is unnecessary.
+printf '\r\nreboot\r\n' > "$PORT" 2>/dev/null || true
+echo "  已向当前控制台发送直接软复位"
+for _ in $(seq 1 15); do
+  if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
+  kill -0 "$LOADER_PID" 2>/dev/null || break
+  sleep 0.1
+done
+
 for i in $(seq 1 "$REBOOT_TRIES"); do
+  [ "$GOT_BUS" -eq 0 ] || break
   if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
   kill -0 "$LOADER_PID" 2>/dev/null || break
 
-  # Escape from the AP shell to the CP shell, flush that line, then reboot.
+  # Fallback for an unresponsive AP shell.  The CP consumes Ctrl-] '.' locally,
+  # but owner switching runs asynchronously in its shell task.  Wait for that
+  # transition before sending reboot; the previous 50 ms delay could race the
+  # bridge and lose or misroute the command.
   printf '\035' > "$PORT" 2>/dev/null || true
   sleep 0.05
   printf '.' > "$PORT" 2>/dev/null || true
-  sleep 0.05
-  printf '\r\n' > "$PORT" 2>/dev/null || true
-  sleep 0.05
-  printf 'reboot\r\n' > "$PORT" 2>/dev/null || true
-  echo "  第 $i 次软复位已发出"
+  sleep 0.3
+  printf '\r\nreboot\r\n' > "$PORT" 2>/dev/null || true
+  echo "  第 $i 次 CP 回退软复位已发出"
 
-  for _ in $(seq 1 15); do
+  for _ in $(seq 1 10); do
     if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
     kill -0 "$LOADER_PID" 2>/dev/null || break
     sleep 0.1

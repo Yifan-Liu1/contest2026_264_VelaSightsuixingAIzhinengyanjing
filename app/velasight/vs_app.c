@@ -19,6 +19,7 @@
 
 #define VS_INPUT_EVENT_QUEUE_SIZE 64
 #define VS_INPUT_EVENTS_PER_FRAME 8
+#define VS_RESPONSE_VISIBLE_MS 120
 
 static const struct vs_history_item_s g_history[] =
 {
@@ -172,8 +173,11 @@ struct vs_runtime_s
   enum vs_net_mode_e network_target_mode;
   uint32_t next_request_id;
   uint32_t active_request_id;
+  bool api_ready;
   uint32_t response_until_ms;
   enum vs_key_e response_key;
+  bool response_pending_visible;
+  char response_text[VS_TEXT_SHORT];
   struct vs_net_status_s network;
   char alert_text[VS_TEXT_LONG];
   char result_text[VS_TEXT_LONG];
@@ -382,17 +386,15 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
   snapshot->photo_context = runtime->photo_context;
   snapshot->progress = runtime->progress;
   snapshot->emotion = runtime->emotion;
-  snapshot->response_active = runtime->response_until_ms != 0 &&
-                              (int32_t)(runtime->response_until_ms -
-                                        vs_app_now_ms()) > 0;
+  snapshot->response_active = runtime->response_until_ms != 0;
   snapshot->response_key = runtime->response_key;
   snapshot->error_retryable = runtime->error_retryable;
   snapshot->wifi_ready = runtime->network.state == VS_NET_STA_READY ||
                          runtime->network.state == VS_NET_AP_READY;
   snapshot->battery_present = false;
-#ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
-  snapshot->api_ready = bk7258_ai_config_ready();
-#endif
+  /* UI snapshots are a latency-sensitive hot path.  Never read SD-NAND here;
+   * persistent state must be loaded by startup or background event handling. */
+  snapshot->api_ready = runtime->api_ready;
   snprintf(snapshot->error_reason, sizeof(snapshot->error_reason), "%s",
            runtime->error_reason);
   snapshot->emotion_color = runtime->emotion_color != 0 ?
@@ -441,6 +443,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
                  "照片问答");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "准备好");
+        vs_key_set(snapshot, VS_KEY_CONFIRM, "拍照提问");
         vs_key_set(snapshot, VS_KEY_BACK, "返回");
         vs_key_set(snapshot, VS_KEY_NEXT, "下一条");
         break;
@@ -658,9 +661,14 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
 
   if (snapshot->progress_kind == VS_PROGRESS_HOLD)
     snapshot->progress = runtime->progress;
-  if (runtime->response_until_ms != 0 &&
-      (int32_t)(runtime->response_until_ms - vs_app_now_ms()) > 0)
-    snapshot->softkey[runtime->response_key].highlighted = true;
+  if (snapshot->response_active)
+    {
+      snapshot->softkey[runtime->response_key].visible = true;
+      snapshot->softkey[runtime->response_key].highlighted = true;
+      snprintf(snapshot->softkey[runtime->response_key].text,
+               sizeof(snapshot->softkey[runtime->response_key].text), "%s",
+               runtime->response_text);
+    }
 }
 
 static void vs_render(struct vs_display_s *display,
@@ -670,24 +678,33 @@ static void vs_render(struct vs_display_s *display,
 
   vs_snapshot(runtime, &snapshot);
   (void)vs_display_render(display, &snapshot);
+  if (runtime->response_pending_visible)
+    {
+      runtime->response_until_ms = vs_app_now_ms() + VS_RESPONSE_VISIBLE_MS;
+      runtime->response_pending_visible = false;
+    }
 }
 
 static void vs_expire_response(struct vs_runtime_s *runtime)
 {
   if (runtime->response_until_ms != 0 &&
       (int32_t)(runtime->response_until_ms - vs_app_now_ms()) <= 0)
-    runtime->response_until_ms = 0;
+    {
+      runtime->response_until_ms = 0;
+      runtime->response_pending_visible = false;
+    }
 }
 
-static void vs_set_response(struct vs_runtime_s *runtime, enum vs_key_e key)
+static void vs_set_response(struct vs_runtime_s *runtime, enum vs_key_e key,
+                            const char *text)
 {
   runtime->response_key = key;
-  runtime->response_until_ms = vs_app_now_ms() + 120;
+  runtime->response_until_ms = vs_app_now_ms() + VS_RESPONSE_VISIBLE_MS;
+  runtime->response_pending_visible = true;
+  snprintf(runtime->response_text, sizeof(runtime->response_text), "%s", text);
 }
 
-static void vs_acknowledge(struct vs_display_s *display,
-                           struct vs_runtime_s *runtime,
-                           enum vs_key_e key)
+static void vs_acknowledge(struct vs_runtime_s *runtime, enum vs_key_e key)
 {
   struct vs_ui_snapshot_s snapshot;
 
@@ -695,7 +712,7 @@ static void vs_acknowledge(struct vs_display_s *display,
   if (!snapshot.softkey[key].visible)
     return;
 
-  vs_set_response(runtime, key);
+  vs_set_response(runtime, key, snapshot.softkey[key].text);
 }
 
 static void vs_set_error(struct vs_runtime_s *runtime, int error,
@@ -950,10 +967,7 @@ static void vs_handle_event(struct vs_display_s *display,
                             const struct vs_input_event_s *event)
 {
   if (event->type == VS_INPUT_PRESS)
-    {
-      vs_acknowledge(display, runtime, event->key);
-      return;
-    }
+    return;
 
   if (event->type == VS_INPUT_COMBO_PROGRESS &&
       (runtime->page == VS_PAGE_HISTORY || runtime->page == VS_PAGE_HISTORY_BLANK ||
@@ -1054,7 +1068,7 @@ static void vs_handle_event(struct vs_display_s *display,
         }
 
       if (!(runtime->page == VS_PAGE_SOFTAP && event->key == VS_KEY_BACK))
-        vs_acknowledge(display, runtime, event->key);
+        vs_acknowledge(runtime, event->key);
       switch (runtime->page)
         {
           case VS_PAGE_HISTORY:
@@ -1293,6 +1307,7 @@ int vs_app_run(void)
     }
 
   bk7258_nand_seed_agent_config();
+  runtime.api_ready = bk7258_ai_config_ready();
   runtime.agent = velaclaw_client_open("velasight");
   if (runtime.agent == NULL)
     printf("velasight: ai_agent client unavailable\n");
@@ -1300,7 +1315,39 @@ int vs_app_run(void)
   vs_render(display, &runtime);
   for (;;)
     {
-      while (vs_app_pop_event(&app_event))
+      if (runtime.response_until_ms != 0)
+        {
+          uint32_t now = vs_app_now_ms();
+
+          if ((int32_t)(runtime.response_until_ms - now) <= 0)
+            {
+              vs_expire_response(&runtime);
+              vs_render(display, &runtime);
+            }
+        }
+
+      /* Input feedback never blocks its action.  SHORT updates the business
+       * state immediately and carries its visual overlay onto the resulting
+       * page. */
+      {
+        unsigned int input_count = 0;
+
+        while (input_count < VS_INPUT_EVENTS_PER_FRAME &&
+               vs_input_queue_pop(&event))
+          {
+            vs_handle_event(display, &runtime, network, &event);
+            input_count++;
+          }
+
+        if (input_count != 0)
+          {
+            vs_render(display, &runtime);
+          }
+      }
+
+      /* Each app event may synchronously push one or both full panels.  Handle
+       * one per pass so a burst cannot keep an already queued press waiting. */
+      if (vs_app_pop_event(&app_event))
         {
           if (app_event.type == VS_APP_EVENT_NETWORK_READY ||
               app_event.type == VS_APP_EVENT_NETWORK_FAILED)
@@ -1315,6 +1362,7 @@ int vs_app_run(void)
           if (ret != 0)
             {
               (void)vs_network_get_status(network, &runtime.network);
+              runtime.api_ready = bk7258_ai_config_ready();
               if (ret < 0)
                 {
                   runtime.error_target_mode = VS_NET_STA;
@@ -1335,33 +1383,6 @@ int vs_app_run(void)
             }
         }
 
-      /* Apply a bounded batch before rendering so continuous progress events
-       * cannot starve lv_timer_handler(). */
-      {
-        unsigned int input_count = 0;
-
-        while (input_count < VS_INPUT_EVENTS_PER_FRAME &&
-               vs_input_queue_pop(&event))
-          {
-            vs_handle_event(display, &runtime, network, &event);
-            input_count++;
-          }
-
-        if (input_count != 0)
-          {
-            vs_render(display, &runtime);
-          }
-      }
-      if (runtime.response_until_ms != 0)
-        {
-          uint32_t now = vs_app_now_ms();
-
-          if ((int32_t)(runtime.response_until_ms - now) <= 0)
-            {
-              vs_expire_response(&runtime);
-              vs_render(display, &runtime);
-            }
-        }
       vs_display_tick(display);
       usleep(CONFIG_VS_INPUT_POLL_MS * 1000);
     }
