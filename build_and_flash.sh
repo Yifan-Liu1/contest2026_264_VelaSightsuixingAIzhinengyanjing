@@ -69,7 +69,11 @@ grep -q 'velasight_font_16_ui' "$AP_OUT/System.map" || die 'UI font is not linke
 grep -q '^ \* Bpp: 1$' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not 1bpp'
 grep -q -- '--no-prefilter' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not the pixel-font build'
 grep -q 'voice_vad_process' "$AP_OUT/System.map" || die 'VAD is not linked'
-grep -q 'velaclaw_client_open' "$AP_OUT/System.map" || die 'local ai_agent client is not linked'
+grep -q 'vs_voice_start' "$AP_OUT/System.map" || die 'idle voice assistant worker is not linked'
+grep -q 'llm_chat_vision_raw' "$AP_OUT/System.map" || die 'vision model call is not linked'
+if grep -qw 'velaclaw_ask' "$AP_OUT/System.map"; then
+  die 'velaclaw_ask is linked (decision was to bypass it, see vs_voice.c)'
+fi
 
 AP_SIZE=$(stat -c%s -- "$AP_BIN")
 AP_LIMIT=$((3904 * 1024))

@@ -2,11 +2,13 @@ config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	bool "VelaSight dual-screen UI"
 	default n
 	depends on VIDEO_FB
+	depends on VIDEO
 	depends on ARCH_BUTTONS
 	depends on NET_TCP && NET_TCPBACKLOG
 	depends on NET_IPv4 && NET_UDP && NETUTILS_DHCPC
 	depends on ARCH_CHIP_BK7258 && BK7258_WIFI
 	depends on BK7258_SDIO && BK7258_SDNAND_AUTOMOUNT && FS_FAT
+	depends on EXAMPLES_AI_AGENT_VELA
 	select GRAPHICS_LVGL
 	select WIRELESS_WAPI
 	select NETUTILS_DHCPD
@@ -14,6 +16,10 @@ config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	select LVX_USE_DEMO_CONTEST2026_264_PROVISION_WEB
 	---help---
 		First-stage VelaSight UI for the dual GC9D01 framebuffer panels.
+		Depends on EXAMPLES_AI_AGENT_VELA because vs_voice.c links directly
+		against packages/ai_agent's LLM proxy, router and Volcengine voice
+		backends (see vs_voice.c's header comment for why it drives those
+		one layer below ai_agent's own voice_channel.c state machine).
 
 config VS_INPUT_POLL_MS
 	int "VelaSight input polling interval (ms)"
@@ -78,3 +84,50 @@ config VS_AP_CHANNEL
 	default 6
 	range 1 14
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_VOICE_PROMPT_MAX_BYTES
+	int "VelaSight idle assistant prompt budget (bytes)"
+	default 16384
+	range 2048 65536
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_VOICE_RESP_MAX_BYTES
+	int "VelaSight idle assistant model response buffer (bytes)"
+	default 32768
+	range 8192 131072
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_VOICE_RECORD_MAX_MS
+	int "VelaSight idle assistant maximum recording (ms)"
+	default 30000
+	range 3000 60000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_VOICE_STACKSIZE
+	int "VelaSight idle assistant worker thread stack (bytes)"
+	default 16384
+	range 8192 32768
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_PHOTO_WIDTH
+	int "VelaSight still capture width"
+	default 480
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Must be one of the GC2145 driver's fixed modes: 480x480, 640x480 or
+		864x480 (bk7258_gc2145_find_mode() is an exact match, not
+		nearest-fit).
+
+config VS_PHOTO_HEIGHT
+	int "VelaSight still capture height"
+	default 480
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_HISTORY_MAX_RECORDS
+	int "VelaSight history in-memory index capacity (records)"
+	default 64
+	range 8 256
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Bounds both the in-memory index array and how many records
+		vs_history_open() will load from SD-NAND at startup.

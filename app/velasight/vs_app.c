@@ -9,25 +9,19 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <velaclaw/client.h>
 #include <arch/board/board.h>
 
 #include "include/vs_app.h"
 #include "include/vs_display.h"
+#include "include/vs_history.h"
 #include "include/vs_input.h"
 #include "include/vs_network.h"
+#include "include/vs_voice.h"
 
 #define VS_INPUT_EVENT_QUEUE_SIZE 64
 #define VS_INPUT_EVENTS_PER_FRAME 8
 #define VS_RESPONSE_VISIBLE_MS 200
 #define VS_WIFI_RETRY_MS 20000
-
-static const struct vs_history_item_s g_history[] =
-{
-  {"08/18 09:20", "上午交流", "整体较平稳\n后段略有疑惑", 55, 30, 15, false},
-  {"08/17 16:40", "项目讨论", "对方需要进一步确认", 30, 20, 50, true},
-  {"08/16 11:05", "日常记录", "交流进展顺利", 65, 25, 10, false}
-};
 
 #define VS_APP_EVENT_QUEUE_SIZE 8
 
@@ -183,7 +177,6 @@ struct vs_runtime_s
   struct vs_net_status_s network;
   char alert_text[VS_TEXT_LONG];
   char result_text[VS_TEXT_LONG];
-  velaclaw_client_t *agent;
 };
 
 struct vs_network_worker_s
@@ -337,11 +330,6 @@ static void vs_update_wifi_retry(struct vs_runtime_s *runtime)
     }
 }
 
-static unsigned int vs_history_count(void)
-{
-  return sizeof(g_history) / sizeof(g_history[0]);
-}
-
 static uint32_t vs_begin_request(struct vs_runtime_s *runtime)
 {
   runtime->next_request_id++;
@@ -394,14 +382,48 @@ static const char *vs_errno_reason(int error)
     }
 }
 
+/* vs_voice.c reports several failure modes vs_errno_reason() above was never
+ * meant to cover (that table is shared with network/config errors, whose
+ * ENOENT already means something else there).  This wraps it with the idle
+ * assistant's own vocabulary so the on-screen reason matches what actually
+ * failed instead of falling through to a generic "系统操作失败" plus a bare
+ * errno number. */
+
+static const char *vs_assistant_error_reason(int error)
+{
+  switch (error < 0 ? -error : error)
+    {
+      case ENOKEY:
+        return "语音服务凭据未配置";
+      case ENODATA:
+        return "未听清，请重试";
+      case EILSEQ:
+        return "识别结果异常";
+      case EMSGSIZE:
+        return "记录内容过长";
+      case ENOENT:
+        return "记录读取失败";
+      case EBUSY:
+        return "上一次请求尚未结束";
+      default:
+        return vs_errno_reason(error);
+    }
+}
+
 static void vs_snapshot(struct vs_runtime_s *runtime,
                         struct vs_ui_snapshot_s *snapshot)
 {
+  struct vs_history_index_s current;
+  bool have_current;
+
+  have_current = !runtime->history_blank &&
+                 vs_history_get_index(runtime->index, &current) == 0;
+
   memset(snapshot, 0, sizeof(*snapshot));
   snapshot->page = runtime->page;
   snapshot->history_view = runtime->view;
   snapshot->network = runtime->network;
-  snapshot->history = runtime->history_blank ? NULL : &g_history[runtime->index];
+  snapshot->history = NULL;
   snapshot->history_index = runtime->index;
   snapshot->history_count = vs_history_count();
   snapshot->history_is_blank = runtime->history_blank;
@@ -441,11 +463,11 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
 
       case VS_PAGE_HISTORY:
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
-                 "%s", g_history[runtime->index].title);
+                 "%s", have_current ? current.title : "");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
-                 "%s", g_history[runtime->index].summary);
+                 "%s", have_current ? current.summary : "");
         snprintf(snapshot->content_meta, sizeof(snapshot->content_meta),
-                 "%s", g_history[runtime->index].date);
+                 "%s", have_current ? current.date : "");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "历史");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
                  "%02u/%02u", runtime->index + 1, vs_history_count());
@@ -823,7 +845,15 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
           {
             vs_cancel_request(runtime);
             vs_set_error_reason(runtime, event->error, VS_PAGE_HISTORY_BLANK,
-                                false, "拍照失败");
+                                false,
+                                vs_assistant_error_reason(event->error));
+          }
+        break;
+
+      case VS_APP_EVENT_VOICE_LISTENING_DONE:
+        if (runtime->page == VS_PAGE_VOICE_LISTENING)
+          {
+            runtime->page = VS_PAGE_VOICE_THINKING;
           }
         break;
 
@@ -855,7 +885,7 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
             vs_set_error_reason(runtime, event->error,
                                 runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
                                                          VS_PAGE_HISTORY, false,
-                                "语音处理失败");
+                                vs_assistant_error_reason(event->error));
           }
         break;
 
@@ -1112,9 +1142,23 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_HISTORY:
             if (event->key == VS_KEY_CONFIRM)
               {
+                struct vs_voice_request_s request;
+                struct vs_history_index_s current;
+
+                memset(&request, 0, sizeof(request));
+                request.ctx = VS_VOICE_CTX_RECORD;
+                if (vs_history_get_index(runtime->index, &current) == 0)
+                  {
+                    snprintf(request.record_key, sizeof(request.record_key),
+                             "%s", current.record_key);
+                  }
+
                 runtime->photo_context = false;
-                (void)vs_begin_request(runtime);
-                runtime->page = VS_PAGE_VOICE_LISTENING;
+                request.request_id = vs_begin_request(runtime);
+                if (vs_voice_start(&request) == 0)
+                  runtime->page = VS_PAGE_VOICE_LISTENING;
+                else
+                  vs_cancel_request(runtime);
               }
             else if (event->key == VS_KEY_NEXT)
               {
@@ -1142,9 +1186,17 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_HISTORY_BLANK:
             if (event->key == VS_KEY_CONFIRM)
               {
+                struct vs_voice_request_s request;
+
+                memset(&request, 0, sizeof(request));
+                request.ctx = VS_VOICE_CTX_PHOTO;
+
                 runtime->photo_context = true;
-                (void)vs_begin_request(runtime);
-                runtime->page = VS_PAGE_PHOTO_CAPTURE;
+                request.request_id = vs_begin_request(runtime);
+                if (vs_voice_start(&request) == 0)
+                  runtime->page = VS_PAGE_PHOTO_CAPTURE;
+                else
+                  vs_cancel_request(runtime);
               }
             else if (event->key == VS_KEY_NEXT)
               {
@@ -1186,10 +1238,16 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_VOICE_LISTENING:
             if (event->key == VS_KEY_CONFIRM)
               {
-                runtime->page = VS_PAGE_VOICE_THINKING;
+                /* Manual cut-off: the worker's own VAD would otherwise end
+                 * the recording; this asks it to stop early.  The page
+                 * itself advances to THINKING only once the worker confirms
+                 * via VOICE_LISTENING_DONE, so a stop that fails to land
+                 * (already past that step) leaves the page where it is. */
+                vs_voice_stop_recording();
               }
             else if (event->key == VS_KEY_BACK)
               {
+                vs_voice_cancel();
                 vs_cancel_request(runtime);
                 runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
                                                         VS_PAGE_HISTORY;
@@ -1199,6 +1257,7 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_VOICE_THINKING:
             if (event->key == VS_KEY_BACK)
               {
+                vs_voice_cancel();
                 vs_cancel_request(runtime);
                 runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
                                                         VS_PAGE_HISTORY;
@@ -1206,8 +1265,16 @@ static void vs_handle_event(struct vs_display_s *display,
             break;
 
           case VS_PAGE_VOICE_SPEAKING:
-            if (event->key == VS_KEY_CONFIRM || event->key == VS_KEY_BACK)
+            if (event->key == VS_KEY_CONFIRM)
               {
+                vs_voice_stop_speaking();
+                vs_cancel_request(runtime);
+                runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
+                                                        VS_PAGE_HISTORY;
+              }
+            else if (event->key == VS_KEY_BACK)
+              {
+                vs_voice_cancel();
                 vs_cancel_request(runtime);
                 runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
                                                         VS_PAGE_HISTORY;
@@ -1225,6 +1292,7 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_PHOTO_CAPTURE:
             if (event->key == VS_KEY_BACK)
               {
+                vs_voice_cancel();
                 vs_cancel_request(runtime);
                 runtime->page = VS_PAGE_HISTORY_BLANK;
               }
@@ -1361,9 +1429,8 @@ int vs_app_run(void)
 
   bk7258_nand_seed_agent_config();
   runtime.api_ready = bk7258_ai_config_ready();
-  runtime.agent = velaclaw_client_open("velasight");
-  if (runtime.agent == NULL)
-    printf("velasight: ai_agent client unavailable\n");
+  vs_history_open();
+  vs_voice_open();
 
   vs_render(display, &runtime);
   for (;;)
@@ -1448,8 +1515,8 @@ int vs_app_run(void)
     }
 
 fail:
-  if (runtime.agent != NULL)
-    velaclaw_client_close(runtime.agent);
+  vs_voice_close();
+  vs_history_close();
   vs_network_close(network);
   vs_input_close(input);
   vs_display_close(display);
