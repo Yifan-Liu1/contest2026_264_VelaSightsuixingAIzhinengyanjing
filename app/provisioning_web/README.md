@@ -135,21 +135,33 @@ SSID；**密码永不回显、永不进日志**。
 
 ## NAND 记录
 
-默认 `/mnt/sdnand/prov/vela.cfg`，固定 626 字节，小端。该文件是配网网页的唯一配置源：
-Wi-Fi 名称、Wi-Fi 密码和 MiMo API key 全部在此文件中读写。KVDB 是废弃功能，产品链路不使用。
+默认 `/mnt/sdnand/prov/vela.cfg`，固定 818 字节，小端。该文件是配网网页的唯一配置源：
+Wi-Fi 名称、Wi-Fi 密码、MiMo API key 和闲时语音助手用的 Volcengine（字节跳动语音开放
+平台）app_id/token 全部在此文件中读写。KVDB 是废弃功能，产品链路不使用。
 
 | 偏移 | 长度 | 字段 |
 |---|---|---|
 | 0 | 4 | 魔数 `VSWP` |
-| 4 | 2 | 版本，当前 1 |
+| 4 | 2 | 版本，当前 3 |
 | 6 | 2 | 标志位，bit0 = 开放网络 |
 | 8 | 4 | generation |
 | 12 | 1 | ssid_len，1..32 |
 | 13 | 1 | psk_len，0 或 8..63 |
 | 14 | 32 | SSID，补零 |
 | 46 | 63 | 密码，补零 |
-| 109 | 1 | 保留，必须 0 |
-| 110 | 4 | CRC32（IEEE，覆盖 0..109） |
+| 109 | 512 | MiMo API key，补零 |
+| 621 | 64 | Volcengine app_id，补零 |
+| 685 | 128 | Volcengine token，补零 |
+| 813 | 1 | 保留，必须 0 |
+| 814 | 4 | CRC32（IEEE，覆盖 0..813） |
+
+Volcengine 的 app_id 和 token 缺一个都视为未配置：闲时语音助手会在两者都非空才尝试
+识别/合成，否则报"语音服务凭据未配置"。两者都是可选字段，不填不影响 Wi-Fi 和文字/
+图片问答（那两项只依赖 MiMo API key）。
+
+v3 在 MiMo key 和保留字节之间插入了两个 Volcengine 字段，是破坏性变更：v2 及更早的
+记录读不出来，`vp_record_decode()` 按"结构不对就是坏的"处理，不做部分恢复。从 v2
+升级的设备需要重新走一次配网。
 
 落盘顺序是同目录的 `vpsave.tmp` → `fflush` → `fsync` → `close` → `rename` → `sync()`。
 若目标文件缺失但 scratch 是完整且 CRC 有效的记录，下一次读取会先将 scratch 提升为正式

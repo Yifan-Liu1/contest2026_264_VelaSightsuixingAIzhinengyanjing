@@ -13,17 +13,19 @@
 #include "vp_form.h"
 #include "vp_store.h"
 
-#define VP_OFF_MAGIC     0
-#define VP_OFF_VERSION   4
-#define VP_OFF_FLAGS     6
-#define VP_OFF_GEN       8
-#define VP_OFF_SSID_LEN  12
-#define VP_OFF_PSK_LEN   13
-#define VP_OFF_SSID      14
-#define VP_OFF_PSK       46
-#define VP_OFF_API       109
-#define VP_OFF_RESERVED  621
-#define VP_OFF_CRC       622
+#define VP_OFF_MAGIC      0
+#define VP_OFF_VERSION    4
+#define VP_OFF_FLAGS      6
+#define VP_OFF_GEN        8
+#define VP_OFF_SSID_LEN   12
+#define VP_OFF_PSK_LEN    13
+#define VP_OFF_SSID       14
+#define VP_OFF_PSK        46
+#define VP_OFF_API        109
+#define VP_OFF_VOLC_APPID 621
+#define VP_OFF_VOLC_TOKEN 685
+#define VP_OFF_RESERVED   813
+#define VP_OFF_CRC        814
 
 #define VP_STORE_PATH_MAX 192
 
@@ -94,6 +96,8 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
   size_t ssid_len;
   size_t psk_len;
   size_t api_len;
+  size_t volc_appid_len;
+  size_t volc_token_len;
   int ret;
 
   if (buf == NULL || cred == NULL)
@@ -112,9 +116,11 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
       return ret;
     }
 
-  ssid_len = vp_len(cred->ssid, sizeof(cred->ssid));
-  psk_len  = vp_len(cred->password, sizeof(cred->password));
-  api_len  = vp_len(cred->api_key, sizeof(cred->api_key));
+  ssid_len       = vp_len(cred->ssid, sizeof(cred->ssid));
+  psk_len        = vp_len(cred->password, sizeof(cred->password));
+  api_len        = vp_len(cred->api_key, sizeof(cred->api_key));
+  volc_appid_len = vp_len(cred->volc_appid, sizeof(cred->volc_appid));
+  volc_token_len = vp_len(cred->volc_token, sizeof(cred->volc_token));
 
   memset(buf, 0, VP_RECORD_SIZE);
   memcpy(buf + VP_OFF_MAGIC, VP_RECORD_MAGIC, 4);
@@ -127,6 +133,8 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
   memcpy(buf + VP_OFF_SSID, cred->ssid, ssid_len);
   memcpy(buf + VP_OFF_PSK, cred->password, psk_len);
   memcpy(buf + VP_OFF_API, cred->api_key, api_len);
+  memcpy(buf + VP_OFF_VOLC_APPID, cred->volc_appid, volc_appid_len);
+  memcpy(buf + VP_OFF_VOLC_TOKEN, cred->volc_token, volc_token_len);
   vp_put32(buf + VP_OFF_CRC, vp_crc32(buf, VP_RECORD_SIZE - 4));
   return VP_RECORD_SIZE;
 }
@@ -154,6 +162,8 @@ int vp_record_decode(const uint8_t *buf, size_t len,
   size_t ssid_len;
   size_t psk_len;
   size_t api_len;
+  size_t volc_appid_len;
+  size_t volc_token_len;
   uint16_t flags;
 
   if (buf == NULL || cred == NULL)
@@ -187,6 +197,10 @@ int vp_record_decode(const uint8_t *buf, size_t len,
   psk_len  = buf[VP_OFF_PSK_LEN];
   api_len  = vp_len((const char *)(buf + VP_OFF_API),
                     VELASIGHT_PROV_API_KEY_MAX);
+  volc_appid_len = vp_len((const char *)(buf + VP_OFF_VOLC_APPID),
+                          VELASIGHT_PROV_VOLC_APPID_MAX);
+  volc_token_len = vp_len((const char *)(buf + VP_OFF_VOLC_TOKEN),
+                          VELASIGHT_PROV_VOLC_TOKEN_MAX);
 
   if ((flags & ~(uint16_t)VP_RECORD_FLAG_OPEN) != 0)
     {
@@ -224,10 +238,26 @@ int vp_record_decode(const uint8_t *buf, size_t len,
       return -EBADMSG;
     }
 
+  if (volc_appid_len > VELASIGHT_PROV_VOLC_APPID_MAX ||
+      !vp_padding_is_zero(buf, VP_OFF_VOLC_APPID, volc_appid_len,
+                          VELASIGHT_PROV_VOLC_APPID_MAX))
+    {
+      return -EBADMSG;
+    }
+
+  if (volc_token_len > VELASIGHT_PROV_VOLC_TOKEN_MAX ||
+      !vp_padding_is_zero(buf, VP_OFF_VOLC_TOKEN, volc_token_len,
+                          VELASIGHT_PROV_VOLC_TOKEN_MAX))
+    {
+      return -EBADMSG;
+    }
+
   memset(&parsed, 0, sizeof(parsed));
   memcpy(parsed.ssid, buf + VP_OFF_SSID, ssid_len);
   memcpy(parsed.password, buf + VP_OFF_PSK, psk_len);
   memcpy(parsed.api_key, buf + VP_OFF_API, api_len);
+  memcpy(parsed.volc_appid, buf + VP_OFF_VOLC_APPID, volc_appid_len);
+  memcpy(parsed.volc_token, buf + VP_OFF_VOLC_TOKEN, volc_token_len);
   parsed.generation   = vp_get32(buf + VP_OFF_GEN);
   parsed.open_network = psk_len == 0;
 

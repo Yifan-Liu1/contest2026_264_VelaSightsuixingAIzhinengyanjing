@@ -32,6 +32,18 @@ extern "C"
 #define VELASIGHT_PROV_PSK_MAX  63
 #define VELASIGHT_PROV_API_KEY_MAX 512
 
+/* Volcengine (ByteDance speech platform) credentials for the idle voice
+ * assistant's ASR and TTS.  Both fields are required together: the backend
+ * refuses to open a session unless app_id and token are both non-empty (see
+ * volc_asr_stream_open()/volc_tts_ws_synthesize_stream() in
+ * packages/ai_agent).  Sized from what the platform actually issues, not
+ * from the MiMo key's budget -- app_id is a short numeric string and token
+ * is a bearer token, neither approaching 512 bytes.
+ */
+
+#define VELASIGHT_PROV_VOLC_APPID_MAX 64
+#define VELASIGHT_PROV_VOLC_TOKEN_MAX 128
+
 /* Where the record lives when the caller passes no path.  On SD-NAND, so it
  * survives a reset; /mnt itself is pseudo-filesystem and /mnt/ram is a PSRAM
  * ramdisk, neither of which would.
@@ -54,6 +66,8 @@ struct velasight_prov_credentials_s
   char     ssid[VELASIGHT_PROV_SSID_MAX + 1];
   char     password[VELASIGHT_PROV_PSK_MAX + 1];
   char     api_key[VELASIGHT_PROV_API_KEY_MAX + 1];
+  char     volc_appid[VELASIGHT_PROV_VOLC_APPID_MAX + 1];
+  char     volc_token[VELASIGHT_PROV_VOLC_TOKEN_MAX + 1];
   uint32_t generation;   /* Monotonic save counter, first save is 1 */
   bool     open_network; /* Password is empty */
 };

@@ -26,20 +26,30 @@
 /* Layout, little-endian:
  *
  *   0   4   magic "VSWP"
- *   4   2   version, currently 2
+ *   4   2   version, currently 3
  *   6   2   flags, bit0 = open network
  *   8   4   generation
  *   12  1   ssid_len, 1..32
  *   13  1   psk_len, 0 or 8..63
  *   14  32  ssid, zero padded
  *   46  63  password, zero padded
- *   109 512 API key, zero padded
- *   621 1   reserved, must be zero
- *   622 4   CRC32 of bytes 0..621
+ *   109 512 MiMo API key, zero padded
+ *   621 64  Volcengine app_id, zero padded
+ *   685 128 Volcengine token, zero padded
+ *   813 1   reserved, must be zero
+ *   814 4   CRC32 of bytes 0..813
+ *
+ * Version 3 added the two Volcengine fields (offsets 621 and 685) between
+ * the MiMo key and the reserved byte, which pushed the reserved byte and
+ * the CRC further out.  This is a breaking change: a v2 record from before
+ * this field existed does not decode, by design (see vp_record_decode()'s
+ * header comment) -- there is no partial-record recovery here, only intact
+ * or corrupt.  A device upgrading from v2 loses its stored Wi-Fi and MiMo
+ * key and must be provisioned again.
  */
 
-#define VP_RECORD_SIZE    626
-#define VP_RECORD_VERSION 2
+#define VP_RECORD_SIZE    818
+#define VP_RECORD_VERSION 3
 #define VP_RECORD_MAGIC   "VSWP"
 
 #define VP_RECORD_FLAG_OPEN 0x0001u

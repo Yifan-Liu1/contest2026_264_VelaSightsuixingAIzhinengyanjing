@@ -38,6 +38,8 @@ static void fill(struct velasight_prov_credentials_s *cred,
   snprintf(cred->ssid, sizeof(cred->ssid), "%s", ssid);
   snprintf(cred->password, sizeof(cred->password), "%s", psk);
   snprintf(cred->api_key, sizeof(cred->api_key), "%s", "tp-test-key");
+  snprintf(cred->volc_appid, sizeof(cred->volc_appid), "%s", "1234567890");
+  snprintf(cred->volc_token, sizeof(cred->volc_token), "%s", "volc-test-token");
   cred->generation   = generation;
   cred->open_network = cred->password[0] == '\0';
 }
@@ -72,6 +74,8 @@ static void test_record_roundtrip(void)
         strcmp(out.ssid, "AIPC") == 0 &&
          strcmp(out.password, "passphrase") == 0 &&
          strcmp(out.api_key, "tp-test-key") == 0 &&
+         strcmp(out.volc_appid, "1234567890") == 0 &&
+         strcmp(out.volc_token, "volc-test-token") == 0 &&
         out.generation == 7 && !out.open_network,
         "decode returns what encode was given");
 

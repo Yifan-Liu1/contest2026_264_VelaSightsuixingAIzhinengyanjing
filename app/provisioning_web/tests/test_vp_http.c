@@ -154,15 +154,26 @@ static void test_pages(void)
 
   len = vp_http_form_page(buf, sizeof(buf), NULL);
   CHECK(len > 0 && len < sizeof(buf), "the form page is generated");
-  CHECK(len < 1514, "the form response fits in one IOB-sized write");
+
+  /* Adding the two Volcengine fields pushed the form past one IOB
+   * (1514 bytes); vp_write_all() loops until every byte is sent, so a
+   * response spanning two TCP segments is a minor efficiency cost on a
+   * SoftAP link, not a correctness issue.  The bound here still exists so
+   * a future addition that meaningfully bloats the page (a stray debug
+   * dump, an accidentally duplicated block) gets caught instead of silently
+   * growing forever. */
+
+  CHECK(len < 2200, "the form response stays within a couple of IOBs");
   CHECK(strncmp(buf, "HTTP/1.1 200 OK\r\n", 17) == 0,
         "the form page carries a 200 status line");
   CHECK(strstr(buf, "Content-Length: ") != NULL,
         "the form page declares its length");
   CHECK(strstr(buf, "name=\"ssid\"") != NULL &&
         strstr(buf, "name=\"password\"") != NULL &&
-        strstr(buf, "name=\"mimo_apikey\"") != NULL,
-        "the form has Wi-Fi and API inputs");
+        strstr(buf, "name=\"mimo_apikey\"") != NULL &&
+        strstr(buf, "name=\"volc_appid\"") != NULL &&
+        strstr(buf, "name=\"volc_token\"") != NULL,
+        "the form has Wi-Fi, MiMo and Volcengine inputs");
   CHECK(strstr(buf, "action=\"/save\"") != NULL &&
         strstr(buf, "method=\"post\"") != NULL,
         "the form posts to /save");
@@ -182,7 +193,7 @@ static void test_pages(void)
   CHECK(strstr(buf, "name=\"password\"") != NULL &&
         strstr(buf, "href=\"/\"") == NULL,
         "saving stays on the input form without a return link");
-  CHECK(len < 1514, "the saved response fits in one IOB-sized write");
+  CHECK(len < 2200, "the saved response stays within a couple of IOBs");
 
   len = vp_http_saved_page(buf, sizeof(buf), "<script>", 1, true);
   CHECK(len > 0 && strstr(buf, "<script>") == NULL &&

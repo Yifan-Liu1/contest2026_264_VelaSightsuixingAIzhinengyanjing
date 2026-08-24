@@ -364,14 +364,26 @@ static void vp_handle(int fd, bool *saved, int *save_status,
         else
           {
             struct velasight_prov_credentials_s previous;
+            bool have_previous = velasight_provisioning_load(&previous) == 0;
 
-            /* The API key field is intentionally never pre-filled in HTML.
-             * An ordinary Wi-Fi-only resubmit must not erase the existing key. */
-            if (cred.api_key[0] == '\0' &&
-                velasight_provisioning_load(&previous) == 0)
+            /* None of the three secret fields are pre-filled in HTML.  An
+             * ordinary Wi-Fi-only resubmit must not erase any of them. */
+            if (cred.api_key[0] == '\0' && have_previous)
               {
                 snprintf(cred.api_key, sizeof(cred.api_key), "%s",
                          previous.api_key);
+              }
+
+            if (cred.volc_appid[0] == '\0' && have_previous)
+              {
+                snprintf(cred.volc_appid, sizeof(cred.volc_appid), "%s",
+                         previous.volc_appid);
+              }
+
+            if (cred.volc_token[0] == '\0' && have_previous)
+              {
+                snprintf(cred.volc_token, sizeof(cred.volc_token), "%s",
+                         previous.volc_token);
               }
 
             cred.generation = vp_store_next_generation(g_server.store_path);

@@ -139,26 +139,66 @@ static bool vp_psk_char_ok(char c)
   return u >= 0x20 && u <= 0x7e;
 }
 
+/* MiMo key, Volcengine app_id and Volcengine token share the same character
+ * set (printable ASCII) and the same "empty means not configured yet"
+ * treatment, so one helper checks all three instead of repeating the loop.
+ */
+
+static int vp_printable_field_validate(const char *field, size_t cap,
+                                       size_t limit)
+{
+  size_t len = vp_strnlen(field, cap);
+  size_t i;
+
+  if (len > limit)
+    {
+      return -EINVAL;
+    }
+
+  for (i = 0; i < len; i++)
+    {
+      if ((unsigned char)field[i] < 0x20 || (unsigned char)field[i] > 0x7e)
+        {
+          return -EINVAL;
+        }
+    }
+
+  return 0;
+}
+
 int vp_credentials_validate(
     const struct velasight_prov_credentials_s *cred)
 {
   size_t len;
   size_t i;
-  size_t api_len;
+  int ret;
 
   if (cred == NULL)
     {
       return -EINVAL;
     }
 
-  api_len = vp_strnlen(cred->api_key, sizeof(cred->api_key));
-  if (api_len > VELASIGHT_PROV_API_KEY_MAX)
-    return -EINVAL;
-  for (i = 0; i < api_len; i++)
+  ret = vp_printable_field_validate(cred->api_key, sizeof(cred->api_key),
+                                    VELASIGHT_PROV_API_KEY_MAX);
+  if (ret < 0)
     {
-      if ((unsigned char)cred->api_key[i] < 0x20 ||
-          (unsigned char)cred->api_key[i] > 0x7e)
-        return -EINVAL;
+      return ret;
+    }
+
+  ret = vp_printable_field_validate(cred->volc_appid,
+                                    sizeof(cred->volc_appid),
+                                    VELASIGHT_PROV_VOLC_APPID_MAX);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = vp_printable_field_validate(cred->volc_token,
+                                    sizeof(cred->volc_token),
+                                    VELASIGHT_PROV_VOLC_TOKEN_MAX);
+  if (ret < 0)
+    {
+      return ret;
     }
 
   len = vp_strnlen(cred->ssid, sizeof(cred->ssid));
@@ -215,6 +255,8 @@ int vp_form_parse(const char *body, size_t bodylen,
   bool have_ssid = false;
   bool have_psk = false;
   bool have_api_key = false;
+  bool have_volc_appid = false;
+  bool have_volc_token = false;
   size_t pos = 0;
 
   if (body == NULL || cred == NULL)
@@ -275,7 +317,9 @@ int vp_form_parse(const char *body, size_t bodylen,
         }
 
       if (strcmp(name, "ssid") != 0 && strcmp(name, "password") != 0 &&
-          strcmp(name, "mimo_apikey") != 0)
+          strcmp(name, "mimo_apikey") != 0 &&
+          strcmp(name, "volc_appid") != 0 &&
+          strcmp(name, "volc_token") != 0)
         {
           goto next;
         }
@@ -317,13 +361,31 @@ int vp_form_parse(const char *body, size_t bodylen,
 
           memcpy(cred->password, value, (size_t)decoded + 1);
         }
-      else
+      else if (strcmp(name, "mimo_apikey") == 0)
         {
           if (have_api_key || (size_t)decoded >= sizeof(cred->api_key))
             return -EINVAL;
 
           have_api_key = true;
           memcpy(cred->api_key, value, (size_t)decoded + 1);
+        }
+      else if (strcmp(name, "volc_appid") == 0)
+        {
+          if (have_volc_appid ||
+              (size_t)decoded >= sizeof(cred->volc_appid))
+            return -EINVAL;
+
+          have_volc_appid = true;
+          memcpy(cred->volc_appid, value, (size_t)decoded + 1);
+        }
+      else
+        {
+          if (have_volc_token ||
+              (size_t)decoded >= sizeof(cred->volc_token))
+            return -EINVAL;
+
+          have_volc_token = true;
+          memcpy(cred->volc_token, value, (size_t)decoded + 1);
         }
 
 next:
