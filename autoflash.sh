@@ -261,7 +261,13 @@ for i in $(seq 1 "$REBOOT_TRIES"); do
   printf '\r\nreboot\r\n' > "$PORT" 2>/dev/null || true
   echo "  第 $i 次 CP 回退软复位已发出"
 
-  for _ in $(seq 1 10); do
+  # CP's own `reboot` takes the NMI/interrupt-watchdog path, measured at
+  # ~8.37s before the part actually resets (see
+  # board/beken/chips/bk7258/bk7258_reset.c for the measurement writeup).
+  # A 1s observation window was too short to ever see that path complete
+  # before sending another reboot; 5s gives it room to land within a
+  # couple of rounds instead of only via many short, overlapping retries.
+  for _ in $(seq 1 50); do
     if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
     kill -0 "$LOADER_PID" 2>/dev/null || break
     sleep 0.1
