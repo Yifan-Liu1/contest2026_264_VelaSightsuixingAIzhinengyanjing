@@ -37,7 +37,8 @@ static int vs_config_wait_for_store(void)
 #endif
 }
 
-int vs_config_load_wifi(struct vs_wifi_config_s *config)
+int vs_config_load_wifi(struct vs_wifi_config_s *config,
+                        uint32_t *generation)
 {
   static bool first_load = true;
   bool use_defaults = false;
@@ -48,6 +49,10 @@ int vs_config_load_wifi(struct vs_wifi_config_s *config)
     }
 
   memset(config, 0, sizeof(*config));
+  if (generation != NULL)
+    {
+      *generation = 0;
+    }
 
   if (first_load)
     {
@@ -64,7 +69,8 @@ int vs_config_load_wifi(struct vs_wifi_config_s *config)
 
   /* The provisioning record is the runtime source of network credentials.
    * Kconfig is only the first-boot fallback; no Wi-Fi credential is mirrored
-   * into KVDB.
+   * into KVDB.  A corrupt persisted record is never mistaken for an empty
+   * but successful configuration.
    */
   {
     struct velasight_prov_credentials_s credentials;
@@ -77,12 +83,16 @@ int vs_config_load_wifi(struct vs_wifi_config_s *config)
         snprintf(config->sta_password, sizeof(config->sta_password), "%s",
                  credentials.password);
         config->sta_open_network = credentials.open_network;
+        if (generation != NULL)
+          {
+            *generation = credentials.generation;
+          }
       }
     else if (ret == -ENOENT)
       {
         use_defaults = true;
       }
-    else if (ret != -EBADMSG)
+    else
       {
         return ret;
       }

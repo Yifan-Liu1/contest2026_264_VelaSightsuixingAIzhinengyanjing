@@ -1,5 +1,6 @@
 #include <nuttx/config.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -20,7 +21,9 @@
 
 #include "velasight_provisioning.h"
 #include "include/vs_config.h"
+#include "include/vs_history.h"
 #include "include/vs_network.h"
+#include "include/vs_voice.h"
 
 
 #define VS_DHCP_TRIES       3
@@ -37,8 +40,10 @@ struct vs_network_s
   pthread_cond_t wifi_cond;
   bool dhcp_running;
   bool provision_running;
-  bool provision_event;
-  int provision_status;
+  uint32_t provision_pending_generation;
+  uint32_t provision_applied_generation;
+  bool provision_failure_pending;
+  int provision_failure_status;
   bool wifi_event;
   bool sta_connected;
   bool sta_ipv4_ready;
@@ -270,48 +275,188 @@ static void vs_network_provision_saved(int status, uint32_t generation,
 {
   struct vs_network_s *network = arg;
 
-  (void)generation;
-  if (network != NULL)
+  if (network == NULL)
     {
-      pthread_mutex_lock(&network->event_lock);
-      network->provision_status = status;
-      network->provision_event = true;
-      pthread_mutex_unlock(&network->event_lock);
+      return;
     }
+
+  pthread_mutex_lock(&network->event_lock);
+  if (status == 0 && generation != 0)
+    {
+      /* Successful callbacks are serialized and the store has one current
+       * record, so only the latest unapplied generation is meaningful.  A
+       * failure is kept independently and cannot erase this durable fact. */
+      network->provision_pending_generation = generation;
+    }
+  else
+    {
+      network->provision_failure_pending = true;
+      network->provision_failure_status = status < 0 ? status : -EBADMSG;
+    }
+  pthread_mutex_unlock(&network->event_lock);
 }
 
-static int vs_network_consume_saved(struct vs_network_s *network,
-                                    bool ignore_failure)
+static int vs_network_social_history_snapshot(
+    unsigned int offset, struct velasight_prov_history_entry_s *out,
+    size_t capacity, unsigned int *total, unsigned int *copied, void *arg)
+{
+  struct vs_history_index_s *native = NULL;
+  unsigned int i;
+  int ret;
+
+  (void)arg;
+  if (total == NULL || copied == NULL ||
+      (capacity > 0 && out == NULL) ||
+      capacity > VELASIGHT_PROV_HISTORY_MAX_ENTRIES)
+    {
+      return -EINVAL;
+    }
+
+  if (!vs_history_is_ready(VS_HISTORY_KIND_SOCIAL))
+    {
+      return -ENODEV;
+    }
+
+  if (capacity > 0)
+    {
+      native = calloc(capacity, sizeof(*native));
+      if (native == NULL)
+        {
+          return -ENOMEM;
+        }
+    }
+
+  ret = vs_history_snapshot(VS_HISTORY_KIND_SOCIAL, offset, native, capacity,
+                            total, copied);
+  if (ret < 0)
+    {
+      free(native);
+      return ret;
+    }
+
+  for (i = 0; i < *copied; i++)
+    {
+      if (strlen(native[i].record_key) >
+          VELASIGHT_PROV_HISTORY_KEY_MAX)
+        {
+          free(native);
+          return -EBADMSG;
+        }
+
+      snprintf(out[i].record_key, sizeof(out[i].record_key), "%s",
+               native[i].record_key);
+      snprintf(out[i].date, sizeof(out[i].date), "%s", native[i].date);
+      snprintf(out[i].title, sizeof(out[i].title), "%s", native[i].title);
+      snprintf(out[i].summary, sizeof(out[i].summary), "%s",
+               native[i].summary);
+      out[i].calm = native[i].calm;
+      out[i].happy = native[i].happy;
+      out[i].tense = native[i].tense;
+      out[i].incomplete = native[i].incomplete;
+    }
+
+  free(native);
+  return 0;
+}
+
+static int vs_network_social_history_open(const char *record_key, int *fd,
+                                          size_t *size, void *arg)
+{
+  (void)arg;
+  return vs_history_open_full(VS_HISTORY_KIND_SOCIAL, record_key, fd, size);
+}
+
+static int vs_network_start_provisioning(struct vs_network_s *network)
+{
+  struct velasight_prov_config_s provision;
+  int ret;
+
+  memset(&provision, 0, sizeof(provision));
+  provision.one_shot = false;
+  provision.on_saved = vs_network_provision_saved;
+  provision.cb_arg = network;
+  provision.history.snapshot = vs_network_social_history_snapshot;
+  provision.history.open = vs_network_social_history_open;
+  ret = velasight_provisioning_start(&provision);
+  if (ret == 0)
+    {
+      network->provision_running = true;
+    }
+
+  return ret;
+}
+
+/* Apply the newest durable successful save.  The callback-facing generation
+ * is acknowledged only after the record has been loaded and all live mirrors
+ * have accepted the refresh.  An equal compare under event_lock preserves a
+ * newer callback that may arrive while SD-NAND I/O is in progress.
+ *
+ * Returns 1 when a save was applied, 0 when none is pending, or a negative
+ * errno while leaving the successful generation pending for a later retry.
+ */
+
+static int vs_network_reload_saved(struct vs_network_s *network)
 {
   struct vs_wifi_config_s config;
-  bool pending;
-  int status;
+  uint32_t pending_generation;
+  uint32_t loaded_generation = 0;
   int ret;
 
   pthread_mutex_lock(&network->event_lock);
-  pending = network->provision_event;
-  status = network->provision_status;
-  network->provision_event = false;
+  pending_generation = network->provision_pending_generation;
   pthread_mutex_unlock(&network->event_lock);
+  if (pending_generation == 0)
+    {
+      return 0;
+    }
 
-  if (!pending)
-    return -ENOENT;
-
-  if (status < 0)
-    return ignore_failure ? -ENOENT : status;
-
-  ret = vs_config_load_wifi(&config);
+  ret = vs_config_load_wifi(&config, &loaded_generation);
   if (ret < 0)
-    return ret;
+    {
+      return ret;
+    }
+
+  if (loaded_generation == 0)
+    {
+      return -EBADMSG;
+    }
 
   network->config = config;
   bk7258_nand_seed_agent_config();
-  return 0;
+  ret = vs_voice_reload_credentials();
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  pthread_mutex_lock(&network->event_lock);
+  network->provision_applied_generation = loaded_generation;
+  if (network->provision_pending_generation == loaded_generation)
+    {
+      network->provision_pending_generation = 0;
+    }
+  pthread_mutex_unlock(&network->event_lock);
+  return 1;
+}
+
+static int vs_network_take_save_failure(struct vs_network_s *network)
+{
+  int status = 0;
+
+  pthread_mutex_lock(&network->event_lock);
+  if (network->provision_failure_pending)
+    {
+      status = network->provision_failure_status;
+      network->provision_failure_pending = false;
+    }
+  pthread_mutex_unlock(&network->event_lock);
+  return status;
 }
 
 static int vs_network_apply_sta(struct vs_network_s *network)
 {
   struct wpa_wconfig_s wifi;
+  struct in_addr address;
   unsigned int attempt;
   int ret;
 
@@ -395,6 +540,33 @@ static int vs_network_apply_sta(struct vs_network_s *network)
           "WiFi密码错误" : "STA获取地址", ret);
     }
 
+  memset(&address, 0, sizeof(address));
+  ret = netlib_get_ipv4addr("wlan0", &address);
+  if (ret < 0 || address.s_addr == htonl(INADDR_ANY))
+    {
+      if (ret >= 0)
+        {
+          ret = -EADDRNOTAVAIL;
+        }
+      (void)wapi_set_ifdown(network->sock, "wlan0");
+      return vs_network_failed(network, "STA读取地址", ret);
+    }
+
+  if (inet_ntop(AF_INET, &address, network->status.address,
+                sizeof(network->status.address)) == NULL)
+    {
+      ret = errno != 0 ? -errno : -EIO;
+      (void)wapi_set_ifdown(network->sock, "wlan0");
+      return vs_network_failed(network, "STA地址格式", ret);
+    }
+
+  ret = vs_network_start_provisioning(network);
+  if (ret < 0)
+    {
+      (void)wapi_set_ifdown(network->sock, "wlan0");
+      return vs_network_failed(network, "STA配网服务", ret);
+    }
+
   network->mode = VS_NET_STA;
   network->status.mode = VS_NET_STA;
   network->status.state = VS_NET_STA_READY;
@@ -405,8 +577,8 @@ static int vs_network_apply_sta(struct vs_network_s *network)
   snprintf(network->status.ssid, sizeof(network->status.ssid), "%s",
            network->config.sta_ssid);
   network->status.password[0] = '\0';
-  snprintf(network->status.address, sizeof(network->status.address),
-           "STA READY");
+  printf("velasight: STA ready, web http://%s/\n",
+         network->status.address);
   return 0;
 }
 
@@ -415,7 +587,6 @@ static int vs_network_apply_ap(struct vs_network_s *network)
   struct wpa_wconfig_s wifi;
   struct in_addr address;
   struct in_addr netmask;
-  struct velasight_prov_config_s provision;
   int ret;
 
   if (network->config.ap_channel < 1 || network->config.ap_channel > 14 ||
@@ -486,18 +657,12 @@ static int vs_network_apply_ap(struct vs_network_s *network)
     }
 
   network->dhcp_running = true;
-  memset(&provision, 0, sizeof(provision));
-  provision.one_shot = false;
-  provision.on_saved = vs_network_provision_saved;
-  provision.cb_arg = network;
-  ret = velasight_provisioning_start(&provision);
+  ret = vs_network_start_provisioning(network);
   if (ret < 0)
     {
        vs_network_failed(network, "AP配网服务", ret);
       goto fail;
     }
-
-  network->provision_running = true;
 
   network->mode = VS_NET_AP;
   network->status.mode = VS_NET_AP;
@@ -560,7 +725,7 @@ int vs_network_open(struct vs_network_s **network)
       return ret;
     }
 
-  ret = vs_config_load_wifi(&n->config);
+  ret = vs_config_load_wifi(&n->config, NULL);
   if (ret < 0)
     {
       close(n->sock);
@@ -599,34 +764,42 @@ int vs_network_request_mode(struct vs_network_s *network,
   network->status.error_reason[0] = '\0';
   network->status.state = VS_NET_SWITCHING;
 
-  if (network->mode == VS_NET_AP && mode == VS_NET_STA)
-    {
-      ret = vs_network_stop_provisioning(network);
-      if (ret < 0)
-        {
-          snprintf(network->status.error_reason,
-                   sizeof(network->status.error_reason),
-                   "AP provisioning stop (%d)", ret);
-          network->status.state = VS_NET_ERROR;
-          network->status.error = ret;
-          return ret;
-        }
+  /* The wildcard listener is also active in STA mode.  Join it before any
+   * wlan0 reset so no client or callback survives across an interface role
+   * change; both AP and STA paths start a fresh listener after their address
+   * is ready. */
 
-      /* stop() joins the listener, so no callback can race with this consume.
-       * Apply a completed save even when manual exit won the UI race; discard
-       * a failed save because the user explicitly chose to leave AP.
-       */
-      ret = vs_network_consume_saved(network, true);
-      if (ret < 0 && ret != -ENOENT)
-        {
-          snprintf(network->status.error_reason,
-                   sizeof(network->status.error_reason),
-                   "保存WiFi配置 (%d)", ret);
-          network->status.state = VS_NET_ERROR;
-          network->status.error = ret;
-          return ret;
-        }
+  ret = vs_network_stop_provisioning(network);
+  if (ret < 0)
+    {
+      snprintf(network->status.error_reason,
+               sizeof(network->status.error_reason),
+               "Web服务停止 (%d)", ret);
+      network->status.state = VS_NET_ERROR;
+      network->status.error = ret;
+      return ret;
     }
+
+  /* stop() joins the listener, so no save callback can race this reload.
+   * A failed HTTP save already returned an error to its client and does not
+   * invalidate the current config.  A successful save remains pending until
+   * its durable generation and live providers have both been refreshed. */
+
+  ret = vs_network_reload_saved(network);
+  if (ret < 0)
+    {
+      snprintf(network->status.error_reason,
+               sizeof(network->status.error_reason),
+               "加载已保存配置 (%d)", ret);
+      network->status.state = VS_NET_ERROR;
+      network->status.error = ret;
+      return ret;
+    }
+
+  /* The browser already received any persistence failure.  Discard only the
+   * independent failure notification during a mode switch; never the pending
+   * success generation above. */
+  (void)vs_network_take_save_failure(network);
 
   ret = vs_network_stop_dhcp(network);
   if (ret < 0)
@@ -721,20 +894,42 @@ int vs_network_process_events(struct vs_network_s *network)
       changed = true;
     }
 
-  ret = vs_network_consume_saved(network, false);
-  if (ret == -ENOENT)
-    return changed ? 1 : 0;
-
+  ret = vs_network_reload_saved(network);
   if (ret < 0)
     {
+      /* Do not acknowledge the generation on a transient load/provider
+       * failure.  The current link stays alive and a later poll retries. */
       network->status.error = ret;
-      network->status.state = VS_NET_AP_READY;
+      snprintf(network->status.error_reason,
+               sizeof(network->status.error_reason),
+               "加载保存配置 (%d)", ret);
       return ret;
     }
 
-  /* Keep AP and the provisioning listener alive after a save.  The saved STA
-   * credentials are applied only when the user explicitly exits AP mode. */
-  return 1;
+  if (ret > 0)
+    {
+      changed = true;
+      network->status.error = 0;
+      network->status.error_reason[0] = '\0';
+    }
+
+  ret = vs_network_take_save_failure(network);
+  if (ret < 0)
+    {
+      /* Persistence errors belong to the Web operation, not the radio.  Keep
+       * the real AP/STA/DOWN state instead of fabricating AP_READY while the
+       * device may be connected as a station. */
+      network->status.error = ret;
+      snprintf(network->status.error_reason,
+               sizeof(network->status.error_reason),
+               "保存配置失败 (%d)", ret);
+      return ret;
+    }
+
+  /* Keep the current listener and link alive after a save.  New Wi-Fi
+   * credentials are used by the next explicit switch or disconnected-STA
+   * retry; MiMo/Volcengine live credentials are already refreshed or queued. */
+  return changed ? 1 : 0;
 }
 
 int vs_network_get_status(struct vs_network_s *network,

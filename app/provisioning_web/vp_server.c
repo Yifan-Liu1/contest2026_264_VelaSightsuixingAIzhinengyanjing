@@ -15,9 +15,12 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "velasight_provisioning.h"
@@ -52,6 +55,7 @@ struct vp_server_s
   uint32_t  generation;
   velasight_prov_saved_cb_t on_saved;
   void     *cb_arg;
+  struct velasight_prov_history_provider_s history;
 };
 
 static struct vp_server_s g_server =
@@ -90,11 +94,11 @@ static int vp_wait_stop(int timeout_ms)
   pfd.fd = g_server.stoprd;
   pfd.events = POLLIN;
   pfd.revents = 0;
-  do
+  ret = poll(&pfd, 1, timeout_ms);
+  if (ret < 0 && errno == EINTR)
     {
-      ret = poll(&pfd, 1, timeout_ms);
+      return 0;
     }
-  while (ret < 0 && errno == EINTR);
 
   if (ret > 0 || vp_stopping())
     {
@@ -104,15 +108,83 @@ static int vp_wait_stop(int timeout_ms)
   return ret < 0 ? -errno : 0;
 }
 
-static int vp_write_all(int fd, const char *data, size_t len)
+static int vp_monotonic_ms(uint64_t *now_ms)
+{
+  struct timespec now;
+
+  if (now_ms == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+    {
+      return -errno;
+    }
+
+  *now_ms = (uint64_t)now.tv_sec * 1000u +
+            (uint64_t)now.tv_nsec / 1000000u;
+  return 0;
+}
+
+static int vp_response_deadline(uint64_t *deadline_ms)
+{
+  uint64_t now;
+  int ret = vp_monotonic_ms(&now);
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  *deadline_ms = now + VP_RESPONSE_TIMEOUT_MS;
+  return 0;
+}
+
+static int vp_deadline_delay(uint64_t deadline_ms, int *delay_ms)
+{
+  uint64_t now;
+  uint64_t remaining;
+  int ret = vp_monotonic_ms(&now);
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (now >= deadline_ms)
+    {
+      return -ETIMEDOUT;
+    }
+
+  remaining = deadline_ms - now;
+  *delay_ms = remaining < VP_RESPONSE_RETRY_MS ? (int)remaining :
+                                                    VP_RESPONSE_RETRY_MS;
+  if (*delay_ms <= 0)
+    {
+      *delay_ms = 1;
+    }
+
+  return 0;
+}
+
+static int vp_write_all(int fd, const char *data, size_t len,
+                        uint64_t deadline_ms)
 {
   size_t sent = 0;
-  int waited = 0;
 
   while (sent < len)
     {
       int flags = MSG_DONTWAIT;
+      int delay_ms;
       ssize_t n;
+      int ret;
+
+      ret = vp_deadline_delay(deadline_ms, &delay_ms);
+      if (ret < 0)
+        {
+          return ret;
+        }
 
 #ifdef MSG_NOSIGNAL
       flags |= MSG_NOSIGNAL;
@@ -121,6 +193,8 @@ static int vp_write_all(int fd, const char *data, size_t len)
 
       if (n < 0)
         {
+          bool retryable;
+
           if (errno == EINTR)
             {
               continue;
@@ -128,23 +202,28 @@ static int vp_write_all(int fd, const char *data, size_t len)
 
           /* NuttX's buffered TCP send returns ENOMEM when the global socket
            * callback pool is momentarily busy, and EAGAIN/ENOBUFS when the
-           * WRB or IOB pool is busy.  Phone browsers create short connection
-           * bursts, so give completed closes a bounded chance to release
-           * those resources.  The stop pipe makes this retry immediately
-           * interruptible when the application leaves SoftAP.
-           */
+           * WRB or IOB pool is busy.  Every fragment of one response shares
+           * the same absolute deadline, so a paced slow client cannot occupy
+           * the only listener forever by periodically freeing one buffer. */
 
-          if ((errno == ENOMEM || errno == EAGAIN || errno == ENOBUFS) &&
-              waited < VP_RESPONSE_TIMEOUT_MS)
+          retryable = errno == ENOMEM || errno == EAGAIN || errno == ENOBUFS;
+#ifdef EWOULDBLOCK
+          retryable = retryable || errno == EWOULDBLOCK;
+#endif
+          if (retryable)
             {
-              int ret = vp_wait_stop(VP_RESPONSE_RETRY_MS);
-
+              ret = vp_deadline_delay(deadline_ms, &delay_ms);
               if (ret < 0)
                 {
                   return ret;
                 }
 
-              waited += VP_RESPONSE_RETRY_MS;
+              ret = vp_wait_stop(delay_ms);
+              if (ret < 0)
+                {
+                  return ret;
+                }
+
               continue;
             }
 
@@ -160,6 +239,14 @@ static int vp_write_all(int fd, const char *data, size_t len)
     }
 
   return 0;
+}
+
+static int vp_write_response(int fd, const char *data, size_t len)
+{
+  uint64_t deadline_ms;
+  int ret = vp_response_deadline(&deadline_ms);
+
+  return ret < 0 ? ret : vp_write_all(fd, data, len, deadline_ms);
 }
 
 /****************************************************************************
@@ -267,6 +354,282 @@ static int vp_read_request(int fd, struct vp_http_request_s *req)
     }
 }
 
+static bool vp_history_enabled(void)
+{
+  return g_server.history.snapshot != NULL && g_server.history.open != NULL;
+}
+
+static int vp_send_status(int fd, int status, const char *message)
+{
+  size_t len = vp_http_status_page(g_response, sizeof(g_response), status,
+                                   message);
+
+  return len == 0 ? -EOVERFLOW : vp_write_response(fd, g_response, len);
+}
+
+static int vp_history_error_status(int error)
+{
+  if (error == -ENOENT)
+    {
+      return 404;
+    }
+
+  if (error == -ENODEV || error == -EAGAIN)
+    {
+      return 503;
+    }
+
+  return 500;
+}
+
+static int vp_history_snapshot(
+    struct velasight_prov_history_entry_s **entries_out,
+    unsigned int *count_out)
+{
+  struct velasight_prov_history_entry_s *entries = NULL;
+  unsigned int total = 0;
+  unsigned int copied = 0;
+  unsigned int attempt;
+  int ret;
+
+  if (entries_out == NULL || count_out == NULL || !vp_history_enabled())
+    {
+      return -ENODEV;
+    }
+
+  *entries_out = NULL;
+  *count_out = 0;
+  ret = g_server.history.snapshot(0, NULL, 0, &total, &copied,
+                                  g_server.history.arg);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  for (attempt = 0; attempt < 2; attempt++)
+    {
+      unsigned int current_total = 0;
+
+      if (total > VELASIGHT_PROV_HISTORY_MAX_ENTRIES)
+        {
+          return -E2BIG;
+        }
+
+      if (total == 0)
+        {
+          return 0;
+        }
+
+      entries = calloc(total, sizeof(*entries));
+      if (entries == NULL)
+        {
+          return -ENOMEM;
+        }
+
+      copied = 0;
+      ret = g_server.history.snapshot(0, entries, total, &current_total,
+                                      &copied, g_server.history.arg);
+      if (ret < 0)
+        {
+          free(entries);
+          return ret;
+        }
+
+      if (copied > total)
+        {
+          free(entries);
+          return -EBADMSG;
+        }
+
+      if (current_total <= total)
+        {
+          *entries_out = entries;
+          *count_out = copied;
+          return 0;
+        }
+
+      free(entries);
+      entries = NULL;
+      total = current_total;
+    }
+
+  return -EAGAIN;
+}
+
+static int vp_send_history_list(int fd)
+{
+  struct velasight_prov_history_entry_s *entries = NULL;
+  unsigned int count = 0;
+  unsigned int i;
+  size_t body_length = 0;
+  size_t len;
+  uint64_t deadline_ms;
+  int status;
+  int ret;
+
+  if (!vp_history_enabled())
+    {
+      return vp_send_status(fd, 404, "历史记录功能未启用。");
+    }
+
+  ret = vp_history_snapshot(&entries, &count);
+  if (ret < 0)
+    {
+      status = vp_history_error_status(ret);
+      return vp_send_status(fd, status,
+                            status == 503 ? "历史存储暂不可用。" :
+                            status == 404 ? "历史记录不存在。" :
+                                            "读取历史记录失败。");
+    }
+
+  len = vp_http_history_head_fragment(g_response, sizeof(g_response), count);
+  if (len == 0)
+    {
+      free(entries);
+      return vp_send_status(fd, 500, "生成历史页面失败。");
+    }
+  body_length = len;
+
+  for (i = 0; i < count; i++)
+    {
+      len = vp_http_history_entry_fragment(g_response, sizeof(g_response),
+                                           &entries[i]);
+      if (len == 0 || body_length > SIZE_MAX - len)
+        {
+          free(entries);
+          return vp_send_status(fd, 500, "历史索引格式无效。");
+        }
+
+      body_length += len;
+    }
+
+  len = vp_http_history_tail_fragment(g_response, sizeof(g_response));
+  if (len == 0 || body_length > SIZE_MAX - len)
+    {
+      free(entries);
+      return vp_send_status(fd, 500, "生成历史页面失败。");
+    }
+  body_length += len;
+
+  len = vp_http_response_header(g_response, sizeof(g_response), 200,
+                                "text/html; charset=utf-8", body_length,
+                                NULL, NULL);
+  if (len == 0)
+    {
+      free(entries);
+      return -EOVERFLOW;
+    }
+
+  ret = vp_response_deadline(&deadline_ms);
+  if (ret == 0)
+    {
+      ret = vp_write_all(fd, g_response, len, deadline_ms);
+    }
+  if (ret == 0)
+    {
+      len = vp_http_history_head_fragment(g_response, sizeof(g_response),
+                                          count);
+      ret = len == 0 ? -EOVERFLOW :
+                       vp_write_all(fd, g_response, len, deadline_ms);
+    }
+
+  for (i = 0; ret == 0 && i < count; i++)
+    {
+      len = vp_http_history_entry_fragment(g_response, sizeof(g_response),
+                                           &entries[i]);
+      ret = len == 0 ? -EBADMSG :
+                       vp_write_all(fd, g_response, len, deadline_ms);
+    }
+
+  if (ret == 0)
+    {
+      len = vp_http_history_tail_fragment(g_response, sizeof(g_response));
+      ret = len == 0 ? -EOVERFLOW :
+                       vp_write_all(fd, g_response, len, deadline_ms);
+    }
+
+  free(entries);
+  return ret;
+}
+
+static int vp_send_history_file(int fd, const char *record_key,
+                                bool download)
+{
+  size_t remaining;
+  size_t size = 0;
+  size_t len;
+  uint64_t deadline_ms;
+  int history_fd = -1;
+  int status;
+  int ret;
+
+  if (!vp_history_enabled())
+    {
+      return vp_send_status(fd, 404, "历史记录功能未启用。");
+    }
+
+  ret = g_server.history.open(record_key, &history_fd, &size,
+                              g_server.history.arg);
+  if (ret < 0 || history_fd < 0)
+    {
+      if (history_fd >= 0)
+        {
+          close(history_fd);
+        }
+
+      if (ret >= 0)
+        {
+          ret = -EBADMSG;
+        }
+      status = vp_history_error_status(ret);
+      return vp_send_status(fd, status,
+                            status == 503 ? "历史存储暂不可用。" :
+                            status == 404 ? "历史记录不存在。" :
+                                            "打开历史记录失败。");
+    }
+
+  len = vp_http_response_header(
+      g_response, sizeof(g_response), 200,
+      download ? "application/json" : "application/json; charset=utf-8",
+      size, download ? "attachment" : NULL,
+      download ? record_key : NULL);
+  if (len == 0)
+    {
+      close(history_fd);
+      return -EOVERFLOW;
+    }
+
+  ret = vp_response_deadline(&deadline_ms);
+  if (ret == 0)
+    {
+      ret = vp_write_all(fd, g_response, len, deadline_ms);
+    }
+  remaining = size;
+  while (ret == 0 && remaining > 0)
+    {
+      size_t wanted = remaining < sizeof(g_response) ? remaining :
+                                                       sizeof(g_response);
+      ssize_t n = read(history_fd, g_response, wanted);
+
+      if (n < 0 && errno == EINTR)
+        {
+          continue;
+        }
+
+      if (n <= 0)
+        {
+          ret = n < 0 ? -errno : -EIO;
+          break;
+        }
+
+      ret = vp_write_all(fd, g_response, (size_t)n, deadline_ms);
+      remaining -= (size_t)n;
+    }
+
+  close(history_fd);
+  return ret;
+}
+
 /****************************************************************************
  * Name: vp_handle
  *
@@ -313,14 +676,37 @@ static void vp_handle(int fd, bool *saved, int *save_status,
 
          if (velasight_provisioning_load(&current) == 0)
            ssid = current.ssid;
-         len = vp_http_form_page_with_ssid(g_response, sizeof(g_response),
-                                           NULL, ssid);
+         len = vp_http_form_page_with_ssid_history(
+             g_response, sizeof(g_response), NULL, ssid,
+             vp_history_enabled());
        }
+    }
+  else if (req.action == VP_HTTP_ACTION_HISTORY_LIST)
+    {
+      ret = vp_send_history_list(fd);
+      if (ret < 0)
+        {
+          printf("provision_web: history list write failed: %d\n", ret);
+        }
+      return;
+    }
+  else if (req.action == VP_HTTP_ACTION_HISTORY_JSON ||
+           req.action == VP_HTTP_ACTION_HISTORY_DOWNLOAD)
+    {
+      ret = vp_send_history_file(
+          fd, req.record_key,
+          req.action == VP_HTTP_ACTION_HISTORY_DOWNLOAD);
+      if (ret < 0)
+        {
+          printf("provision_web: history file write failed: %d\n", ret);
+        }
+      return;
     }
   else if (req.action == VP_HTTP_ACTION_REJECT)
     {
       len = vp_http_status_page(g_response, sizeof(g_response), req.status,
                                req.status == 404 ? "页面不存在。" :
+                               req.status == 403 ? "不允许跨站提交。" :
                                req.status == 405 ? "不支持该请求方法。" :
                                req.status == 413 ? "提交内容过大。" :
                                req.status == 415 ? "提交格式不受支持。" :
@@ -409,7 +795,7 @@ static void vp_handle(int fd, bool *saved, int *save_status,
 
   if (len > 0)
     {
-      ret = vp_write_all(fd, g_response, len);
+      ret = vp_write_response(fd, g_response, len);
       if (ret < 0)
         {
           /* Transport failure does not undo a completed persistent save.
@@ -643,6 +1029,11 @@ int velasight_provisioning_start(
       return -ENAMETOOLONG;
     }
 
+  if ((cfg.history.snapshot == NULL) != (cfg.history.open == NULL))
+    {
+      return -EINVAL;
+    }
+
   pthread_mutex_lock(&g_lock);
   vp_reap_locked();
   if (g_server.state != VP_STATE_IDLE)
@@ -695,6 +1086,7 @@ int velasight_provisioning_start(
   g_server.generation = 0;
   g_server.on_saved   = cfg.on_saved;
   g_server.cb_arg     = cfg.cb_arg;
+  g_server.history   = cfg.history;
   g_server.stoprd     = stopfds[0];
   g_server.stopwr     = stopfds[1];
   g_server.clientfd   = -1;

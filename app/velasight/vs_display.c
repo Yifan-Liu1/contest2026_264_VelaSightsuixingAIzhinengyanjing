@@ -37,6 +37,37 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_META_X            28
 #define VS_META_WIDTH        104
 
+/* The specification calls the y=110..128 row the wider chord region and gives
+ * it "date, time or longer meta information".  The chord is 128 px across at
+ * that row's lowest scanline, so this is as wide as it can be without the ends
+ * of a fifteen-character address falling off the circle -- which 104 px would
+ * have clipped.
+ */
+
+#define VS_META_WIDE_X       16
+#define VS_META_WIDE_WIDTH   128
+
+/* Both rings are 152x152 and centred, hugging the bezel as the display rules
+ * require.  They differ only in how much of the circle they sweep.
+ *
+ * A hold ring may cross the y=108 divider, because a hold hides the key hints
+ * and has the screen to itself.  A level ring shares the screen with them, so
+ * its ends have to stop above the line -- and the way to do that is to draw
+ * less of the circle, not to draw a smaller one.
+ *
+ * An end at angle a sits at y = cy + r sin(a), so clearing y=108 with cy=80
+ * and r=76 needs sin(a) <= 28/76, i.e. a <= 21.6 degrees or a >= 158.4.  The
+ * angles below are 160 and 380 (= 20), which puts both ends at y = 106 and
+ * leaves a 220 degree sweep -- still most of the circle, and visually the same
+ * ring as the hold one.
+ */
+
+#define VS_RING_SIZE         152
+#define VS_HOLD_ANGLE_START  135
+#define VS_HOLD_ANGLE_END    405
+#define VS_LEVEL_ANGLE_START 160
+#define VS_LEVEL_ANGLE_END   380
+
 #define VS_STATUS_SHORT_X       2
 #define VS_STATUS_SHORT_Y       44
 #define VS_STATUS_SHORT_WIDTH   156
@@ -55,6 +86,15 @@ struct vs_panel_s
   lv_obj_t *meta;
   lv_obj_t *status_line[2];
   lv_obj_t *progress;
+
+  /* The sweep currently programmed into the arc.  Cached so the background
+   * angles are only rewritten when the ring changes kind: each write ends in
+   * lv_arc's value_update(), which invalidates the ring's area, and doing that
+   * on every repaint would undo the point of the snapshot dirty check.
+   */
+
+  int32_t ring_start;
+  int32_t ring_end;
   lv_obj_t *divider[2];
   lv_obj_t *key[VS_KEY_COUNT];
 };
@@ -177,12 +217,14 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
   if (panel->progress == NULL)
     return -ENOMEM;
 
-  lv_obj_set_size(panel->progress, 152, 152);
+  lv_obj_set_size(panel->progress, VS_RING_SIZE, VS_RING_SIZE);
   lv_obj_center(panel->progress);
   lv_arc_set_range(panel->progress, 0, 100);
-  lv_arc_set_angles(panel->progress, 135, 405);
-  lv_arc_set_bg_angles(panel->progress, 135, 405);
+  lv_arc_set_bg_angles(panel->progress, VS_HOLD_ANGLE_START,
+                       VS_HOLD_ANGLE_END);
   lv_arc_set_value(panel->progress, 0);
+  panel->ring_start = VS_HOLD_ANGLE_START;
+  panel->ring_end = VS_HOLD_ANGLE_END;
   lv_obj_set_style_arc_color(panel->progress, vs_rgb(27, 55, 72), LV_PART_MAIN);
   lv_obj_set_style_arc_width(panel->progress, 4, LV_PART_MAIN);
   lv_obj_set_style_arc_color(panel->progress, vs_rgb(53, 199, 174), LV_PART_INDICATOR);
@@ -277,6 +319,31 @@ static void vs_panel_set_progress(struct vs_panel_s *panel,
 {
   if (visible)
     {
+      int32_t start = snapshot->progress_kind == VS_PROGRESS_LEVEL ?
+                      VS_LEVEL_ANGLE_START : VS_HOLD_ANGLE_START;
+      int32_t end = snapshot->progress_kind == VS_PROGRESS_LEVEL ?
+                    VS_LEVEL_ANGLE_END : VS_HOLD_ANGLE_END;
+
+      /* Only the background sweep is programmed here.  The value is the single
+       * source of truth for how far the ring is filled, and
+       * lv_arc_set_bg_angles() ends in lv_arc's value_update(), so changing the
+       * sweep re-derives the indicator from the value on its own.
+       *
+       * lv_arc_set_angles() must not be used alongside it.  That call writes
+       * the indicator angles directly -- passing the full sweep pegs the ring
+       * at 100% -- and lv_arc_set_value() cannot put it back, because it
+       * returns early when the value has not changed (lv_arc.c:237).  A level
+       * being redrawn has an unchanged value by definition, which is why the
+       * volume ring read full on every repaint after the first.
+       */
+
+      if (panel->ring_start != start || panel->ring_end != end)
+        {
+          lv_arc_set_bg_angles(panel->progress, start, end);
+          panel->ring_start = start;
+          panel->ring_end = end;
+        }
+
       vs_set_hidden(panel->progress, false);
       lv_arc_set_value(panel->progress, snapshot->progress);
     }
@@ -317,7 +384,14 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
             }
         }
 
+      /* A hold hides every hint but the one being acknowledged, because the
+       * gesture in progress is the only thing the keys can do.  A level does
+       * the opposite: the user is pressing keys to move it, so the hints are
+       * what makes it operable.
+       */
+
       if (snapshot->progress_kind != VS_PROGRESS_NONE &&
+          snapshot->progress_kind != VS_PROGRESS_LEVEL &&
           !(snapshot->response_active && snapshot->response_key == key))
         visible = false;
 
@@ -338,7 +412,17 @@ static void vs_render_content(struct vs_panel_s *panel,
   /* The wider upper row carries metadata; the lower row carries the short
    * status moved from the right screen. */
 
-  lv_obj_set_y(panel->meta, VS_LOWER_TOP_Y);
+  if (snapshot->page == VS_PAGE_VOLUME)
+    {
+      lv_obj_set_pos(panel->meta, VS_META_WIDE_X, VS_LOWER_TOP_Y);
+      lv_obj_set_width(panel->meta, VS_META_WIDE_WIDTH);
+    }
+  else
+    {
+      lv_obj_set_pos(panel->meta, VS_META_X, VS_LOWER_TOP_Y);
+      lv_obj_set_width(panel->meta, VS_META_WIDTH);
+    }
+
   vs_set_label(panel->title, snapshot->content_title);
   vs_set_label(panel->body, snapshot->content_body);
   vs_set_label(panel->meta, snapshot->content_meta);
@@ -408,7 +492,8 @@ static void vs_render_status(struct vs_panel_s *panel,
   vs_set_label(panel->meta, "");
   vs_set_text_color(panel->body, vs_color(snapshot->emotion_color));
   vs_panel_set_progress(panel, snapshot, progress &&
-                        snapshot->progress_kind == VS_PROGRESS_HOLD);
+                        (snapshot->progress_kind == VS_PROGRESS_HOLD ||
+                         snapshot->progress_kind == VS_PROGRESS_LEVEL));
   vs_panel_set_keys(panel, snapshot, false);
 }
 
@@ -537,6 +622,22 @@ void vs_display_tick(struct vs_display_s *display)
         }
       lv_timer_handler();
     }
+}
+
+void vs_display_flush(struct vs_display_s *display)
+{
+  if (display == NULL)
+    {
+      return;
+    }
+
+  /* Both panels, and both synchronously: the two screens carry halves of one
+   * message, and lv_refr_now() runs each framebuffer's FBIO_UPDATE before it
+   * returns.  This is the same hand-off the boot reveal uses.
+   */
+
+  lv_refr_now(display->panel[VS_STATUS_PANEL].display);
+  lv_refr_now(display->panel[VS_CONTENT_PANEL].display);
 }
 
 void vs_display_close(struct vs_display_s *display)

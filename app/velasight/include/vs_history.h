@@ -7,16 +7,28 @@
 
 #include "vs_types.h"
 
-/* record_key is a short, stable identifier ("R00000001") used both as the
- * on-disk record file's stem and as the handle vs_voice.c freezes at the
- * moment a question is asked, so a later page change cannot make the
- * question answer a different record than the one shown on screen.
+/* Record keys are 8.3-safe file stems: "R" plus seven decimal digits.
+ * SOCIAL and CHAT have independent key spaces, so kind must always travel
+ * with the key.
  */
 
 #define VS_HISTORY_KEY_MAX 16
 
+enum vs_history_kind_e
+{
+  VS_HISTORY_KIND_SOCIAL = 0,
+  VS_HISTORY_KIND_CHAT,
+  VS_HISTORY_KIND_COUNT
+};
+
+/* One compact index entry.  The full JSON body is stored in a separate file
+ * and is opened only by worker/Web threads; UI snapshots only copy this
+ * structure and never touch SD-NAND.
+ */
+
 struct vs_history_index_s
 {
+  enum vs_history_kind_e kind;
   char     record_key[VS_HISTORY_KEY_MAX];
   char     date[VS_TEXT_SHORT];
   char     title[VS_TEXT_SHORT];
@@ -27,69 +39,61 @@ struct vs_history_index_s
   bool     incomplete;
 };
 
-/****************************************************************************
- * Name: vs_history_open
- *
- * Description:
- *   Wait for the SD-NAND store, load the index into memory, and seed it
- *   with the built-in demo records the very first time no store exists yet
- *   so the UI keeps showing something meaningful before any real record has
- *   been written.  Blocking: SD-NAND automount can take tens of seconds.
- *   Call once at startup, never from the UI hot path.
- *
- * Returned Value:
- *   0 on success (including "seeded fresh"), or a negative errno.  A
- *   failure here still leaves the in-memory index at zero records rather
- *   than leaving the caller without a usable vs_history_count().
- *
- ****************************************************************************/
+/* Wait for SD-NAND, create the two stores and load their indexes.  A missing
+ * SOCIAL index is initialized with protocol-shaped sample sessions; a
+ * missing CHAT index is initialized as an empty array.  Corrupt indexes are
+ * not overwritten.  Returns 0 only when both stores are usable.
+ */
 
 int vs_history_open(void);
 
-/* Number of records currently known.  In-memory only, never blocks, safe to
- * call from vs_snapshot(). */
+/* True only when this kind has a mounted, loaded and writable backing store.
+ * A startup failure may still leave in-memory SOCIAL samples visible to the
+ * display, but append/open_full then correctly return -ENODEV.
+ */
 
-unsigned int vs_history_count(void);
+bool vs_history_is_ready(enum vs_history_kind_e kind);
 
-/* Copy index fields for record i (0-based, 0 is the newest).  In-memory
- * only, never blocks.  Returns 0, or -EINVAL if i is out of range. */
+/* In-memory readers.  Index 0 is newest. */
 
-int vs_history_get_index(unsigned int i, struct vs_history_index_s *out);
+unsigned int vs_history_count(enum vs_history_kind_e kind);
+int vs_history_get_index(enum vs_history_kind_e kind, unsigned int index,
+                         struct vs_history_index_s *out);
 
-/* Read the stored full record for record_key as a NUL-terminated JSON
- * object string (title/summary/date and, when a producer supplies them,
- * body/full_transcript/timeline/emotion_distribution).  Opens a file: call
- * only from a worker thread, never from the UI hot path.
- *
- * Returns the number of bytes written (excluding the NUL), or a negative
- * errno.  -ENOENT means record_key is not on disk (stale key, or the store
- * was cleared). */
+/* Copy one consistent page of index entries while holding the internal lock.
+ * offset is newest-first; total is the full count and copied is the number
+ * written to out.  out may be NULL only when capacity is zero.
+ */
 
-int vs_history_read_full(const char *record_key, char *buf, size_t len);
+int vs_history_snapshot(enum vs_history_kind_e kind, unsigned int offset,
+                        struct vs_history_index_s *out, size_t capacity,
+                        unsigned int *total, unsigned int *copied);
 
-/****************************************************************************
- * Name: vs_history_append
- *
- * Description:
- *   Add one record.  index->record_key is generated and filled in on
- *   return; any value the caller put there is ignored.  full_json, when
- *   non-NULL, is stored verbatim as the full record body alongside the
- *   index fields (it must already be a valid, NUL-terminated JSON object
- *   fragment -- e.g. {"body":"...","full_transcript":"..."} -- with no
- *   trailing content); NULL stores only the index fields.
- *
- *   Writes go through a temp-file-then-rename sequence with fsync so a
- *   power loss mid-write leaves either the old state or the new one, never
- *   a half-written file.  Call only from a worker thread.
- *
- * Returned Value:
- *   0 on success, or a negative errno.  -ENOSPC means the in-memory index
- *   is already at CONFIG_VS_HISTORY_MAX_RECORDS; the caller keeps its
- *   existing history rather than losing an old record to make room.
- *
- ****************************************************************************/
+/* Open a complete record after strict key validation and membership checking.
+ * The returned descriptor is positioned at byte zero and belongs to the
+ * caller.  Opening under the history lock gives Web downloads a stable file
+ * even if a later append evicts its index entry.
+ */
 
-int vs_history_append(struct vs_history_index_s *index,
+int vs_history_open_full(enum vs_history_kind_e kind, const char *record_key,
+                         int *fd, size_t *size);
+
+/* Read a complete JSON body and append a NUL.  Unlike the old API, this never
+ * reports a truncated JSON document as success: -E2BIG means len is too
+ * small for the complete body plus terminator.
+ */
+
+int vs_history_read_full(enum vs_history_kind_e kind, const char *record_key,
+                         char *buf, size_t len);
+
+/* Atomically append one full JSON object.  The module generates record_key,
+ * writes the body, commits a replacement index, then removes the evicted
+ * oldest body (if capacity was full).  A failed index commit leaves the old
+ * index and old body intact and returns an error.  Capacity is per kind.
+ */
+
+int vs_history_append(enum vs_history_kind_e kind,
+                      struct vs_history_index_s *index,
                       const char *full_json);
 
 void vs_history_close(void);

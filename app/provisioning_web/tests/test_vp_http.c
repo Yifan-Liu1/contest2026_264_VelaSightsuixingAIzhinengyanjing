@@ -42,6 +42,34 @@ static void test_dispatch(void)
   CHECK(parse("GET /?x=1 HTTP/1.1\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_PAGE, "a query string is ignored");
 
+  CHECK(parse("GET /history HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_HISTORY_LIST,
+        "GET /history serves the social-history list");
+  CHECK(parse("GET /history/R0000000 HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_HISTORY_JSON &&
+        strcmp(req.record_key, "R0000000") == 0,
+        "a strict record key selects JSON preview");
+  CHECK(parse("GET /history/R1234567/download?x=1 HTTP/1.1\r\n\r\n",
+              &req) == 0 &&
+        req.action == VP_HTTP_ACTION_HISTORY_DOWNLOAD &&
+        strcmp(req.record_key, "R1234567") == 0,
+        "a strict record key selects attachment download");
+  CHECK(parse("GET /history/r0000000 HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
+        "history keys are case sensitive");
+  CHECK(parse("GET /history/R000000 HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
+        "a short history key is rejected");
+  CHECK(parse("GET /history/R00000000 HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
+        "a long history key is rejected");
+  CHECK(parse("GET /history/%520000000 HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
+        "encoded history keys are not decoded into routes");
+  CHECK(parse("GET /history/R0000000/ HTTP/1.1\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
+        "a trailing history path segment is rejected");
+
   CHECK(parse("GET /secret HTTP/1.1\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
         "an unknown path is 404");
@@ -58,6 +86,20 @@ static void test_dispatch(void)
               "Content-Length: 27\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_SAVE && req.content_length == 27,
         "a well formed submit is accepted");
+
+  CHECK(parse("POST /save HTTP/1.1\r\n"
+              "Sec-Fetch-Site: cross-site \t\r\n"
+              "Content-Type: application/x-www-form-urlencoded\r\n"
+              "Content-Length: 27\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 403,
+        "an explicit cross-site browser submit is refused");
+
+  CHECK(parse("POST /save HTTP/1.1\r\n"
+              "sEc-FeTcH-sItE: same-origin\r\n"
+              "Content-Type: application/x-www-form-urlencoded\r\n"
+              "Content-Length: 27\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_SAVE && req.content_length == 27,
+        "a same-origin browser submit remains accepted");
 
   CHECK(parse("POST /save HTTP/1.1\r\n"
               "content-type: application/x-www-form-urlencoded; charset=UTF-8"
@@ -203,8 +245,73 @@ static void test_pages(void)
   len = vp_http_status_page(buf, sizeof(buf), 413, "too large");
   CHECK(len > 0 && strncmp(buf, "HTTP/1.1 413 ", 13) == 0,
         "a status page uses the requested status");
+
+  len = vp_http_status_page(buf, sizeof(buf), 403, "forbidden");
+  CHECK(len > 0 &&
+        strncmp(buf, "HTTP/1.1 403 Forbidden\r\n", 24) == 0,
+        "a 403 status page uses the Forbidden reason phrase");
   CHECK(vp_http_status_page(buf, 8, 400, "bad") == 0,
         "a status page refuses a buffer it cannot fill");
+}
+
+static void test_history_pages(void)
+{
+  struct velasight_prov_history_entry_s entry;
+  char buf[VP_HTTP_RESPONSE_MAX];
+  size_t len;
+
+  CHECK(vp_http_history_key_valid("R0000000"),
+        "the canonical history key is valid");
+  CHECK(!vp_http_history_key_valid("R00000000") &&
+        !vp_http_history_key_valid("r0000000") &&
+        !vp_http_history_key_valid("R00000/0"),
+        "non-canonical history keys are invalid");
+
+  len = vp_http_form_page_with_ssid_history(buf, sizeof(buf), NULL,
+                                            "AIPC", true);
+  CHECK(len > 0 && strstr(buf, "href=\"/history\"") != NULL,
+        "the configured form exposes the history entry point");
+  len = vp_http_form_page_with_ssid_history(buf, sizeof(buf), NULL,
+                                            "AIPC", false);
+  CHECK(len > 0 && strstr(buf, "href=\"/history\"") == NULL,
+        "a form without a provider has no dead history link");
+
+  memset(&entry, 0, sizeof(entry));
+  snprintf(entry.record_key, sizeof(entry.record_key), "R0000000");
+  snprintf(entry.date, sizeof(entry.date), "<date>");
+  snprintf(entry.title, sizeof(entry.title), "<script>alert(1)</script>");
+  snprintf(entry.summary, sizeof(entry.summary), "A&B \"quoted\"");
+  entry.calm = 60;
+  entry.happy = 30;
+  entry.tense = 10;
+  entry.incomplete = true;
+
+  len = vp_http_history_head_fragment(buf, sizeof(buf), 1);
+  CHECK(len > 0 && strstr(buf, "共 1 条") != NULL,
+        "the history head shows its record count");
+  len = vp_http_history_entry_fragment(buf, sizeof(buf), &entry);
+  CHECK(len > 0 && strstr(buf, "<script>") == NULL &&
+        strstr(buf, "&lt;script&gt;") != NULL &&
+        strstr(buf, "A&amp;B &quot;quoted&quot;") != NULL,
+        "history metadata is HTML escaped");
+  CHECK(strstr(buf, "href=\"/history/R0000000\"") != NULL &&
+        strstr(buf, "href=\"/history/R0000000/download\"") != NULL,
+        "each history entry links preview and download");
+  CHECK(vp_http_history_tail_fragment(buf, sizeof(buf)) > 0 &&
+        strstr(buf, "href=\"/\"") != NULL,
+        "the history page links back to provisioning");
+
+  len = vp_http_response_header(buf, sizeof(buf), 200,
+                                "application/json", 8193,
+                                "attachment", "R0000000");
+  CHECK(len > 0 && strstr(buf, "Content-Length: 8193\r\n") != NULL &&
+        strstr(buf, "Content-Disposition: attachment; "
+                    "filename=\"R0000000.json\"") != NULL,
+        "a download header carries exact length and safe filename");
+  CHECK(vp_http_response_header(buf, sizeof(buf), 200,
+                                "application/json", 1,
+                                "attachment", "../bad") == 0,
+        "an unsafe download filename is refused");
 }
 
 static void test_password_never_echoed(void)
@@ -239,6 +346,7 @@ int main(void)
   test_header_len();
   test_escape();
   test_pages();
+  test_history_pages();
   test_password_never_echoed();
 
   printf("%s: %d checks, %d failures\n",

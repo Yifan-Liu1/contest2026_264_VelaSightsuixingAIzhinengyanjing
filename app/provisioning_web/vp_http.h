@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "velasight_provisioning.h"
+
 /* Request headers and body caps.  A provisioning form needs a few hundred
  * bytes; anything larger is a mistake or a probe.
  */
@@ -29,9 +31,12 @@
 
 enum vp_http_action_e
 {
-  VP_HTTP_ACTION_PAGE = 0, /* GET / -- serve the form */
-  VP_HTTP_ACTION_SAVE,     /* POST /save -- body is a form submit */
-  VP_HTTP_ACTION_REJECT    /* answer with .status and close */
+  VP_HTTP_ACTION_PAGE = 0,       /* GET / -- serve the form */
+  VP_HTTP_ACTION_SAVE,           /* POST /save -- body is a form submit */
+  VP_HTTP_ACTION_HISTORY_LIST,   /* GET /history */
+  VP_HTTP_ACTION_HISTORY_JSON,   /* GET /history/<key> */
+  VP_HTTP_ACTION_HISTORY_DOWNLOAD, /* GET /history/<key>/download */
+  VP_HTTP_ACTION_REJECT          /* answer with .status and close */
 };
 
 struct vp_http_request_s
@@ -40,6 +45,7 @@ struct vp_http_request_s
   int                   status;         /* Only meaningful when REJECT */
   size_t                header_len;     /* Includes the blank line */
   size_t                content_length; /* 0 unless SAVE */
+  char                  record_key[VELASIGHT_PROV_HISTORY_KEY_MAX + 1];
 };
 
 /****************************************************************************
@@ -52,6 +58,7 @@ struct vp_http_request_s
  *
  *     405  a method other than GET or POST
  *     404  an unknown path
+ *     403  an explicit Sec-Fetch-Site: cross-site submit
  *     411  POST without Content-Length
  *     413  a body over VP_HTTP_MAX_BODY
  *     415  a submit that is not form-urlencoded
@@ -91,5 +98,28 @@ size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
 
 size_t vp_http_status_page(char *buf, size_t buflen, int status,
                            const char *message);
+
+/* Streaming history response helpers.  response_header writes headers only;
+ * history_*_fragment write body fragments only. */
+
+bool vp_http_history_key_valid(const char *key);
+
+size_t vp_http_form_page_with_ssid_history(char *buf, size_t buflen,
+                                           const char *notice,
+                                           const char *current_ssid,
+                                           bool history_enabled);
+
+size_t vp_http_response_header(char *buf, size_t buflen, int status,
+                               const char *content_type,
+                               size_t content_length,
+                               const char *disposition,
+                               const char *record_key);
+
+size_t vp_http_history_head_fragment(char *buf, size_t buflen,
+                                     unsigned int count);
+size_t vp_http_history_entry_fragment(
+    char *buf, size_t buflen,
+    const struct velasight_prov_history_entry_s *entry);
+size_t vp_http_history_tail_fragment(char *buf, size_t buflen);
 
 #endif /* __APP_PROVISIONING_WEB_VP_HTTP_H */

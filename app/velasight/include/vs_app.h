@@ -1,6 +1,7 @@
 #ifndef __APP_VELASIGHT_INCLUDE_VS_APP_H
 #define __APP_VELASIGHT_INCLUDE_VS_APP_H
 
+
 #include <stdint.h>
 
 #include "vs_types.h"
@@ -11,6 +12,19 @@ enum vs_app_event_e
   VS_APP_EVENT_PHOTO_FAILED,
   VS_APP_EVENT_VOICE_LISTENING_DONE,
   VS_APP_EVENT_VOICE_REPLY,
+  VS_APP_EVENT_VOICE_LISTENING_AGAIN,
+
+  /* The capture device is open and recording.  Posted separately from the
+   * page switch because the two are seconds apart: a round first loads the
+   * referenced record from SD-NAND and completes a TLS handshake and
+   * WebSocket upgrade to the ASR service, and only then opens the
+   * microphone.  Showing "请说话" before this arrives asked the user to talk
+   * into a device that was not listening yet, and their opening words were
+   * simply never captured.
+   */
+
+  VS_APP_EVENT_VOICE_LISTENING_READY,
+  VS_APP_EVENT_VOICE_CONVERSATION_DONE,
   VS_APP_EVENT_VOICE_FAILED,
   VS_APP_EVENT_SOCIAL_STARTED,
   VS_APP_EVENT_SOCIAL_START_FAILED,

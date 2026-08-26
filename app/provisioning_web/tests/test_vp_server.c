@@ -11,6 +11,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -42,7 +43,96 @@ static int g_failures;
 
 static char g_dir[] = "/tmp/vp_server_testXXXXXX";
 static char g_path[256];
+static char g_history_path[256];
 static uint16_t g_port = 18080;
+static int g_history_open_calls;
+
+static const struct velasight_prov_history_entry_s g_history_entries[] =
+{
+  {
+    .record_key = "R0000001",
+    .date = "运行+0:00:02",
+    .title = "最近记录",
+    .summary = "正常摘要",
+    .calm = 65,
+    .happy = 25,
+    .tense = 10,
+    .incomplete = false,
+  },
+  {
+    .record_key = "R0000000",
+    .date = "<date>",
+    .title = "<script>alert(1)</script>",
+    .summary = "A&B",
+    .calm = 40,
+    .happy = 20,
+    .tense = 40,
+    .incomplete = true,
+  },
+};
+
+static int history_snapshot(
+    unsigned int offset, struct velasight_prov_history_entry_s *out,
+    size_t capacity, unsigned int *total, unsigned int *copied, void *arg)
+{
+  const unsigned int count =
+    (unsigned int)(sizeof(g_history_entries) / sizeof(g_history_entries[0]));
+  unsigned int available;
+  unsigned int n;
+
+  (void)arg;
+  if (total == NULL || copied == NULL ||
+      (capacity > 0 && out == NULL))
+    {
+      return -EINVAL;
+    }
+
+  *total = count;
+  *copied = 0;
+  if (offset >= count || capacity == 0)
+    {
+      return 0;
+    }
+
+  available = count - offset;
+  n = available < capacity ? available : (unsigned int)capacity;
+  memcpy(out, &g_history_entries[offset], (size_t)n * sizeof(*out));
+  *copied = n;
+  return 0;
+}
+
+static int history_open(const char *record_key, int *fd, size_t *size,
+                        void *arg)
+{
+  struct stat st;
+  int opened;
+
+  (void)arg;
+  g_history_open_calls++;
+  if (record_key == NULL || fd == NULL || size == NULL ||
+      (strcmp(record_key, "R0000000") != 0 &&
+       strcmp(record_key, "R0000001") != 0))
+    {
+      return -ENOENT;
+    }
+
+  opened = open(g_history_path, O_RDONLY);
+  if (opened < 0)
+    {
+      return -errno;
+    }
+
+  if (fstat(opened, &st) < 0 || st.st_size < 0)
+    {
+      int error = errno != 0 ? -errno : -EIO;
+      close(opened);
+      return error;
+    }
+
+  *fd = opened;
+  *size = (size_t)st.st_size;
+  return 0;
+}
 
 /* The callback records what it saw and, more importantly, whether the socket
  * had already been closed when it ran.
@@ -278,6 +368,252 @@ static void test_connection_burst_and_stop(void)
         "connection cleanup cannot hold the network switch worker");
 }
 
+static void *slow_history_reader(void *arg)
+{
+  int fd = *(int *)arg;
+  char buffer[4096];
+
+  for (;;)
+    {
+      ssize_t n = read(fd, buffer, sizeof(buffer));
+
+      if (n < 0 && errno == EINTR)
+        {
+          continue;
+        }
+
+      if (n <= 0)
+        {
+          break;
+        }
+
+      /* Keep making enough progress that the former per-chunk timeout never
+       * expired, while making a multi-megabyte response take far longer than
+       * the one-second response-wide service budget. */
+      usleep(75000);
+    }
+
+  return NULL;
+}
+
+static void test_history_response_deadline(void)
+{
+  static const char request[] =
+      "GET /history/R0000000 HTTP/1.1\r\nConnection: close\r\n\r\n";
+  struct velasight_prov_config_s cfg;
+  struct sockaddr_in addr;
+  struct timespec start;
+  struct timespec end;
+  struct timeval tv;
+  pthread_t reader;
+  char reply[8192];
+  long elapsed_ms;
+  int receive_buffer = 4096;
+  int history_fd;
+  int reader_ret;
+  int slow_fd;
+  int len;
+
+  history_fd = open(g_history_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  CHECK(history_fd >= 0 &&
+        ftruncate(history_fd, (off_t)(32u * 1024u * 1024u)) == 0,
+        "a large sparse history fixture is created");
+  if (history_fd < 0)
+    {
+      return;
+    }
+  close(history_fd);
+
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.store_path = g_path;
+  cfg.history.snapshot = history_snapshot;
+  cfg.history.open = history_open;
+  CHECK(start_on_free_port(&cfg) == 0,
+        "the service starts for the response-deadline test");
+  if (!velasight_provisioning_is_running())
+    {
+      return;
+    }
+
+  slow_fd = socket(AF_INET, SOCK_STREAM, 0);
+  CHECK(slow_fd >= 0, "the paced history client socket opens");
+  if (slow_fd < 0)
+    {
+      (void)velasight_provisioning_stop();
+      return;
+    }
+
+  tv.tv_sec = 6;
+  tv.tv_usec = 0;
+  (void)setsockopt(slow_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)setsockopt(slow_fd, SOL_SOCKET, SO_RCVBUF,
+                   &receive_buffer, sizeof(receive_buffer));
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(g_port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  CHECK(connect(slow_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0,
+        "the paced history client connects");
+  CHECK(write(slow_fd, request, sizeof(request) - 1u) ==
+        (ssize_t)(sizeof(request) - 1u),
+        "the paced history client requests a large record");
+
+  reader_ret = pthread_create(&reader, NULL, slow_history_reader, &slow_fd);
+  CHECK(reader_ret == 0, "the paced history reader starts");
+  if (reader_ret != 0)
+    {
+      close(slow_fd);
+      (void)velasight_provisioning_stop();
+      return;
+    }
+
+  usleep(100000);
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  len = http_exchange("GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+                      reply, sizeof(reply));
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  elapsed_ms = (end.tv_sec - start.tv_sec) * 1000L +
+               (end.tv_nsec - start.tv_nsec) / 1000000L;
+
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL,
+        "a second client is served after the slow response is abandoned");
+  CHECK(elapsed_ms < 4000,
+        "one response deadline bounds the single listener occupation");
+
+  (void)shutdown(slow_fd, SHUT_RDWR);
+  pthread_join(reader, NULL);
+  close(slow_fd);
+  CHECK(velasight_provisioning_stop() == 0,
+        "the response-deadline service stops");
+}
+
+static void test_history_routes(void)
+{
+  static const char prefix[] = "{\"text\":\"";
+  static const char suffix[] = "\"}";
+  struct velasight_prov_config_s cfg;
+  const size_t payload_len = 7000;
+  const size_t json_len = sizeof(prefix) - 1 + payload_len +
+                          sizeof(suffix) - 1;
+  char *json = malloc(json_len);
+  char *reply = malloc(json_len + 16384);
+  char *body;
+  size_t written = 0;
+  int history_fd;
+  int before;
+  int len;
+
+  CHECK(json != NULL && reply != NULL,
+        "history route test buffers allocate");
+  if (json == NULL || reply == NULL)
+    {
+      free(json);
+      free(reply);
+      return;
+    }
+
+  memcpy(json, prefix, sizeof(prefix) - 1);
+  memset(json + sizeof(prefix) - 1, 'x', payload_len);
+  memcpy(json + sizeof(prefix) - 1 + payload_len, suffix,
+         sizeof(suffix) - 1);
+
+  history_fd = open(g_history_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  CHECK(history_fd >= 0, "the fake history file opens");
+  while (history_fd >= 0 && written < json_len)
+    {
+      ssize_t n = write(history_fd, json + written, json_len - written);
+
+      if (n < 0 && errno == EINTR)
+        {
+          continue;
+        }
+      if (n <= 0)
+        {
+          break;
+        }
+      written += (size_t)n;
+    }
+  if (history_fd >= 0)
+    {
+      close(history_fd);
+    }
+  CHECK(written == json_len, "the fake history file is complete");
+
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.store_path = g_path;
+  cfg.history.snapshot = history_snapshot;
+  CHECK(velasight_provisioning_start(&cfg) == -EINVAL,
+        "a half-configured history provider is rejected");
+  cfg.history.open = history_open;
+
+  reset_callback();
+  g_history_open_calls = 0;
+  CHECK(start_on_free_port(&cfg) == 0,
+        "the service starts with a history provider");
+
+  len = http_exchange("GET / HTTP/1.1\r\n\r\n", reply,
+                      json_len + 16384);
+  CHECK(len > 0 && strstr(reply, "href=\"/history\"") != NULL,
+        "the root page exposes history when configured");
+
+  len = http_exchange("GET /history HTTP/1.1\r\n\r\n", reply,
+                      json_len + 16384);
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL &&
+        strstr(reply, "R0000001") != NULL &&
+        strstr(reply, "href=\"/history/R0000000/download\"") != NULL,
+        "the history list contains preview and download links");
+  CHECK(strstr(reply, "<script>") == NULL &&
+        strstr(reply, "&lt;script&gt;") != NULL &&
+        strstr(reply, "A&amp;B") != NULL,
+        "the server escapes untrusted history metadata");
+
+  len = http_exchange("GET /history/R0000001 HTTP/1.1\r\n\r\n", reply,
+                      json_len + 16384);
+  body = len > 0 ? strstr(reply, "\r\n\r\n") : NULL;
+  if (body != NULL)
+    {
+      body += 4;
+    }
+  CHECK(body != NULL && strstr(reply,
+        "Content-Type: application/json; charset=utf-8") != NULL &&
+        (size_t)(len - (int)(body - reply)) == json_len &&
+        memcmp(body, json, json_len) == 0,
+        "JSON preview streams every byte beyond the 4KB response buffer");
+
+  len = http_exchange(
+      "GET /history/R0000000/download HTTP/1.1\r\n\r\n", reply,
+      json_len + 16384);
+  body = len > 0 ? strstr(reply, "\r\n\r\n") : NULL;
+  if (body != NULL)
+    {
+      body += 4;
+    }
+  CHECK(body != NULL && strstr(reply,
+        "Content-Disposition: attachment; filename=\"R0000000.json\"") !=
+        NULL && (size_t)(len - (int)(body - reply)) == json_len &&
+        memcmp(body, json, json_len) == 0,
+        "history download is a complete attachment");
+
+  before = g_history_open_calls;
+  len = http_exchange("GET /history/R000000X HTTP/1.1\r\n\r\n", reply,
+                      json_len + 16384);
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 404") != NULL &&
+        g_history_open_calls == before,
+        "an invalid key is rejected before the provider");
+  len = http_exchange("GET /history/R9999999 HTTP/1.1\r\n\r\n", reply,
+                      json_len + 16384);
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 404") != NULL,
+        "a missing valid history key is 404");
+  CHECK(cb_calls() == 0,
+        "history reads never trigger the credential callback");
+  CHECK(velasight_provisioning_stop() == 0,
+        "the history-enabled service stops");
+
+  free(reply);
+  free(json);
+}
+
 static void test_get_and_save(void)
 {
   struct velasight_prov_credentials_s cred;
@@ -435,6 +771,16 @@ static void test_rejections(void)
         "a 3-byte passphrase is refused with 400");
 
   len = http_exchange("POST /save HTTP/1.1\r\n"
+                      "Sec-Fetch-Site: cross-site\r\n"
+                      "Content-Type: application/x-www-form-urlencoded\r\n"
+                      "Content-Length: 32\r\n\r\n"
+                      "ssid=Blocked&password=passphrase",
+                      reply, sizeof(reply));
+  CHECK(len > 0 &&
+        strstr(reply, "HTTP/1.1 403 Forbidden") != NULL,
+        "an explicit cross-site submit is refused with 403");
+
+  len = http_exchange("POST /save HTTP/1.1\r\n"
                       "Content-Type: text/plain\r\n"
                       "Content-Length: 4\r\n\r\nssid", reply, sizeof(reply));
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 415") != NULL,
@@ -443,6 +789,11 @@ static void test_rejections(void)
   len = http_exchange("GET /nope HTTP/1.1\r\n\r\n", reply, sizeof(reply));
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 404") != NULL,
         "an unknown path is refused with 404");
+
+  len = http_exchange("GET /history HTTP/1.1\r\n\r\n", reply,
+                      sizeof(reply));
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 404") != NULL,
+        "history is hidden when no provider is configured");
 
   len = http_exchange("PUT / HTTP/1.1\r\n\r\n", reply, sizeof(reply));
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 405") != NULL,
@@ -535,6 +886,7 @@ static void cleanup(void)
   snprintf(path, sizeof(path), "%s.tmp", g_path);
   unlink(path);
   unlink(g_path);
+  unlink(g_history_path);
   rmdir(g_dir);
 }
 
@@ -549,10 +901,13 @@ int main(void)
     }
 
   snprintf(g_path, sizeof(g_path), "%s/wifi-provision.bin", g_dir);
+  snprintf(g_history_path, sizeof(g_history_path), "%s/R0000000.JSN", g_dir);
 
   test_lifecycle();
   test_stop_interrupts_client();
   test_connection_burst_and_stop();
+  test_history_response_deadline();
+  test_history_routes();
   test_get_and_save();
   test_repeated_password_save_cycles();
   test_rejections();

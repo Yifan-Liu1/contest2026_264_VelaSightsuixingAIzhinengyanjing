@@ -33,8 +33,8 @@ struct vs_voice_request_s
  *   state via llm_set_all(), because that credential's on-disk mirror
  *   inside packages/ai_agent's own config store is not guaranteed to
  *   survive a reset on every SD-NAND image (short-name volumes reject its
- *   4-character ".json" extension) -- re-seeding on every boot is what
- *   makes that irrelevant.
+ *   4-character ".json" extension) -- re-seeding on boot and after each
+ *   successful Web save is what makes that irrelevant.
  *
  *   Call once from vs_app_run(), before the main loop starts.  Safe to
  *   call even when no credential has been provisioned yet: the assistant
@@ -44,34 +44,47 @@ struct vs_voice_request_s
 
 void vs_voice_open(void);
 
-/* Start one voice round.  Non-blocking: spins up a worker thread and
- * returns immediately.  Only one round may be in flight; a second call
- * before the first has finished (successfully, with failure, or via
- * vs_voice_cancel()) returns -EBUSY. */
+/* Re-read the durable provisioning record and refresh the live MiMo and
+ * Volcengine providers.  When a conversation is active the request is
+ * coalesced and applied after its worker finishes, before another worker may
+ * start.  Returns 0 when applied or queued, otherwise a negative errno. */
+
+int  vs_voice_reload_credentials(void);
+
+/* Start one multi-turn voice conversation.  Non-blocking: spins up one
+ * worker and returns immediately.  After each answer/TTS the worker records
+ * another utterance until follow-up silence, an explicit end request, the
+ * turn limit, or an error.  Only one conversation may be in flight. */
 
 int  vs_voice_start(const struct vs_voice_request_s *request);
 
-/* Ask the in-flight round, if any, to stop producing events.  Bounded time:
- * the worker checks a cancellation flag between blocking steps and around
- * network retries, so it unwinds within roughly one network I/O's worth of
- * time, not instantly, but never past the request that was already
- * in-flight when this was called.  Does not block the caller. */
+/* End the in-flight conversation while preserving all completed turns.
+ * Non-blocking: capture/playback are interrupted immediately where possible;
+ * synchronous ASR/LLM/TTS calls may first have to return.  The worker then
+ * persists CHAT history and emits exactly one VOICE_CONVERSATION_DONE or
+ * VOICE_FAILED terminal event. */
+
+int  vs_voice_end_conversation(void);
+
+/* Compatibility alias for vs_voice_end_conversation().  It no longer drops
+ * terminal events or completed conversation history. */
 
 void vs_voice_cancel(void);
 
-/* Cut recording short, as if the pre-roll/VAD tail had just fired.  Valid
- * only while the round is in its recording step; returns -EINVAL
- * otherwise. */
+/* Cut only the current utterance short and finish ASR normally.  The
+ * conversation continues when recognized text is available.  Valid only
+ * while recording; returns -EINVAL otherwise. */
 
 int  vs_voice_stop_recording(void);
 
-/* Cut a TTS playback short and close the playback device.  Valid only
- * while the round is speaking; returns -EINVAL otherwise. Idempotent. */
+/* Stop the current playback handle.  Valid only while the conversation is
+ * speaking; returns -EINVAL otherwise. */
 
 int  vs_voice_stop_speaking(void);
 
-/* Release resources.  Call at most once, from vs_app_run()'s shutdown
- * path. */
+/* Request shutdown and wait until the detached worker has either delivered
+ * its terminal event or suppressed it because shutdown is in progress.
+ * A synchronous network call may delay return. */
 
 void vs_voice_close(void);
 

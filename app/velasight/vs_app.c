@@ -11,12 +11,24 @@
 
 #include <arch/board/board.h>
 
+#include <agent_config.h>
+
 #include "include/vs_app.h"
+#include "include/vs_audio.h"
 #include "include/vs_display.h"
 #include "include/vs_history.h"
 #include "include/vs_input.h"
 #include "include/vs_network.h"
+#include "include/vs_settings.h"
 #include "include/vs_voice.h"
+
+/* Shown on the listening page, so it has to agree with the value vs_voice.c
+ * actually enforces.  Same fallback as there, for a build without the app's
+ * Kconfig fragment. */
+
+#ifndef CONFIG_VS_VOICE_RECORD_MAX_MS
+#  define CONFIG_VS_VOICE_RECORD_MAX_MS 15000
+#endif
 
 #define VS_INPUT_EVENT_QUEUE_SIZE 64
 #define VS_INPUT_EVENTS_PER_FRAME 8
@@ -151,10 +163,41 @@ struct vs_runtime_s
 {
   enum vs_page_e page;
   enum vs_history_view_e view;
-  uint8_t index;
+  uint16_t index;
   uint8_t progress;
   bool history_blank;
   bool photo_context;
+  bool voice_ending;
+
+  /* Volume page state.  volume_level is the ring's 0..100 reading, which is
+   * also what gets scaled to the driver's thousandths; volume_editing is
+   * whether the browse keys currently move it or still turn pages.
+   */
+
+  uint8_t volume_level;
+  bool volume_editing;
+
+  /* Set when the level has moved since it was last written.  Volume is saved
+   * when the user finishes adjusting rather than on every key press: one
+   * completed action is one record, which is how the provisioning store is
+   * used too, and it keeps a rename plus a sync off the path of a key the user
+   * may be about to press again.
+   */
+
+  bool volume_dirty;
+
+  /* A store write waiting for its progress frame to be painted, and the page
+   * to return to once it completes.  See vs_request_save().
+   */
+
+  bool pending_save;
+  enum vs_page_e save_resume_page;
+
+  /* Set from the key press until VS_APP_EVENT_VOICE_LISTENING_READY says the
+   * microphone is open.  The listening page shows a preparing state while it
+   * is set, so the user is not asked to speak before anything can hear them. */
+
+  bool voice_arming;
   enum vs_page_e social_entry_return_page;
   enum vs_page_e social_exit_return_page;
   enum vs_emotion_e emotion;
@@ -351,6 +394,175 @@ static void vs_cancel_request(struct vs_runtime_s *runtime)
   pthread_mutex_unlock(&g_app_events.lock);
 }
 
+/* Keep the request id live until the worker has persisted all completed
+ * turns and posts a terminal event.  Dropping it here would make the normal
+ * request-id filter discard that event and could leave a detached worker
+ * running behind a page that already returned to history. */
+
+static void vs_end_voice_conversation(struct vs_runtime_s *runtime)
+{
+  int ret;
+
+  if (runtime->voice_ending)
+    {
+      return;
+    }
+
+  ret = vs_voice_end_conversation();
+  if (ret < 0 && ret != -EINVAL)
+    {
+      printf("velasight: failed to request conversation end (%d)\n", ret);
+    }
+
+  /* -EINVAL can mean the worker has already completed and its terminal
+   * event is queued.  Continue waiting with the request id intact. */
+
+  runtime->voice_ending = true;
+}
+
+/* One key press of volume, as a percentage of full scale.
+ *
+ * Chosen against the driver's quantisation rather than for a round number of
+ * steps: it maps 0..1000 onto six bits of digital gain, so one gain step is
+ * about 1.6% and anything finer than that would give presses that change
+ * nothing.  Five percent is three gain steps, which is always audible.
+ */
+
+#define VS_VOLUME_STEP 5
+
+/* Used only if the driver will not say what the gain is.  Close to the 0 dB
+ * point it powers up at, so the ring is not wildly wrong even then.
+ */
+
+#define VS_VOLUME_FALLBACK 70
+
+static uint8_t vs_volume_round(unsigned int percent)
+{
+  if (percent > 100)
+    percent = 100;
+
+  /* Snapped to the step so that the first press moves a whole step instead of
+   * first correcting an offset the user cannot see.
+   */
+
+  return (uint8_t)((percent + VS_VOLUME_STEP / 2) / VS_VOLUME_STEP *
+                   VS_VOLUME_STEP);
+}
+
+/* A word for the level, so the left screen carries something the right screen
+ * does not.  The specification forbids the two screens showing the same core
+ * field, and a percentage is what the right screen already shows.
+ */
+
+static const char *vs_volume_word(unsigned int level)
+{
+  if (level == 0)
+    return "已静音";
+  if (level <= 30)
+    return "较轻";
+  if (level <= 60)
+    return "适中";
+  if (level < 100)
+    return "较响";
+
+  return "最大";
+}
+
+/* Push a level to the DAC and adopt whatever it actually settled on.
+ *
+ * The read-back matters: the driver quantises to six bits of gain, so the value
+ * it keeps differs from the request by up to half a step, and a ring that
+ * tracked requests would drift away from the hardware over a series of
+ * presses.  Used for both a key press and a level restored from storage, so
+ * the two cannot disagree about what the displayed number means.
+ */
+
+static void vs_apply_volume(struct vs_runtime_s *runtime, unsigned int level)
+{
+  unsigned int applied = 0;
+
+  if (level > 100)
+    level = 100;
+
+  if (vs_audio_volume_set(AGENT_AUDIO_PLAYBACK_DEV, level * 10u) < 0)
+    return;
+
+  if (vs_audio_volume_get(AGENT_AUDIO_PLAYBACK_DEV, &applied) == 0)
+    runtime->volume_level = vs_volume_round(applied / 10u);
+  else
+    runtime->volume_level = (uint8_t)level;
+}
+
+static void vs_adjust_volume(struct vs_runtime_s *runtime, bool louder)
+{
+  unsigned int level = runtime->volume_level;
+
+  if (louder)
+    level = level + VS_VOLUME_STEP > 100 ? 100 : level + VS_VOLUME_STEP;
+  else
+    level = level < VS_VOLUME_STEP ? 0 : level - VS_VOLUME_STEP;
+
+  vs_apply_volume(runtime, level);
+  runtime->volume_dirty = true;
+}
+
+/* Ask for the pending write to happen, and say where to go afterwards.
+ *
+ * Deliberately does not write anything.  This runs inside vs_handle_event(),
+ * which only mutates runtime -- the frame it produces is not painted until
+ * vs_display_tick() runs at the bottom of the main loop.  A rename plus a sync
+ * on SD-NAND takes long enough to be seen, so doing it here would freeze the
+ * page the user is trying to leave and then jump straight to the destination,
+ * which is exactly the delay it looks like.
+ *
+ * Instead the page becomes VS_PAGE_SAVING now, the main loop paints it, and the
+ * write happens on the following pass.  vs_flush_pending_save() then restores
+ * the destination page.
+ *
+ * Callers must set the page they want to end up on before calling this, or pass
+ * it as resume.
+ */
+
+static void vs_request_save(struct vs_runtime_s *runtime,
+                            enum vs_page_e resume)
+{
+  if (!runtime->volume_dirty)
+    {
+      runtime->page = resume;
+      return;
+    }
+
+  runtime->save_resume_page = resume;
+  runtime->pending_save = true;
+  runtime->page = VS_PAGE_SAVING;
+}
+
+/* Runs from the main loop, after the saving page has been painted.  This is the
+ * only place that blocks on the store from the UI thread.
+ */
+
+static void vs_flush_pending_save(struct vs_runtime_s *runtime)
+{
+  int ret;
+
+  if (!runtime->pending_save)
+    return;
+
+  runtime->pending_save = false;
+
+  if (runtime->volume_dirty)
+    {
+      ret = vs_settings_save_volume(runtime->volume_level);
+      if (ret < 0)
+        printf("velasight: volume %u%% not saved (%d)\n",
+               runtime->volume_level, ret);
+      else
+        runtime->volume_dirty = false;
+    }
+
+  runtime->page = runtime->save_resume_page;
+}
+
 static void vs_key_set(struct vs_ui_snapshot_s *snapshot,
                        enum vs_key_e key, const char *text)
 {
@@ -417,7 +629,8 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
   bool have_current;
 
   have_current = !runtime->history_blank &&
-                 vs_history_get_index(runtime->index, &current) == 0;
+                 vs_history_get_index(VS_HISTORY_KIND_SOCIAL, runtime->index,
+                                      &current) == 0;
 
   memset(snapshot, 0, sizeof(*snapshot));
   snapshot->page = runtime->page;
@@ -425,7 +638,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
   snapshot->network = runtime->network;
   snapshot->history = NULL;
   snapshot->history_index = runtime->index;
-  snapshot->history_count = vs_history_count();
+  snapshot->history_count = vs_history_count(VS_HISTORY_KIND_SOCIAL);
   snapshot->history_is_blank = runtime->history_blank;
   snapshot->photo_context = runtime->photo_context;
   snapshot->progress = runtime->progress;
@@ -470,8 +683,10 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
                  "%s", have_current ? current.date : "");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "历史");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
-                 "%02u/%02u", runtime->index + 1, vs_history_count());
-        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "已保存");
+                 "%02u/%02u", runtime->index + 1,
+                 vs_history_count(VS_HISTORY_KIND_SOCIAL));
+        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                 "已保存");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "询问");
         vs_key_set(snapshot, VS_KEY_BACK, "上一条");
         vs_key_set(snapshot, VS_KEY_NEXT, "下一条");
@@ -486,10 +701,77 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "AI");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
                  "照片问答");
-        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "准备好");
+        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                 "准备好");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "拍照提问");
         vs_key_set(snapshot, VS_KEY_BACK, "上一条");
         vs_key_set(snapshot, VS_KEY_NEXT, "下一条");
+        break;
+
+      case VS_PAGE_VOLUME:
+        snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                 "音量");
+
+        /* Middle layer describes what is being set and how loud it now is in
+         * words.  It deliberately does not name the keys: the right screen's
+         * footer is where key hints belong, and spelling them out in the body
+         * duplicated them in a form nobody reads twice.
+         */
+
+        snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                 "语音播报\n%s", vs_volume_word(runtime->volume_level));
+
+        /* Lower rows: the address itself on the wider first row, its label on
+         * the narrow second row.  The address is the longer meta field that
+         * row exists for, and the label fits the four-character limit on the
+         * row below it.
+         */
+
+        snprintf(snapshot->content_meta, sizeof(snapshot->content_meta),
+                 "%s", runtime->network.address);
+        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "%s",
+                 runtime->network.address[0] != '\0' ? "IP地址" : "未联网");
+
+        snprintf(snapshot->status_title, sizeof(snapshot->status_title), "音量");
+        snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                 "%u%%", runtime->volume_level);
+        snapshot->progress_kind = VS_PROGRESS_LEVEL;
+        snapshot->progress = runtime->volume_level;
+
+        /* Next is louder, matching the direction the ring fills and the order
+         * the two keys sit in on the footer. */
+
+        if (runtime->volume_editing)
+          {
+            vs_key_set(snapshot, VS_KEY_CONFIRM, "完成");
+            vs_key_set(snapshot, VS_KEY_BACK, "调小");
+            vs_key_set(snapshot, VS_KEY_NEXT, "调大");
+          }
+        else
+          {
+            vs_key_set(snapshot, VS_KEY_CONFIRM, "调节");
+            vs_key_set(snapshot, VS_KEY_BACK, "上一条");
+            vs_key_set(snapshot, VS_KEY_NEXT, "下一条");
+          }
+        break;
+
+      case VS_PAGE_SAVING:
+        snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                 "保存设置");
+        snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                 "正在写入");
+        snapshot->content_meta[0] = '\0';
+        snprintf(snapshot->status_title, sizeof(snapshot->status_title), "设置");
+        snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                 "保存中");
+        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "请稍等");
+
+        /* No ring: the write is one indivisible operation with no progress to
+         * report, and the specification forbids inventing a percentage.  WAIT
+         * gives the left footer its dotted animation instead.
+         */
+
+        snapshot->progress_kind = VS_PROGRESS_WAIT;
         break;
 
       case VS_PAGE_SOCIAL_ENTER:
@@ -611,19 +893,80 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         break;
 
       case VS_PAGE_VOICE_LISTENING:
+        if (runtime->voice_ending)
+          {
+            snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                     "正在结束");
+            snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                     "保存已完成问答");
+            snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                     "会话");
+            snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                     "请稍等");
+            snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                     "写入历史");
+            snapshot->progress_kind = VS_PROGRESS_WAIT;
+            break;
+          }
+
+        if (runtime->voice_arming)
+          {
+            /* Not listening yet: the round is still loading the referenced
+             * record and completing the TLS handshake to the ASR service.
+             * Saying "请说话" here would lose the user's opening words. */
+
+            snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                     "正在准备");
+            snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                     "连接语音服务\n稍后再说话");
+            snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                     "聆听");
+            snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                     "准备中");
+            snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                     "请稍等");
+            snapshot->progress_kind = VS_PROGRESS_WAIT;
+            vs_key_set(snapshot, VS_KEY_BACK, "退出");
+            break;
+          }
+
+        /* Pressing 说完 is the way an utterance ends, so the page says so
+         * rather than describing a silence timer.  There is no local speech
+         * detector any more: an energy threshold miscalibrated for this
+         * board's microphone gain used to discard whole recordings, so the
+         * keys drive the round and the listening window is only a bound on
+         * how long a user who walked away is recorded. */
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
                  "请说话");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
-                 "说完自动结束");
+                 "说完按确认\n最长%u秒",
+                 (unsigned int)(CONFIG_VS_VOICE_RECORD_MAX_MS / 1000));
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "聆听");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
                  "%s", runtime->photo_context ? "照片问题" : "正在听");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "录音中");
-        vs_key_set(snapshot, VS_KEY_BACK, "取消");
-        vs_key_set(snapshot, VS_KEY_CONFIRM, "结束");
+        vs_key_set(snapshot, VS_KEY_BACK, "退出");
+        vs_key_set(snapshot, VS_KEY_CONFIRM, "说完");
         break;
 
       case VS_PAGE_VOICE_THINKING:
+        if (runtime->voice_ending)
+          {
+            snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                     "正在结束");
+            snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                     "保存已完成问答");
+            snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                     "会话");
+            snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                     "请稍等");
+            snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                     "写入历史");
+            snapshot->progress_kind = VS_PROGRESS_WAIT;
+            break;
+          }
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
                  "正在思考");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
@@ -631,10 +974,26 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "思考");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "请稍等");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "处理中");
-        vs_key_set(snapshot, VS_KEY_BACK, "取消");
+        vs_key_set(snapshot, VS_KEY_BACK, "退出");
         break;
 
       case VS_PAGE_VOICE_SPEAKING:
+        if (runtime->voice_ending)
+          {
+            snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                     "正在结束");
+            snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                     "保存已完成问答");
+            snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                     "会话");
+            snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                     "请稍等");
+            snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                     "写入历史");
+            snapshot->progress_kind = VS_PROGRESS_WAIT;
+            break;
+          }
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
                  "回答建议");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body), "%s",
@@ -642,12 +1001,29 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
                  "先听完对方\n再回应");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "回答");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "结果就绪");
-        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "播报中");
-        vs_key_set(snapshot, VS_KEY_BACK, "取消");
+        snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                 "播报后继续聆听");
+        vs_key_set(snapshot, VS_KEY_BACK, "退出");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "完成");
         break;
 
       case VS_PAGE_PHOTO_CAPTURE:
+        if (runtime->voice_ending)
+          {
+            snprintf(snapshot->content_title, sizeof(snapshot->content_title),
+                     "正在结束");
+            snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                     "保存已完成问答");
+            snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                     "会话");
+            snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                     "请稍等");
+            snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                     "写入历史");
+            snapshot->progress_kind = VS_PROGRESS_WAIT;
+            break;
+          }
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
                  "正在拍照");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
@@ -655,7 +1031,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "AI");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "拍摄中");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "请稍等");
-        vs_key_set(snapshot, VS_KEY_BACK, "取消");
+        vs_key_set(snapshot, VS_KEY_BACK, "退出");
         break;
 
       case VS_PAGE_NET_SWITCHING:
@@ -827,46 +1203,37 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
   switch (event->type)
     {
       case VS_APP_EVENT_PHOTO_READY:
-        if (runtime->page == VS_PAGE_PHOTO_CAPTURE)
+        if (!runtime->voice_ending &&
+            runtime->page == VS_PAGE_PHOTO_CAPTURE)
           {
-            if (event->text[0] == '\0')
-              {
-                vs_cancel_request(runtime);
-                vs_set_error_reason(runtime, -EBADMSG, VS_PAGE_HISTORY_BLANK,
-                                    false, "拍照未返回照片");
-              }
-            else
-              runtime->page = VS_PAGE_VOICE_LISTENING;
+            runtime->voice_arming = true;
+            runtime->page = VS_PAGE_VOICE_LISTENING;
           }
         break;
 
       case VS_APP_EVENT_PHOTO_FAILED:
-        if (runtime->page == VS_PAGE_PHOTO_CAPTURE)
-          {
-            vs_cancel_request(runtime);
-            vs_set_error_reason(runtime, event->error, VS_PAGE_HISTORY_BLANK,
-                                false,
-                                vs_assistant_error_reason(event->error));
-          }
+        runtime->voice_ending = false;
+        vs_cancel_request(runtime);
+        vs_set_error_reason(runtime, event->error, VS_PAGE_HISTORY_BLANK,
+                            false,
+                            vs_assistant_error_reason(event->error));
         break;
 
       case VS_APP_EVENT_VOICE_LISTENING_DONE:
-        if (runtime->page == VS_PAGE_VOICE_LISTENING)
+        if (!runtime->voice_ending &&
+            runtime->page == VS_PAGE_VOICE_LISTENING)
           {
             runtime->page = VS_PAGE_VOICE_THINKING;
           }
         break;
 
       case VS_APP_EVENT_VOICE_REPLY:
-        if (runtime->page == VS_PAGE_VOICE_THINKING)
+        if (!runtime->voice_ending &&
+            runtime->page == VS_PAGE_VOICE_THINKING)
           {
             if (event->text[0] == '\0')
               {
-                vs_cancel_request(runtime);
-                vs_set_error_reason(runtime, -EBADMSG,
-                                    runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
-                                                             VS_PAGE_HISTORY, false,
-                                    "AI未返回回答");
+                vs_end_voice_conversation(runtime);
               }
             else
               {
@@ -877,16 +1244,40 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
           }
         break;
 
-      case VS_APP_EVENT_VOICE_FAILED:
-        if (runtime->page == VS_PAGE_VOICE_LISTENING ||
-            runtime->page == VS_PAGE_VOICE_THINKING)
+      case VS_APP_EVENT_VOICE_LISTENING_AGAIN:
+        if (!runtime->voice_ending &&
+            (runtime->page == VS_PAGE_VOICE_SPEAKING ||
+             runtime->page == VS_PAGE_VOICE_THINKING))
           {
-            vs_cancel_request(runtime);
-            vs_set_error_reason(runtime, event->error,
-                                runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
-                                                         VS_PAGE_HISTORY, false,
-                                vs_assistant_error_reason(event->error));
+            /* A follow-up round opens its own ASR session and microphone, so
+             * it is armed here for the same reason the first round is. */
+
+            runtime->voice_arming = true;
+            runtime->page = VS_PAGE_VOICE_LISTENING;
           }
+        break;
+
+      case VS_APP_EVENT_VOICE_LISTENING_READY:
+        runtime->voice_arming = false;
+        break;
+
+      case VS_APP_EVENT_VOICE_CONVERSATION_DONE:
+        runtime->voice_ending = false;
+        runtime->voice_arming = false;
+        runtime->result_text[0] = '\0';
+        vs_cancel_request(runtime);
+        runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
+                                                VS_PAGE_HISTORY;
+        break;
+
+      case VS_APP_EVENT_VOICE_FAILED:
+        runtime->voice_ending = false;
+        runtime->voice_arming = false;
+        vs_cancel_request(runtime);
+        vs_set_error_reason(runtime, event->error,
+                            runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
+                                                     VS_PAGE_HISTORY, false,
+                            vs_assistant_error_reason(event->error));
         break;
 
       case VS_APP_EVENT_SOCIAL_STARTED:
@@ -976,6 +1367,7 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
         runtime->network_busy = false;
         if (network != NULL)
           (void)vs_network_get_status(network, &runtime->network);
+        runtime->api_ready = bk7258_ai_config_ready();
         runtime->error = 0;
         runtime->error_retryable = false;
         runtime->wifi_retry_at_ms = 0;
@@ -995,6 +1387,7 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
         runtime->network_busy = false;
         if (network != NULL)
           (void)vs_network_get_status(network, &runtime->network);
+        runtime->api_ready = bk7258_ai_config_ready();
         runtime->error_target_mode = runtime->network_target_mode;
         if (runtime->network_target_mode == VS_NET_STA)
           {
@@ -1135,6 +1528,12 @@ static void vs_handle_event(struct vs_display_s *display,
           runtime->progress = 0;
         }
 
+      /* Taken before the key is acted on, which is what makes it correct: the
+       * label that flashes is the one the user pressed.  On the volume page
+       * that means 确认 flashes "调节" and then becomes "完成", which is the
+       * sequence that happened.  Only SOFTAP's back key opts out, because
+       * there the short press has no action to acknowledge. */
+
       if (!(runtime->page == VS_PAGE_SOFTAP && event->key == VS_KEY_BACK))
         vs_acknowledge(runtime, event->key);
       switch (runtime->page)
@@ -1145,41 +1544,66 @@ static void vs_handle_event(struct vs_display_s *display,
                 struct vs_voice_request_s request;
                 struct vs_history_index_s current;
 
-                memset(&request, 0, sizeof(request));
-                request.ctx = VS_VOICE_CTX_RECORD;
-                if (vs_history_get_index(runtime->index, &current) == 0)
+                if (vs_history_get_index(VS_HISTORY_KIND_SOCIAL,
+                                         runtime->index, &current) < 0)
                   {
-                    snprintf(request.record_key, sizeof(request.record_key),
-                             "%s", current.record_key);
+                    runtime->history_blank = true;
+                    runtime->index = 0;
+                    runtime->page = VS_PAGE_HISTORY_BLANK;
+                    break;
                   }
 
+                memset(&request, 0, sizeof(request));
+                request.ctx = VS_VOICE_CTX_RECORD;
+                snprintf(request.record_key, sizeof(request.record_key),
+                         "%s", current.record_key);
+
                 runtime->photo_context = false;
+                runtime->voice_ending = false;
+                runtime->result_text[0] = '\0';
                 request.request_id = vs_begin_request(runtime);
                 if (vs_voice_start(&request) == 0)
-                  runtime->page = VS_PAGE_VOICE_LISTENING;
+                  {
+                    runtime->voice_arming = true;
+                    runtime->page = VS_PAGE_VOICE_LISTENING;
+                  }
                 else
                   vs_cancel_request(runtime);
               }
             else if (event->key == VS_KEY_NEXT)
               {
-                runtime->index++;
-                runtime->history_blank = runtime->index >= vs_history_count();
-                if (runtime->history_blank)
+                unsigned int count =
+                  vs_history_count(VS_HISTORY_KIND_SOCIAL);
+
+                /* Past the last record is the volume page, not a wrap: the
+                 * ring is blank -> records -> volume -> blank. */
+
+                if (count == 0 || runtime->index + 1u >= count)
                   {
-                    runtime->index = vs_history_count() - 1;
-                    runtime->page = VS_PAGE_HISTORY_BLANK;
+                    runtime->index = count == 0 ? 0 : count - 1u;
+                    runtime->page = VS_PAGE_VOLUME;
+                    runtime->volume_editing = false;
+                  }
+                else
+                  {
+                    runtime->index++;
                   }
               }
             else if (event->key == VS_KEY_BACK)
               {
-                if (runtime->index == 0)
+                unsigned int count =
+                  vs_history_count(VS_HISTORY_KIND_SOCIAL);
+
+                if (count == 0 || runtime->index == 0)
                   {
                     runtime->history_blank = true;
-                    runtime->index = vs_history_count() - 1;
+                    runtime->index = count == 0 ? 0 : count - 1u;
                     runtime->page = VS_PAGE_HISTORY_BLANK;
                   }
                 else
-                  runtime->index--;
+                  {
+                    runtime->index--;
+                  }
               }
             break;
 
@@ -1192,6 +1616,8 @@ static void vs_handle_event(struct vs_display_s *display,
                 request.ctx = VS_VOICE_CTX_PHOTO;
 
                 runtime->photo_context = true;
+                runtime->voice_ending = false;
+                runtime->result_text[0] = '\0';
                 request.request_id = vs_begin_request(runtime);
                 if (vs_voice_start(&request) == 0)
                   runtime->page = VS_PAGE_PHOTO_CAPTURE;
@@ -1200,15 +1626,71 @@ static void vs_handle_event(struct vs_display_s *display,
               }
             else if (event->key == VS_KEY_NEXT)
               {
-                runtime->history_blank = false;
-                runtime->index = 0;
-                runtime->page = VS_PAGE_HISTORY;
+                unsigned int count =
+                  vs_history_count(VS_HISTORY_KIND_SOCIAL);
+
+                if (count > 0)
+                  {
+                    runtime->history_blank = false;
+                    runtime->index = 0;
+                    runtime->page = VS_PAGE_HISTORY;
+                  }
+                else
+                  {
+                    /* With no records at all the ring is two pages wide. */
+
+                    runtime->page = VS_PAGE_VOLUME;
+                    runtime->volume_editing = false;
+                  }
               }
             else if (event->key == VS_KEY_BACK)
               {
-                runtime->history_blank = false;
-                runtime->index = vs_history_count() - 1;
-                runtime->page = VS_PAGE_HISTORY;
+                /* Backwards from the first page is the last page, which is now
+                 * the volume page rather than the newest record. */
+
+                runtime->page = VS_PAGE_VOLUME;
+                runtime->volume_editing = false;
+              }
+            break;
+
+          case VS_PAGE_VOLUME:
+            if (event->key == VS_KEY_CONFIRM)
+              {
+                /* Power toggles what the two browse keys mean.  Physically
+                 * they are the volume rocker, so inside the editing state they
+                 * are doing what is printed on them. */
+
+                runtime->volume_editing = !runtime->volume_editing;
+                if (!runtime->volume_editing)
+                  vs_request_save(runtime, VS_PAGE_VOLUME);
+              }
+            else if (runtime->volume_editing)
+              {
+                vs_adjust_volume(runtime, event->key == VS_KEY_NEXT);
+              }
+            else if (event->key == VS_KEY_NEXT)
+              {
+                /* Forwards from the last page wraps to the first. */
+
+                runtime->history_blank = true;
+                vs_request_save(runtime, VS_PAGE_HISTORY_BLANK);
+              }
+            else if (event->key == VS_KEY_BACK)
+              {
+                unsigned int count =
+                  vs_history_count(VS_HISTORY_KIND_SOCIAL);
+
+                if (count > 0)
+                  {
+                    runtime->history_blank = false;
+                    runtime->index = count - 1u;
+                    vs_request_save(runtime, VS_PAGE_HISTORY);
+                  }
+                else
+                  {
+                    runtime->history_blank = true;
+                    vs_request_save(runtime, VS_PAGE_HISTORY_BLANK);
+                  }
               }
             break;
 
@@ -1236,48 +1718,45 @@ static void vs_handle_event(struct vs_display_s *display,
             break;
 
           case VS_PAGE_VOICE_LISTENING:
+            if (runtime->voice_ending)
+              {
+                break;
+              }
+
             if (event->key == VS_KEY_CONFIRM)
               {
-                /* Manual cut-off: the worker's own VAD would otherwise end
-                 * the recording; this asks it to stop early.  The page
-                 * itself advances to THINKING only once the worker confirms
-                 * via VOICE_LISTENING_DONE, so a stop that fails to land
-                 * (already past that step) leaves the page where it is. */
-                vs_voice_stop_recording();
+                /* Ignored while arming: the microphone is not open yet, so
+                 * this would end a round that never recorded anything.  The
+                 * page shows a preparing state and offers no 说完 key then,
+                 * but a press queued just before the switch can still land
+                 * here. */
+
+                if (!runtime->voice_arming)
+                  {
+                    /* Finish only this utterance.  ASR still produces text
+                     * and the multi-turn worker remains active. */
+                    (void)vs_voice_stop_recording();
+                  }
               }
             else if (event->key == VS_KEY_BACK)
               {
-                vs_voice_cancel();
-                vs_cancel_request(runtime);
-                runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
-                                                        VS_PAGE_HISTORY;
+                vs_end_voice_conversation(runtime);
               }
             break;
 
           case VS_PAGE_VOICE_THINKING:
-            if (event->key == VS_KEY_BACK)
+            if (!runtime->voice_ending && event->key == VS_KEY_BACK)
               {
-                vs_voice_cancel();
-                vs_cancel_request(runtime);
-                runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
-                                                        VS_PAGE_HISTORY;
+                vs_end_voice_conversation(runtime);
               }
             break;
 
           case VS_PAGE_VOICE_SPEAKING:
-            if (event->key == VS_KEY_CONFIRM)
+            if (!runtime->voice_ending &&
+                (event->key == VS_KEY_CONFIRM ||
+                 event->key == VS_KEY_BACK))
               {
-                vs_voice_stop_speaking();
-                vs_cancel_request(runtime);
-                runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
-                                                        VS_PAGE_HISTORY;
-              }
-            else if (event->key == VS_KEY_BACK)
-              {
-                vs_voice_cancel();
-                vs_cancel_request(runtime);
-                runtime->page = runtime->photo_context ? VS_PAGE_HISTORY_BLANK :
-                                                        VS_PAGE_HISTORY;
+                vs_end_voice_conversation(runtime);
               }
             break;
 
@@ -1290,11 +1769,9 @@ static void vs_handle_event(struct vs_display_s *display,
             break;
 
           case VS_PAGE_PHOTO_CAPTURE:
-            if (event->key == VS_KEY_BACK)
+            if (!runtime->voice_ending && event->key == VS_KEY_BACK)
               {
-                vs_voice_cancel();
-                vs_cancel_request(runtime);
-                runtime->page = VS_PAGE_HISTORY_BLANK;
+                vs_end_voice_conversation(runtime);
               }
             break;
 
@@ -1402,7 +1879,7 @@ int vs_app_run(void)
 
   vs_input_queue_reset();
   g_input_worker_state = input;
-  ret = task_create("velasight_input", SCHED_PRIORITY_DEFAULT + 1, 2048,
+  ret = task_create("velasight_input", VS_PRIORITY_INPUT, 2048,
                     vs_input_worker, NULL);
   if (ret < 0)
     {
@@ -1427,9 +1904,51 @@ int vs_app_run(void)
   runtime.network.wifi_issue = VS_WIFI_ISSUE_DISCONNECTED;
   vs_render(display, &runtime);
 
+  /* Adopt the driver's current gain instead of imposing one.  The DAC comes
+   * up at 0 dB, which reads back as 714 rather than 1000, so a hardcoded
+   * starting value would show the user a number the hardware is not at.
+   */
+
+  {
+    unsigned int permille = 0;
+
+    if (vs_audio_volume_get(AGENT_AUDIO_PLAYBACK_DEV, &permille) == 0)
+      runtime.volume_level = vs_volume_round(permille / 10u);
+    else
+      runtime.volume_level = VS_VOLUME_FALLBACK;
+  }
+
   bk7258_nand_seed_agent_config();
   runtime.api_ready = bk7258_ai_config_ready();
   vs_history_open();
+
+  /* Only now is /mnt/sdnand known to be mounted: SD-NAND comes up on a delayed
+   * work item and vs_history_open() is what blocks for it.  Reading the volume
+   * any earlier -- next to the driver query above, where it would read more
+   * naturally -- gets ENOENT on every boot.
+   */
+
+  {
+    uint8_t stored = 0;
+    int stored_ret = vs_settings_load_volume(&stored);
+
+    if (stored_ret == 0)
+      {
+        vs_apply_volume(&runtime, stored);
+        printf("velasight: volume restored to %u%%\n", runtime.volume_level);
+      }
+    else if (stored_ret != -ENOENT)
+      {
+        /* A rejected record is worth saying out loud; a missing one is the
+         * normal state of a device whose volume has never been changed, and
+         * the driver's own level already stands in for it.
+         */
+
+        printf("velasight: stored volume unusable (%d), keeping %u%%\n",
+               stored_ret, runtime.volume_level);
+      }
+  }
+
   vs_voice_open();
 
   vs_render(display, &runtime);
@@ -1485,8 +2004,13 @@ int vs_app_run(void)
               runtime.api_ready = bk7258_ai_config_ready();
               if (ret < 0)
                 {
-                  runtime.error_target_mode = VS_NET_STA;
-                  vs_set_error(&runtime, ret, VS_PAGE_SOFTAP, false);
+                  runtime.error_target_mode = runtime.network.mode;
+                  vs_set_error(
+                      &runtime, ret,
+                      runtime.network.mode == VS_NET_AP ? VS_PAGE_SOFTAP :
+                      runtime.history_blank ? VS_PAGE_HISTORY_BLANK :
+                                              VS_PAGE_HISTORY,
+                      false);
                 }
               else
                 {
@@ -1511,13 +2035,29 @@ int vs_app_run(void)
         }
 
       vs_display_tick(display);
+
+      /* After the tick, so the saving page is on the glass before the write
+       * blocks.  Any future store write from the UI thread belongs here too:
+       * request it with vs_request_save() and extend the flush.
+       */
+
+      if (runtime.pending_save)
+        {
+          /* Put the saving page on the glass before blocking on it. */
+
+          vs_display_flush(display);
+          vs_flush_pending_save(&runtime);
+          vs_render(display, &runtime);
+          vs_display_tick(display);
+        }
+
       usleep(CONFIG_VS_INPUT_POLL_MS * 1000);
     }
 
 fail:
   vs_voice_close();
-  vs_history_close();
   vs_network_close(network);
+  vs_history_close();
   vs_input_close(input);
   vs_display_close(display);
   return ret;

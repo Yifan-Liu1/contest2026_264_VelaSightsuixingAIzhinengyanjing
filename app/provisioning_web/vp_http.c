@@ -21,6 +21,7 @@ static const char *vp_reason(int status)
     {
       case 200: return "OK";
       case 400: return "Bad Request";
+      case 403: return "Forbidden";
       case 404: return "Not Found";
       case 405: return "Method Not Allowed";
       case 411: return "Length Required";
@@ -28,6 +29,7 @@ static const char *vp_reason(int status)
       case 415: return "Unsupported Media Type";
       case 431: return "Request Header Fields Too Large";
       case 500: return "Internal Server Error";
+      case 503: return "Service Unavailable";
       default:  return "Error";
     }
 }
@@ -98,6 +100,27 @@ static int vp_reject(struct vp_http_request_s *req, int status)
   req->action = VP_HTTP_ACTION_REJECT;
   req->status = status;
   return 0;
+}
+
+bool vp_http_history_key_valid(const char *key)
+{
+  size_t i;
+
+  if (key == NULL || strlen(key) != VELASIGHT_PROV_HISTORY_KEY_MAX ||
+      key[0] != 'R')
+    {
+      return false;
+    }
+
+  for (i = 1; i < VELASIGHT_PROV_HISTORY_KEY_MAX; i++)
+    {
+      if (key[i] < '0' || key[i] > '9')
+        {
+          return false;
+        }
+    }
+
+  return true;
 }
 
 int vp_http_parse(const char *buf, size_t len,
@@ -217,13 +240,43 @@ int vp_http_parse(const char *buf, size_t len,
         bool index = pathlen == 11 &&
                      memcmp(target, "/index.html", 11) == 0;
 
-        if (!root && !index)
+        if (root || index)
           {
-            return vp_reject(req, 404);
+            req->action = VP_HTTP_ACTION_PAGE;
+            return 0;
           }
 
-        req->action = VP_HTTP_ACTION_PAGE;
-        return 0;
+        if (pathlen == 8 && memcmp(target, "/history", 8) == 0)
+          {
+            req->action = VP_HTTP_ACTION_HISTORY_LIST;
+            return 0;
+          }
+
+        if ((pathlen == 17 || pathlen == 26) &&
+            memcmp(target, "/history/", 9) == 0)
+          {
+            memcpy(req->record_key, target + 9,
+                   VELASIGHT_PROV_HISTORY_KEY_MAX);
+            req->record_key[VELASIGHT_PROV_HISTORY_KEY_MAX] = '\0';
+            if (!vp_http_history_key_valid(req->record_key))
+              {
+                return vp_reject(req, 404);
+              }
+
+            if (pathlen == 17)
+              {
+                req->action = VP_HTTP_ACTION_HISTORY_JSON;
+                return 0;
+              }
+
+            if (memcmp(target + 17, "/download", 9) == 0)
+              {
+                req->action = VP_HTTP_ACTION_HISTORY_DOWNLOAD;
+                return 0;
+              }
+          }
+
+        return vp_reject(req, 404);
       }
 
     if (pathlen != 5 || memcmp(target, "/save", 5) != 0)
@@ -262,6 +315,28 @@ int vp_http_parse(const char *buf, size_t len,
                             &valuelen) != NULL)
           {
             return vp_reject(req, 400);
+          }
+
+        value = vp_header_value(cursor, thislen, "sec-fetch-site",
+                                &valuelen);
+        if (value != NULL)
+          {
+            while (valuelen > 0 &&
+                   (value[valuelen - 1u] == ' ' ||
+                    value[valuelen - 1u] == '\t'))
+              {
+                valuelen--;
+              }
+
+            /* Fetch Metadata is not authentication, but an explicit browser
+             * cross-site navigation must never be allowed to mutate trusted-
+             * LAN settings.  Missing headers remain accepted for captive
+             * portals and older clients. */
+            if (valuelen == sizeof("cross-site") - 1u &&
+                vp_ci_prefix(value, valuelen, "cross-site"))
+              {
+                return vp_reject(req, 403);
+              }
           }
 
         value = vp_header_value(cursor, thislen, "content-type", &valuelen);
@@ -431,7 +506,8 @@ static size_t vp_wrap(char *buf, size_t buflen, int status,
 static size_t vp_http_form_page_notice(char *buf, size_t buflen,
                                        const char *notice,
                                        const char *current_ssid,
-                                       bool saved)
+                                       bool saved,
+                                       bool history_enabled)
 {
   char escaped[256];
   char escaped_ssid[VELASIGHT_PROV_SSID_MAX * 6 + 1];
@@ -485,15 +561,19 @@ static size_t vp_http_form_page_notice(char *buf, size_t buflen,
                      "<button type=\"submit\">保存</button>"
                      "</form>"
                       "<p class=\"note\">保存后可在设备上长按返回。</p>"
+                      "%s"
                       VP_PAGE_TAIL,
                       escaped_ssid[0] != '\0' ? escaped_ssid : "未配置",
                       escaped[0] != '\0' ? saved ? "<p class=\"ok\">" :
                                                    "<p class=\"err\">" : "",
                       escaped,
                       escaped[0] != '\0' ? "</p>" : "",
-                      ssid_attr);
+                      ssid_attr,
+                      history_enabled ?
+                        "<p><a href=\"/history\">浏览社交历史记录</a></p>" :
+                        "");
 
-  if (bodylen < 0)
+  if (bodylen < 0 || (size_t)bodylen >= sizeof(body))
     {
       return 0;
     }
@@ -501,11 +581,21 @@ static size_t vp_http_form_page_notice(char *buf, size_t buflen,
   return vp_wrap(buf, buflen, 200, body, (size_t)bodylen);
 }
 
+size_t vp_http_form_page_with_ssid_history(char *buf, size_t buflen,
+                                           const char *notice,
+                                           const char *current_ssid,
+                                           bool history_enabled)
+{
+  return vp_http_form_page_notice(buf, buflen, notice, current_ssid, false,
+                                  history_enabled);
+}
+
 size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
                                    const char *notice,
                                    const char *current_ssid)
 {
-  return vp_http_form_page_notice(buf, buflen, notice, current_ssid, false);
+  return vp_http_form_page_with_ssid_history(buf, buflen, notice,
+                                             current_ssid, false);
 }
 
 size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
@@ -518,7 +608,7 @@ size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
 {
   (void)generation;
   (void)open_network;
-  return vp_http_form_page_notice(buf, buflen, "已保存", ssid, true);
+  return vp_http_form_page_notice(buf, buflen, "已保存", ssid, true, false);
 }
 
 size_t vp_http_status_page(char *buf, size_t buflen, int status,
@@ -547,10 +637,138 @@ size_t vp_http_status_page(char *buf, size_t buflen, int status,
                      VP_PAGE_TAIL,
                      status, vp_reason(status), escaped);
 
-  if (bodylen < 0)
+  if (bodylen < 0 || (size_t)bodylen >= sizeof(body))
     {
       return 0;
     }
 
   return vp_wrap(buf, buflen, status, body, (size_t)bodylen);
+}
+
+size_t vp_http_response_header(char *buf, size_t buflen, int status,
+                               const char *content_type,
+                               size_t content_length,
+                               const char *disposition,
+                               const char *record_key)
+{
+  int n;
+
+  if (buf == NULL || buflen == 0 || content_type == NULL)
+    {
+      return 0;
+    }
+
+  if (disposition != NULL)
+    {
+      if ((strcmp(disposition, "inline") != 0 &&
+           strcmp(disposition, "attachment") != 0) ||
+          !vp_http_history_key_valid(record_key))
+        {
+          return 0;
+        }
+
+      n = snprintf(buf, buflen,
+                   "HTTP/1.1 %d %s\r\n"
+                   "Content-Type: %s\r\n"
+                   "Content-Length: %zu\r\n"
+                   "Content-Disposition: %s; filename=\"%s.json\"\r\n"
+                   "Cache-Control: no-store\r\n"
+                   "X-Content-Type-Options: nosniff\r\n"
+                   "Connection: close\r\n\r\n",
+                   status, vp_reason(status), content_type, content_length,
+                   disposition, record_key);
+    }
+  else
+    {
+      n = snprintf(buf, buflen,
+                   "HTTP/1.1 %d %s\r\n"
+                   "Content-Type: %s\r\n"
+                   "Content-Length: %zu\r\n"
+                   "Cache-Control: no-store\r\n"
+                   "X-Content-Type-Options: nosniff\r\n"
+                   "Connection: close\r\n\r\n",
+                   status, vp_reason(status), content_type, content_length);
+    }
+
+  return n < 0 || (size_t)n >= buflen ? 0 : (size_t)n;
+}
+
+size_t vp_http_history_head_fragment(char *buf, size_t buflen,
+                                     unsigned int count)
+{
+  int n;
+
+  if (buf == NULL || buflen == 0)
+    {
+      return 0;
+    }
+
+  n = snprintf(buf, buflen,
+               VP_PAGE_HEAD
+               "<h1>社交历史记录</h1>"
+               "<p class=\"note\">按时间从新到旧，共 %u 条。</p>"
+               "%s",
+               count,
+               count == 0 ? "<p>暂无可读取的社交历史记录。</p>" : "");
+  return n < 0 || (size_t)n >= buflen ? 0 : (size_t)n;
+}
+
+size_t vp_http_history_entry_fragment(
+    char *buf, size_t buflen,
+    const struct velasight_prov_history_entry_s *entry)
+{
+  char key[(VELASIGHT_PROV_HISTORY_KEY_MAX * 6) + 1];
+  char date[(VELASIGHT_PROV_HISTORY_DATE_MAX * 6) + 1];
+  char title[(VELASIGHT_PROV_HISTORY_TITLE_MAX * 6) + 1];
+  char summary[(VELASIGHT_PROV_HISTORY_SUMMARY_MAX * 6) + 1];
+  int n;
+
+  if (buf == NULL || buflen == 0 || entry == NULL ||
+      memchr(entry->record_key, '\0', sizeof(entry->record_key)) == NULL ||
+      memchr(entry->date, '\0', sizeof(entry->date)) == NULL ||
+      memchr(entry->title, '\0', sizeof(entry->title)) == NULL ||
+      memchr(entry->summary, '\0', sizeof(entry->summary)) == NULL ||
+      !vp_http_history_key_valid(entry->record_key) ||
+      entry->calm > 100 || entry->happy > 100 || entry->tense > 100)
+    {
+      return 0;
+    }
+
+  if (vp_html_escape(entry->record_key, key, sizeof(key)) < 0 ||
+      vp_html_escape(entry->date, date, sizeof(date)) < 0 ||
+      vp_html_escape(entry->title, title, sizeof(title)) < 0 ||
+      vp_html_escape(entry->summary, summary, sizeof(summary)) < 0)
+    {
+      return 0;
+    }
+
+  n = snprintf(buf, buflen,
+               "<article style=\"border-top:1px solid #ddd;padding:14px 0\">"
+               "<h2 style=\"font-size:1.05rem;margin:0 0 4px\">%s</h2>"
+               "<p class=\"note\">%s · %s%s</p>"
+               "<p style=\"white-space:pre-wrap\">%s</p>"
+               "<p class=\"note\">平静 %u%% · 开心 %u%% · 紧张 %u%%</p>"
+               "<p><a href=\"/history/%s\">预览 JSON</a> · "
+               "<a href=\"/history/%s/download\">下载</a></p>"
+               "</article>",
+               title, date, key, entry->incomplete ? " · 未完整" : "",
+               summary, (unsigned int)entry->calm,
+               (unsigned int)entry->happy, (unsigned int)entry->tense,
+               entry->record_key, entry->record_key);
+  return n < 0 || (size_t)n >= buflen ? 0 : (size_t)n;
+}
+
+size_t vp_http_history_tail_fragment(char *buf, size_t buflen)
+{
+  int n;
+
+  if (buf == NULL || buflen == 0)
+    {
+      return 0;
+    }
+
+  n = snprintf(buf, buflen,
+               "<p class=\"note\"><a href=\"/\">返回配网页面</a></p>"
+               VP_PAGE_TAIL);
+  return n < 0 || (size_t)n >= buflen ? 0 : (size_t)n;
 }

@@ -1,34 +1,23 @@
 /****************************************************************************
  * app/velasight/vs_history.c
  *
- * SD-NAND backed history for the idle voice assistant.  An in-memory index
- * (bounded, CONFIG_VS_HISTORY_MAX_RECORDS entries) backs vs_snapshot()'s
- * hot-path reads; disk I/O only happens in vs_history_open() (startup) and
- * vs_history_append()/vs_history_read_full() (called from vs_voice.c's
- * worker thread, never from the UI loop).
+ * One SD-NAND history engine serves two independent record kinds:
  *
- * Filenames are 8.3-safe on purpose even though this board's defconfig now
- * enables CONFIG_FAT_LFN: a long-name volume can still be re-formatted or
- * swapped for a short-name one (see app/sdnand_init), and nothing here
- * needs more than eight characters, so there is no reason to depend on the
- * option.  Layout, one directory:
+ *   /mnt/sdnand/ai_agent/history/social/INDEX.JSN + R0000000.JSN
+ *   /mnt/sdnand/ai_agent/history/chat/INDEX.JSN   + R0000000.JSN
  *
- *   /mnt/sdnand/ai_agent/history/INDEX.JSN   the whole index, one JSON array
- *   /mnt/sdnand/ai_agent/history/R%08u.JSN   one record's full body
+ * SOCIAL bodies use the cloud protocol's ttsMinutes/txtMinutes,
+ * audioTimeline and emotionTimeline fields.  CHAT bodies are written by
+ * vs_voice.c when a multi-turn idle-assistant conversation ends.  The two
+ * kinds share all indexing, locking, atomic-write and bounded-retention
+ * code, but have separate directories, sequence spaces and capacities.
  *
- * INDEX.JSN holds the full index rather than one line per record (contrast
- * app/conv/conv_store.c's pipe-delimited INDEX.TXT): the index here is
- * small (bounded record count, short fields) and callers want structured
- * fields including a leading record_key, so a single cJSON round trip on
- * open/append is simpler than a line-oriented format and does not need a
- * second parser.
- *
- * Write ordering mirrors app/provisioning_web/vp_store.c: temp file, fwrite,
- * fflush+fsync, close, rename over the destination, then fsync the
- * directory.  The record body is written and renamed into place *before*
- * the index is updated, so a crash between the two leaves an index that
- * does not yet mention the new record (invisible, harmless) rather than an
- * index entry whose record file does not exist (a read that fails).
+ * A record append is a small transaction: write the new body, atomically
+ * replace the index with a candidate containing the new entry, update RAM,
+ * then unlink the evicted oldest body.  Power loss can therefore leave an
+ * unreferenced body, but never an index that points at a body deleted before
+ * the new index became durable.  A failed index write is reported and the
+ * previous state remains usable.
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
@@ -37,6 +26,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,59 +45,177 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define VS_HISTORY_DIR       "/mnt/sdnand/ai_agent/history"
-#define VS_HISTORY_INDEX     VS_HISTORY_DIR "/INDEX.JSN"
-#define VS_HISTORY_INDEX_TMP VS_HISTORY_DIR "/INDEX.TMP"
-#define VS_HISTORY_FMT_JSN   VS_HISTORY_DIR "/R%08u.JSN"
-#define VS_HISTORY_FMT_TMP   VS_HISTORY_DIR "/R%08u.TMP"
-
 #ifndef CONFIG_VS_HISTORY_MAX_RECORDS
 #  define CONFIG_VS_HISTORY_MAX_RECORDS 64
 #endif
 
-/* Full-record reads go through a caller buffer sized by CONFIG_VS_VOICE_*;
- * this is only the cap on what vs_history.c itself will ever read off disk
- * into a scratch buffer while building the trimmed copy, independent of
- * whatever vs_voice.c asks for. */
+#define VS_HISTORY_ROOT       "/mnt/sdnand/ai_agent/history"
+#define VS_HISTORY_INDEX_JSN  "INDEX.JSN"
 
-#define VS_HISTORY_RAW_MAX (16 * 1024)
+/* Bump to redeploy g_social_seed to devices that already booted the
+ * previous set.  A stored SEEDVER below this triggers a one-time
+ * re-seed of SOCIAL on the next open.
+ */
+
+#define VS_HISTORY_SOCIAL_SEED_VERSION 2
+#define VS_HISTORY_INDEX_TMP  "INDEX.TMP"
+#define VS_HISTORY_PATH_MAX   96
+#define VS_HISTORY_SEQ_MAX    9999999u
+#define VS_HISTORY_KEY_FMT    "R%07u"
+#define VS_HISTORY_BODY_FMT   "%s/R%07u.JSN"
+#define VS_HISTORY_BODY_TMP   "%s/R%07u.TMP"
+#define VS_HISTORY_INDEX_MAX  \
+  ((size_t)CONFIG_VS_HISTORY_MAX_RECORDS * 1024u + 2u)
+#define VS_HISTORY_SEQ_PROBES \
+  ((unsigned int)CONFIG_VS_HISTORY_MAX_RECORDS + 1024u)
 
 /****************************************************************************
  * Private Data
  ****************************************************************************/
 
-/* Newest first, index 0 is the newest -- matching the demo data's ordering
- * and vs_app.c's existing runtime->index semantics (KEY_NEXT/KEY_BACK walk
- * this array by position, unaffected by how it got populated). */
+static const char *const g_history_dir[VS_HISTORY_KIND_COUNT] =
+{
+  VS_HISTORY_ROOT "/social",
+  VS_HISTORY_ROOT "/chat",
+};
 
-static struct vs_history_index_s g_index[CONFIG_VS_HISTORY_MAX_RECORDS];
-static unsigned int g_count;
-static unsigned int g_next_seq;
-static bool g_ready;
+static struct vs_history_index_s *g_index[VS_HISTORY_KIND_COUNT];
+static unsigned int g_count[VS_HISTORY_KIND_COUNT];
+static unsigned int g_next_seq[VS_HISTORY_KIND_COUNT];
+static bool g_kind_ready[VS_HISTORY_KIND_COUNT];
+static bool g_opened;
+static pthread_mutex_t g_history_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Seed data shown until the first real record is appended.  Kept as the
- * fallback rather than deleted so a fresh SD-NAND (or one that failed the
- * 8.3 gate and was reformatted) still demonstrates the history UI. */
+/* Fresh-store SOCIAL examples.  They are persisted through the same atomic
+ * body/index path as future real sessions.  CHAT is intentionally never
+ * seeded: fabricated user conversations must not appear as real history.
+ */
 
-static const struct vs_history_index_s g_seed[] =
+static const struct vs_history_index_s g_social_seed[] =
 {
   {
-    "R00000000", "08/18 09:20", "上午交流", "整体较平稳\n后段略有疑惑",
-    55, 30, 15, false
+    VS_HISTORY_KIND_SOCIAL, "R0000000", "08/20 10:00", "播报测试",
+    "数字播报测试\n说你好触发", 70, 25, 5, false
   },
   {
-    "R00000001", "08/17 16:40", "项目讨论", "对方需要进一步确认",
-    30, 20, 50, true
+    VS_HISTORY_KIND_SOCIAL, "R0000001", "08/19 12:30", "午间闲聊",
+    "同事午餐闲聊\n气氛轻松", 60, 35, 5, false
   },
   {
-    "R00000002", "08/16 11:05", "日常记录", "交流进展顺利",
-    65, 25, 10, false
+    VS_HISTORY_KIND_SOCIAL, "R0000002", "08/18 20:15", "争执片段",
+    "对话中出现愤怒\n夹杂低落情绪", 10, 5, 85, true
   },
+};
+
+/* Normalized contents of the protocol's msgEvent-2 response object, one
+ * per index entry above.  schemaVersion/kind are the local envelope;
+ * every emotionDetail is from the cloud doc's fixed set.  Record 0 is a
+ * TTS soak test: its text_minutes documents that "你好" should be
+ * answered by counting one to thirty, which exercises long synthesis
+ * without asking the model to break format.  Record 1 is an ordinary
+ * pleasant conversation; record 2 carries anger turning to sadness.
+ */
+
+static const char *const g_social_seed_body[] =
+{
+  "{\"schemaVersion\":1,\"kind\":\"social\",\"ttsMinutes\":\"\",\"txtMinutes\":\"这是一条语音播报（TTS）测试记录。约定：当用户说“你好”时，助手用中文从一数到三十（一、二、三、……、三十）连续朗读，用于验证长文本语音合成与播放是否完整、连贯、无中断。\",\"audioTimeline\":[{\"sentence\":\"你好\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.96\",\"timestampBegin\":\"0.0\",\"timestampEnd\":\"0.8\"},{\"sentence\":\"一二三四五六七八九十\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestampBegin\":\"1.0\",\"timestampEnd\":\"6.5\"}],\"emotionTimeline\":[{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.95\",\"timestamp\":\"500\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestamp\":\"3500\"}]}",
+
+  "{\"schemaVersion\":1,\"kind\":\"social\",\"ttsMinutes\":\"\",\"txtMinutes\":\"午间与同事一起吃饭，聊到最近的项目进度、周末计划和一部刚上映的电影，整体气氛轻松愉快。中途对下周的排期安排有一点疑惑，简单确认后达成一致。全程情绪平稳，以愉悦和中立为主，没有需要特别关注的片段。\",\"audioTimeline\":[{\"sentence\":\"这家店的午餐还挺不错的\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.93\",\"timestampBegin\":\"0.0\",\"timestampEnd\":\"2.4\"},{\"sentence\":\"你周末有什么安排吗\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestampBegin\":\"5.1\",\"timestampEnd\":\"7.0\"},{\"sentence\":\"我打算去看那部新上映的电影\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.92\",\"timestampBegin\":\"7.5\",\"timestampEnd\":\"10.2\"},{\"sentence\":\"下周的排期我还有点不确定\",\"emotionColor\":\"blue\",\"emotionDetail\":\"疑惑\",\"confidence\":\"0.84\",\"timestampBegin\":\"20.3\",\"timestampEnd\":\"23.0\"},{\"sentence\":\"那我们等确认了再定吧\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.88\",\"timestampBegin\":\"24.0\",\"timestampEnd\":\"26.1\"},{\"sentence\":\"好的没问题\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.94\",\"timestampBegin\":\"26.5\",\"timestampEnd\":\"27.8\"}],\"emotionTimeline\":[{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.93\",\"timestamp\":\"1200\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.89\",\"timestamp\":\"6000\"},{\"emotionColor\":\"blue\",\"emotionDetail\":\"疑惑\",\"confidence\":\"0.83\",\"timestamp\":\"21500\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.92\",\"timestamp\":\"27000\"}]}",
+
+  "{\"schemaVersion\":1,\"kind\":\"social\",\"ttsMinutes\":\"\",\"txtMinutes\":\"傍晚的一次对话中出现明显冲突。对方语气升高、多次表达不满与愤怒，随后情绪转为低落和伤心，交流未能达成一致，气氛紧张。建议先暂停争论，给彼此一些冷静的时间，待情绪平复后再心平气和地沟通。\",\"audioTimeline\":[{\"sentence\":\"你怎么又把这件事搞砸了\",\"emotionColor\":\"red\",\"emotionDetail\":\"生气\",\"confidence\":\"0.95\",\"timestampBegin\":\"2.0\",\"timestampEnd\":\"4.6\"},{\"sentence\":\"我真的受够了这样\",\"emotionColor\":\"red\",\"emotionDetail\":\"反感\",\"confidence\":\"0.90\",\"timestampBegin\":\"5.0\",\"timestampEnd\":\"7.3\"},{\"sentence\":\"我也不想这样其实我很难过\",\"emotionColor\":\"blue\",\"emotionDetail\":\"伤心\",\"confidence\":\"0.87\",\"timestampBegin\":\"30.2\",\"timestampEnd\":\"33.5\"}],\"emotionTimeline\":[{\"emotionColor\":\"red\",\"emotionDetail\":\"生气\",\"confidence\":\"0.94\",\"timestamp\":\"3000\"},{\"emotionColor\":\"red\",\"emotionDetail\":\"反感\",\"confidence\":\"0.89\",\"timestamp\":\"6000\"},{\"emotionColor\":\"blue\",\"emotionDetail\":\"伤心\",\"confidence\":\"0.86\",\"timestamp\":\"31500\"}]}",
 };
 
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+/* Seed-version sidecar.  See the file that bumps
+ * VS_HISTORY_SOCIAL_SEED_VERSION for why this exists: it forces already-
+ * provisioned NAND to adopt new seed content.  Best-effort -- a failed
+ * read or write just re-seeds again next boot, which is harmless.
+ */
+
+static int vs_history_seed_version_get_locked(enum vs_history_kind_e kind)
+{
+  char path[VS_HISTORY_PATH_MAX];
+  FILE *f;
+  int ver = 0;
+
+  snprintf(path, sizeof(path), "%s/SEEDVER", g_history_dir[kind]);
+  f = fopen(path, "r");
+  if (f == NULL)
+    {
+      return 0;
+    }
+
+  if (fscanf(f, "%d", &ver) != 1)
+    {
+      ver = 0;
+    }
+
+  fclose(f);
+  return ver;
+}
+
+static void vs_history_seed_version_put_locked(enum vs_history_kind_e kind,
+                                               int ver)
+{
+  char path[VS_HISTORY_PATH_MAX];
+  FILE *f;
+
+  snprintf(path, sizeof(path), "%s/SEEDVER", g_history_dir[kind]);
+  f = fopen(path, "w");
+  if (f == NULL)
+    {
+      return;
+    }
+
+  fprintf(f, "%d\n", ver);
+  fclose(f);
+}
+
+static bool vs_history_kind_valid(enum vs_history_kind_e kind)
+{
+  return (unsigned int)kind < (unsigned int)VS_HISTORY_KIND_COUNT;
+}
+
+static int vs_history_alloc_tables_locked(void)
+{
+  unsigned int kind;
+
+  for (kind = 0; kind < VS_HISTORY_KIND_COUNT; kind++)
+    {
+      if (g_index[kind] == NULL)
+        {
+          g_index[kind] = calloc(CONFIG_VS_HISTORY_MAX_RECORDS,
+                                 sizeof(g_index[kind][0]));
+          if (g_index[kind] == NULL)
+            {
+              unsigned int cleanup;
+
+              for (cleanup = 0; cleanup < VS_HISTORY_KIND_COUNT; cleanup++)
+                {
+                  free(g_index[cleanup]);
+                  g_index[cleanup] = NULL;
+                }
+
+              return -ENOMEM;
+            }
+        }
+    }
+
+  return 0;
+}
+
+static int vs_history_mkdir(const char *path)
+{
+  if (mkdir(path, 0700) == 0 || errno == EEXIST)
+    {
+      return 0;
+    }
+
+  return -errno;
+}
 
 static int vs_history_wait_for_store(void)
 {
@@ -112,10 +223,6 @@ static int vs_history_wait_for_store(void)
   char source[32];
   bool mounted;
   unsigned int attempt;
-
-  /* Same bound as vs_config.c's wait: automount can be delayed up to 60 s,
-   * plus card-probe timeout.  Only called from vs_history_open(), which
-   * runs at startup, never from the UI hot path. */
 
   for (attempt = 0; attempt < 700; attempt++)
     {
@@ -134,150 +241,248 @@ static int vs_history_wait_for_store(void)
 #endif
 }
 
-static void vs_history_load_seed(void)
+static int vs_history_key_parse(const char *key, unsigned int *seq)
 {
-  unsigned int i;
+  unsigned int value = 0;
+  size_t i;
 
-  for (i = 0; i < sizeof(g_seed) / sizeof(g_seed[0]); i++)
+  if (key == NULL || strlen(key) != 8 || key[0] != 'R')
     {
-      g_index[i] = g_seed[i];
+      return -EINVAL;
     }
 
-  g_count    = (unsigned int)(sizeof(g_seed) / sizeof(g_seed[0]));
-  g_next_seq = g_count;
+  for (i = 1; i < 8; i++)
+    {
+      if (key[i] < '0' || key[i] > '9')
+        {
+          return -EINVAL;
+        }
+
+      value = value * 10u + (unsigned int)(key[i] - '0');
+    }
+
+  if (value > VS_HISTORY_SEQ_MAX)
+    {
+      return -EINVAL;
+    }
+
+  if (seq != NULL)
+    {
+      *seq = value;
+    }
+
+  return 0;
 }
 
-/* Parse one index entry out of a cJSON object, tolerating missing or
- * mistyped fields so a partially corrupt INDEX.JSN loses only the entries
- * that are actually bad rather than failing the whole load. */
-
-static bool vs_history_parse_entry(cJSON *obj, struct vs_history_index_s *out)
+static void vs_history_body_path(enum vs_history_kind_e kind,
+                                 unsigned int seq, bool temporary,
+                                 char *path, size_t path_len)
 {
-  cJSON *item;
+  snprintf(path, path_len,
+           temporary ? VS_HISTORY_BODY_TMP : VS_HISTORY_BODY_FMT,
+           g_history_dir[kind], seq);
+}
 
-  memset(out, 0, sizeof(*out));
+static void vs_history_index_path(enum vs_history_kind_e kind,
+                                  bool temporary, char *path,
+                                  size_t path_len)
+{
+  snprintf(path, path_len, "%s/%s", g_history_dir[kind],
+           temporary ? VS_HISTORY_INDEX_TMP : VS_HISTORY_INDEX_JSN);
+}
 
-  item = cJSON_GetObjectItem(obj, "record_key");
-  if (item == NULL || !cJSON_IsString(item) || item->valuestring[0] == '\0')
+static void vs_history_sync_dir(const char *dir)
+{
+  int fd = open(dir, O_RDONLY);
+
+  if (fd >= 0)
+    {
+      (void)fsync(fd);
+      close(fd);
+    }
+}
+
+static int vs_history_write_all(int fd, const char *text, size_t len)
+{
+  size_t done = 0;
+
+  while (done < len)
+    {
+      ssize_t n = write(fd, text + done, len - done);
+
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          return -errno;
+        }
+
+      if (n == 0)
+        {
+          return -EIO;
+        }
+
+      done += (size_t)n;
+    }
+
+  return 0;
+}
+
+static int vs_history_read_all(int fd, char *buf, size_t len)
+{
+  size_t done = 0;
+
+  while (done < len)
+    {
+      ssize_t n = read(fd, buf + done, len - done);
+
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          return -errno;
+        }
+
+      if (n == 0)
+        {
+          return -EIO;
+        }
+
+      done += (size_t)n;
+    }
+
+  return 0;
+}
+
+static int vs_history_atomic_write(const char *dir, const char *temporary,
+                                   const char *destination,
+                                   const char *text)
+{
+  size_t len = strlen(text);
+  int fd;
+  int ret;
+
+  fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    {
+      return -errno;
+    }
+
+  ret = vs_history_write_all(fd, text, len);
+  if (ret == 0 && fsync(fd) < 0)
+    {
+      ret = -errno;
+    }
+
+  if (close(fd) < 0 && ret == 0)
+    {
+      ret = -errno;
+    }
+
+  if (ret < 0)
+    {
+      unlink(temporary);
+      return ret;
+    }
+
+  if (rename(temporary, destination) < 0)
+    {
+      ret = -errno;
+      unlink(temporary);
+      return ret;
+    }
+
+  vs_history_sync_dir(dir);
+  return 0;
+}
+
+static bool vs_history_percent_valid(cJSON *item, uint8_t *value)
+{
+  if (item == NULL)
+    {
+      *value = 0;
+      return true;
+    }
+
+  if (!cJSON_IsNumber(item) || item->valueint < 0 || item->valueint > 100)
     {
       return false;
     }
 
-  snprintf(out->record_key, sizeof(out->record_key), "%s",
-           item->valuestring);
-
-  item = cJSON_GetObjectItem(obj, "date");
-  if (item != NULL && cJSON_IsString(item))
-    {
-      snprintf(out->date, sizeof(out->date), "%s", item->valuestring);
-    }
-
-  item = cJSON_GetObjectItem(obj, "title");
-  if (item != NULL && cJSON_IsString(item))
-    {
-      snprintf(out->title, sizeof(out->title), "%s", item->valuestring);
-    }
-
-  item = cJSON_GetObjectItem(obj, "summary");
-  if (item != NULL && cJSON_IsString(item))
-    {
-      snprintf(out->summary, sizeof(out->summary), "%s", item->valuestring);
-    }
-
-  item = cJSON_GetObjectItem(obj, "calm");
-  out->calm = (item != NULL && cJSON_IsNumber(item)) ?
-              (uint8_t)item->valueint : 0;
-
-  item = cJSON_GetObjectItem(obj, "happy");
-  out->happy = (item != NULL && cJSON_IsNumber(item)) ?
-               (uint8_t)item->valueint : 0;
-
-  item = cJSON_GetObjectItem(obj, "tense");
-  out->tense = (item != NULL && cJSON_IsNumber(item)) ?
-               (uint8_t)item->valueint : 0;
-
-  item = cJSON_GetObjectItem(obj, "incomplete");
-  out->incomplete = item != NULL && cJSON_IsBool(item) && cJSON_IsTrue(item);
+  *value = (uint8_t)item->valueint;
   return true;
 }
 
-static int vs_history_load_index(void)
+static bool vs_history_copy_json_string(cJSON *obj, const char *name,
+                                        char *out, size_t out_len,
+                                        bool required)
 {
-  unsigned char *raw;
-  FILE *f;
-  long sz;
-  cJSON *root;
-  int i;
-  int n;
+  cJSON *item = cJSON_GetObjectItem(obj, name);
 
-  f = fopen(VS_HISTORY_INDEX, "r");
-  if (f == NULL)
+  if (item == NULL)
     {
-      return -ENOENT;
+      out[0] = '\0';
+      return !required;
     }
 
-  if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 ||
-      fseek(f, 0, SEEK_SET) != 0 || sz == 0 || sz > VS_HISTORY_RAW_MAX)
+  if (!cJSON_IsString(item) || strlen(item->valuestring) >= out_len)
     {
-      fclose(f);
-      return -EBADMSG;
+      return false;
     }
 
-  raw = malloc((size_t)sz + 1);
-  if (raw == NULL)
-    {
-      fclose(f);
-      return -ENOMEM;
-    }
-
-  n = (int)fread(raw, 1, (size_t)sz, f);
-  fclose(f);
-  raw[n] = '\0';
-
-  root = cJSON_Parse((const char *)raw);
-  free(raw);
-
-  if (root == NULL || !cJSON_IsArray(root))
-    {
-      cJSON_Delete(root);
-      return -EBADMSG;
-    }
-
-  g_count    = 0;
-  g_next_seq = 0;
-
-  for (i = 0; i < cJSON_GetArraySize(root) &&
-       g_count < CONFIG_VS_HISTORY_MAX_RECORDS; i++)
-    {
-      cJSON *obj = cJSON_GetArrayItem(root, i);
-      unsigned int seq;
-
-      if (!cJSON_IsObject(obj))
-        {
-          continue;
-        }
-
-      /* A corrupt individual entry is skipped, not fatal to the load. */
-
-      if (!vs_history_parse_entry(obj, &g_index[g_count]))
-        {
-          continue;
-        }
-
-      if (sscanf(g_index[g_count].record_key, "R%08u", &seq) == 1 &&
-          seq + 1 > g_next_seq)
-        {
-          g_next_seq = seq + 1;
-        }
-
-      g_count++;
-    }
-
-  cJSON_Delete(root);
-  return 0;
+  snprintf(out, out_len, "%s", item->valuestring);
+  return true;
 }
 
-static cJSON *vs_history_entry_to_json(const struct vs_history_index_s *e)
+static bool vs_history_parse_entry(enum vs_history_kind_e kind, cJSON *obj,
+                                   struct vs_history_index_s *entry)
+{
+  cJSON *item;
+
+  if (!cJSON_IsObject(obj))
+    {
+      return false;
+    }
+
+  memset(entry, 0, sizeof(*entry));
+  entry->kind = kind;
+
+  if (!vs_history_copy_json_string(obj, "record_key", entry->record_key,
+                                   sizeof(entry->record_key), true) ||
+      vs_history_key_parse(entry->record_key, NULL) < 0 ||
+      !vs_history_copy_json_string(obj, "date", entry->date,
+                                   sizeof(entry->date), false) ||
+      !vs_history_copy_json_string(obj, "title", entry->title,
+                                   sizeof(entry->title), false) ||
+      !vs_history_copy_json_string(obj, "summary", entry->summary,
+                                   sizeof(entry->summary), false) ||
+      !vs_history_percent_valid(cJSON_GetObjectItem(obj, "calm"),
+                                &entry->calm) ||
+      !vs_history_percent_valid(cJSON_GetObjectItem(obj, "happy"),
+                                &entry->happy) ||
+      !vs_history_percent_valid(cJSON_GetObjectItem(obj, "tense"),
+                                &entry->tense))
+    {
+      return false;
+    }
+
+  item = cJSON_GetObjectItem(obj, "incomplete");
+  if (item != NULL && !cJSON_IsBool(item))
+    {
+      return false;
+    }
+
+  entry->incomplete = item != NULL && cJSON_IsTrue(item);
+  return true;
+}
+
+static cJSON *vs_history_entry_json(const struct vs_history_index_s *entry)
 {
   cJSON *obj = cJSON_CreateObject();
 
@@ -286,74 +491,23 @@ static cJSON *vs_history_entry_to_json(const struct vs_history_index_s *e)
       return NULL;
     }
 
-  cJSON_AddStringToObject(obj, "record_key", e->record_key);
-  cJSON_AddStringToObject(obj, "date", e->date);
-  cJSON_AddStringToObject(obj, "title", e->title);
-  cJSON_AddStringToObject(obj, "summary", e->summary);
-  cJSON_AddNumberToObject(obj, "calm", e->calm);
-  cJSON_AddNumberToObject(obj, "happy", e->happy);
-  cJSON_AddNumberToObject(obj, "tense", e->tense);
-  cJSON_AddBoolToObject(obj, "incomplete", e->incomplete);
+  cJSON_AddStringToObject(obj, "record_key", entry->record_key);
+  cJSON_AddStringToObject(obj, "date", entry->date);
+  cJSON_AddStringToObject(obj, "title", entry->title);
+  cJSON_AddStringToObject(obj, "summary", entry->summary);
+  cJSON_AddNumberToObject(obj, "calm", entry->calm);
+  cJSON_AddNumberToObject(obj, "happy", entry->happy);
+  cJSON_AddNumberToObject(obj, "tense", entry->tense);
+  cJSON_AddBoolToObject(obj, "incomplete", entry->incomplete);
   return obj;
 }
 
-/* Write `text` to `tmp`, fsync, close, rename onto `dest`, fsync the
- * directory.  Shared by the index save and the per-record body save. */
-
-static int vs_history_atomic_write(const char *tmp, const char *dest,
-                                   const char *text)
+static int vs_history_write_index_locked(
+    enum vs_history_kind_e kind,
+    const struct vs_history_index_s *entries, unsigned int count)
 {
-  size_t len = strlen(text);
-  int fd;
-  ssize_t written;
-
-  fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0)
-    {
-      return -errno;
-    }
-
-  written = write(fd, text, len);
-  if (written < 0 || (size_t)written != len || fsync(fd) < 0)
-    {
-      int err = errno != 0 ? -errno : -EIO;
-
-      close(fd);
-      unlink(tmp);
-      return err;
-    }
-
-  if (close(fd) < 0)
-    {
-      int err = -errno;
-
-      unlink(tmp);
-      return err;
-    }
-
-  if (rename(tmp, dest) < 0)
-    {
-      int err = -errno;
-
-      unlink(tmp);
-      return err;
-    }
-
-  /* Best-effort directory fsync so the rename itself survives a power
-   * cut.  Not fatal if the platform's fs does not support it. */
-
-  fd = open(VS_HISTORY_DIR, O_RDONLY);
-  if (fd >= 0)
-    {
-      fsync(fd);
-      close(fd);
-    }
-
-  return 0;
-}
-
-static int vs_history_save_index(void)
-{
+  char temporary[VS_HISTORY_PATH_MAX];
+  char destination[VS_HISTORY_PATH_MAX];
   cJSON *root;
   char *text;
   unsigned int i;
@@ -365,9 +519,9 @@ static int vs_history_save_index(void)
       return -ENOMEM;
     }
 
-  for (i = 0; i < g_count; i++)
+  for (i = 0; i < count; i++)
     {
-      cJSON *obj = vs_history_entry_to_json(&g_index[i]);
+      cJSON *obj = vs_history_entry_json(&entries[i]);
 
       if (obj == NULL)
         {
@@ -385,9 +539,282 @@ static int vs_history_save_index(void)
       return -ENOMEM;
     }
 
-  ret = vs_history_atomic_write(VS_HISTORY_INDEX_TMP, VS_HISTORY_INDEX, text);
+  if (strlen(text) > VS_HISTORY_INDEX_MAX)
+    {
+      free(text);
+      return -E2BIG;
+    }
+
+  vs_history_index_path(kind, true, temporary, sizeof(temporary));
+  vs_history_index_path(kind, false, destination, sizeof(destination));
+  ret = vs_history_atomic_write(g_history_dir[kind], temporary,
+                                destination, text);
   free(text);
   return ret;
+}
+
+static int vs_history_check_body_locked(enum vs_history_kind_e kind,
+                                        const char *key)
+{
+  char path[VS_HISTORY_PATH_MAX];
+  struct stat st;
+  unsigned int seq;
+
+  if (vs_history_key_parse(key, &seq) < 0)
+    {
+      return -EBADMSG;
+    }
+
+  vs_history_body_path(kind, seq, false, path, sizeof(path));
+  if (stat(path, &st) < 0)
+    {
+      return errno == ENOENT ? -EBADMSG : -errno;
+    }
+
+  return st.st_size > 0 ? 0 : -EBADMSG;
+}
+
+static int vs_history_load_index_locked(enum vs_history_kind_e kind)
+{
+  struct vs_history_index_s *entries;
+  char path[VS_HISTORY_PATH_MAX];
+  struct stat st;
+  cJSON *root = NULL;
+  char *raw = NULL;
+  unsigned int count;
+  unsigned int next_seq = 0;
+  int fd = -1;
+  int ret = 0;
+  int i;
+
+  vs_history_index_path(kind, false, path, sizeof(path));
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    {
+      return -errno;
+    }
+
+  if (fstat(fd, &st) < 0)
+    {
+      ret = -errno;
+      goto out;
+    }
+
+  if (st.st_size < 2 || (uint64_t)st.st_size > VS_HISTORY_INDEX_MAX)
+    {
+      ret = -EBADMSG;
+      goto out;
+    }
+
+  raw = malloc((size_t)st.st_size + 1u);
+  entries = calloc(CONFIG_VS_HISTORY_MAX_RECORDS, sizeof(*entries));
+  if (raw == NULL || entries == NULL)
+    {
+      free(entries);
+      ret = -ENOMEM;
+      goto out;
+    }
+
+  ret = vs_history_read_all(fd, raw, (size_t)st.st_size);
+  if (ret < 0)
+    {
+      free(entries);
+      goto out;
+    }
+
+  raw[st.st_size] = '\0';
+  root = cJSON_Parse(raw);
+  if (root == NULL || !cJSON_IsArray(root) ||
+      cJSON_GetArraySize(root) > CONFIG_VS_HISTORY_MAX_RECORDS)
+    {
+      free(entries);
+      ret = -EBADMSG;
+      goto out;
+    }
+
+  count = (unsigned int)cJSON_GetArraySize(root);
+  for (i = 0; i < (int)count; i++)
+    {
+      unsigned int seq;
+      int j;
+
+      if (!vs_history_parse_entry(kind, cJSON_GetArrayItem(root, i),
+                                  &entries[i]) ||
+          vs_history_key_parse(entries[i].record_key, &seq) < 0 ||
+          vs_history_check_body_locked(kind, entries[i].record_key) < 0)
+        {
+          free(entries);
+          ret = -EBADMSG;
+          goto out;
+        }
+
+      for (j = 0; j < i; j++)
+        {
+          if (strcmp(entries[j].record_key, entries[i].record_key) == 0)
+            {
+              free(entries);
+              ret = -EBADMSG;
+              goto out;
+            }
+        }
+
+      if (seq >= next_seq)
+        {
+          next_seq = seq == VS_HISTORY_SEQ_MAX ? 0 : seq + 1u;
+        }
+    }
+
+  memcpy(g_index[kind], entries, count * sizeof(entries[0]));
+  g_count[kind] = count;
+  g_next_seq[kind] = next_seq;
+  free(entries);
+
+out:
+  cJSON_Delete(root);
+  free(raw);
+  close(fd);
+  return ret;
+}
+
+static void vs_history_load_seed_memory_locked(void)
+{
+  unsigned int count = (unsigned int)(sizeof(g_social_seed) /
+                                      sizeof(g_social_seed[0]));
+
+  memcpy(g_index[VS_HISTORY_KIND_SOCIAL], g_social_seed,
+         count * sizeof(g_social_seed[0]));
+  g_count[VS_HISTORY_KIND_SOCIAL] = count;
+  g_next_seq[VS_HISTORY_KIND_SOCIAL] = count;
+}
+
+static int vs_history_seed_social_locked(void)
+{
+  unsigned int count = (unsigned int)(sizeof(g_social_seed) /
+                                      sizeof(g_social_seed[0]));
+  unsigned int i;
+  int ret;
+
+  for (i = 0; i < count; i++)
+    {
+      char temporary[VS_HISTORY_PATH_MAX];
+      char destination[VS_HISTORY_PATH_MAX];
+      unsigned int seq;
+
+      if (vs_history_key_parse(g_social_seed[i].record_key, &seq) < 0)
+        {
+          return -EINVAL;
+        }
+
+      vs_history_body_path(VS_HISTORY_KIND_SOCIAL, seq, true, temporary,
+                           sizeof(temporary));
+      vs_history_body_path(VS_HISTORY_KIND_SOCIAL, seq, false, destination,
+                           sizeof(destination));
+      ret = vs_history_atomic_write(
+          g_history_dir[VS_HISTORY_KIND_SOCIAL], temporary, destination,
+          g_social_seed_body[i]);
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
+
+  ret = vs_history_write_index_locked(VS_HISTORY_KIND_SOCIAL,
+                                      g_social_seed, count);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  vs_history_seed_version_put_locked(VS_HISTORY_KIND_SOCIAL,
+                                     VS_HISTORY_SOCIAL_SEED_VERSION);
+  vs_history_load_seed_memory_locked();
+  return 0;
+}
+
+static int vs_history_create_empty_locked(enum vs_history_kind_e kind)
+{
+  int ret = vs_history_write_index_locked(kind, NULL, 0);
+
+  if (ret == 0)
+    {
+      g_count[kind] = 0;
+      g_next_seq[kind] = 0;
+    }
+
+  return ret;
+}
+
+static int vs_history_find_key_locked(enum vs_history_kind_e kind,
+                                      const char *key)
+{
+  unsigned int i;
+
+  for (i = 0; i < g_count[kind]; i++)
+    {
+      if (strcmp(g_index[kind][i].record_key, key) == 0)
+        {
+          return (int)i;
+        }
+    }
+
+  return -ENOENT;
+}
+
+static int vs_history_choose_seq_locked(enum vs_history_kind_e kind,
+                                        unsigned int *result)
+{
+  unsigned int seq = g_next_seq[kind];
+  unsigned int attempt;
+
+  for (attempt = 0; attempt < VS_HISTORY_SEQ_PROBES; attempt++)
+    {
+      char key[VS_HISTORY_KEY_MAX];
+      char path[VS_HISTORY_PATH_MAX];
+
+      snprintf(key, sizeof(key), VS_HISTORY_KEY_FMT, seq);
+      vs_history_body_path(kind, seq, false, path, sizeof(path));
+      if (vs_history_find_key_locked(kind, key) == -ENOENT &&
+          access(path, F_OK) < 0)
+        {
+          if (errno == ENOENT)
+            {
+              *result = seq;
+              return 0;
+            }
+
+          return -errno;
+        }
+
+      seq = seq == VS_HISTORY_SEQ_MAX ? 0 : seq + 1u;
+    }
+
+  return -ENOSPC;
+}
+
+static void vs_history_normalize_entry(struct vs_history_index_s *entry,
+                                       enum vs_history_kind_e kind,
+                                       unsigned int seq)
+{
+  entry->kind = kind;
+  snprintf(entry->record_key, sizeof(entry->record_key), VS_HISTORY_KEY_FMT,
+           seq);
+  entry->date[sizeof(entry->date) - 1] = '\0';
+  entry->title[sizeof(entry->title) - 1] = '\0';
+  entry->summary[sizeof(entry->summary) - 1] = '\0';
+  if (entry->calm > 100)
+    {
+      entry->calm = 100;
+    }
+
+  if (entry->happy > 100)
+    {
+      entry->happy = 100;
+    }
+
+  if (entry->tense > 100)
+    {
+      entry->tense = 100;
+    }
 }
 
 /****************************************************************************
@@ -396,160 +823,437 @@ static int vs_history_save_index(void)
 
 int vs_history_open(void)
 {
+  int first_error = 0;
+  int store_ret;
   int ret;
+  unsigned int kind;
 
-  if (g_ready)
+  pthread_mutex_lock(&g_history_lock);
+  if (g_opened)
+    {
+      for (kind = 0; kind < VS_HISTORY_KIND_COUNT; kind++)
+        {
+          if (!g_kind_ready[kind] && first_error == 0)
+            {
+              first_error = -ENODEV;
+            }
+        }
+
+      pthread_mutex_unlock(&g_history_lock);
+      return first_error;
+    }
+  pthread_mutex_unlock(&g_history_lock);
+
+  store_ret = vs_history_wait_for_store();
+  pthread_mutex_lock(&g_history_lock);
+  if (g_opened)
+    {
+      pthread_mutex_unlock(&g_history_lock);
+      return 0;
+    }
+
+  memset(g_kind_ready, 0, sizeof(g_kind_ready));
+  memset(g_count, 0, sizeof(g_count));
+  memset(g_next_seq, 0, sizeof(g_next_seq));
+
+  ret = vs_history_alloc_tables_locked();
+  if (ret < 0)
+    {
+      pthread_mutex_unlock(&g_history_lock);
+      return ret;
+    }
+
+  if (store_ret < 0)
+    {
+      printf("vs_history: store unavailable (%d); samples are RAM-only\n",
+             store_ret);
+      vs_history_load_seed_memory_locked();
+      g_opened = true;
+      pthread_mutex_unlock(&g_history_lock);
+      return store_ret;
+    }
+
+  ret = vs_history_mkdir("/mnt/sdnand/ai_agent");
+  if (ret == 0)
+    {
+      ret = vs_history_mkdir(VS_HISTORY_ROOT);
+    }
+
+  for (kind = 0; ret == 0 && kind < VS_HISTORY_KIND_COUNT; kind++)
+    {
+      ret = vs_history_mkdir(g_history_dir[kind]);
+    }
+
+  if (ret < 0)
+    {
+      vs_history_load_seed_memory_locked();
+      g_opened = true;
+      pthread_mutex_unlock(&g_history_lock);
+      return ret;
+    }
+
+  for (kind = 0; kind < VS_HISTORY_KIND_COUNT; kind++)
+    {
+      ret = vs_history_load_index_locked((enum vs_history_kind_e)kind);
+      if (ret == -ENOENT)
+        {
+          ret = kind == VS_HISTORY_KIND_SOCIAL ?
+                vs_history_seed_social_locked() :
+                vs_history_create_empty_locked((enum vs_history_kind_e)kind);
+        }
+      else if (ret == 0 && kind == VS_HISTORY_KIND_SOCIAL &&
+               vs_history_seed_version_get_locked(VS_HISTORY_KIND_SOCIAL) !=
+               VS_HISTORY_SOCIAL_SEED_VERSION)
+        {
+          /* Seed content changed since this card was written; adopt it
+           * once.  SOCIAL has no real producer, so nothing real is lost.
+           */
+
+          printf("vs_history: social seed v%d -> v%d, reseeding\n",
+                 vs_history_seed_version_get_locked(VS_HISTORY_KIND_SOCIAL),
+                 VS_HISTORY_SOCIAL_SEED_VERSION);
+          ret = vs_history_seed_social_locked();
+        }
+
+      if (ret == 0)
+        {
+          g_kind_ready[kind] = true;
+          printf("vs_history: loaded %u %s record(s)\n", g_count[kind],
+                 kind == VS_HISTORY_KIND_SOCIAL ? "social" : "chat");
+        }
+      else
+        {
+          /* Never replace a corrupt index with samples/empty data. */
+
+          printf("vs_history: %s store unavailable (%d)\n",
+                 kind == VS_HISTORY_KIND_SOCIAL ? "social" : "chat", ret);
+          g_count[kind] = 0;
+          g_next_seq[kind] = 0;
+          if (first_error == 0)
+            {
+              first_error = ret;
+            }
+        }
+    }
+
+  g_opened = true;
+  pthread_mutex_unlock(&g_history_lock);
+  return first_error;
+}
+
+bool vs_history_is_ready(enum vs_history_kind_e kind)
+{
+  bool ready = false;
+
+  if (!vs_history_kind_valid(kind))
+    {
+      return false;
+    }
+
+  pthread_mutex_lock(&g_history_lock);
+  ready = g_kind_ready[kind];
+  pthread_mutex_unlock(&g_history_lock);
+  return ready;
+}
+
+unsigned int vs_history_count(enum vs_history_kind_e kind)
+{
+  unsigned int count = 0;
+
+  if (!vs_history_kind_valid(kind))
     {
       return 0;
     }
 
-  ret = vs_history_wait_for_store();
-  if (ret < 0)
-    {
-      printf("vs_history: store unavailable (%d), using seed data\n", ret);
-      vs_history_load_seed();
-      g_ready = true;
-      return ret;
-    }
-
-  mkdir("/mnt/sdnand/ai_agent", 0700);
-  mkdir(VS_HISTORY_DIR, 0700);
-
-  ret = vs_history_load_index();
-  if (ret < 0)
-    {
-      printf("vs_history: no usable index (%d), seeding\n", ret);
-      vs_history_load_seed();
-    }
-  else
-    {
-      printf("vs_history: loaded %u record(s) from %s\n", g_count,
-             VS_HISTORY_INDEX);
-    }
-
-  g_ready = true;
-  return 0;
+  pthread_mutex_lock(&g_history_lock);
+  count = g_count[kind];
+  pthread_mutex_unlock(&g_history_lock);
+  return count;
 }
 
-unsigned int vs_history_count(void)
+int vs_history_get_index(enum vs_history_kind_e kind, unsigned int index,
+                         struct vs_history_index_s *out)
 {
-  return g_count;
-}
-
-int vs_history_get_index(unsigned int i, struct vs_history_index_s *out)
-{
-  if (out == NULL || i >= g_count)
+  if (!vs_history_kind_valid(kind) || out == NULL)
     {
       return -EINVAL;
     }
 
-  *out = g_index[i];
-  return 0;
-}
-
-int vs_history_read_full(const char *record_key, char *buf, size_t len)
-{
-  char path[64];
-  FILE *f;
-  long sz;
-  int n;
-
-  if (record_key == NULL || buf == NULL || len == 0)
+  pthread_mutex_lock(&g_history_lock);
+  if (index >= g_count[kind])
     {
-      return -EINVAL;
-    }
-
-  snprintf(path, sizeof(path), "%s/%s.JSN", VS_HISTORY_DIR, record_key);
-
-  f = fopen(path, "r");
-  if (f == NULL)
-    {
+      pthread_mutex_unlock(&g_history_lock);
       return -ENOENT;
     }
 
-  if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 ||
-      fseek(f, 0, SEEK_SET) != 0)
-    {
-      fclose(f);
-      return -EIO;
-    }
-
-  if (sz >= (long)len)
-    {
-      sz = (long)len - 1;
-    }
-
-  n = (int)fread(buf, 1, (size_t)sz, f);
-  fclose(f);
-  buf[n] = '\0';
-  return n;
+  *out = g_index[kind][index];
+  pthread_mutex_unlock(&g_history_lock);
+  return 0;
 }
 
-int vs_history_append(struct vs_history_index_s *index,
-                      const char *full_json)
+int vs_history_snapshot(enum vs_history_kind_e kind, unsigned int offset,
+                        struct vs_history_index_s *out, size_t capacity,
+                        unsigned int *total, unsigned int *copied)
 {
-  char path[64];
-  char tmp[64];
-  unsigned int seq;
-  int ret;
+  unsigned int available;
+  unsigned int take;
 
-  if (index == NULL)
+  if (!vs_history_kind_valid(kind) || total == NULL || copied == NULL ||
+      (capacity > 0 && out == NULL))
     {
       return -EINVAL;
     }
 
-  if (!g_ready)
+  pthread_mutex_lock(&g_history_lock);
+  *total = g_count[kind];
+  if (offset >= g_count[kind])
     {
+      *copied = 0;
+      pthread_mutex_unlock(&g_history_lock);
+      return 0;
+    }
+
+  available = g_count[kind] - offset;
+  take = available < capacity ? available : (unsigned int)capacity;
+  if (take > 0)
+    {
+      memcpy(out, &g_index[kind][offset], take * sizeof(out[0]));
+    }
+
+  *copied = take;
+  pthread_mutex_unlock(&g_history_lock);
+  return 0;
+}
+
+int vs_history_open_full(enum vs_history_kind_e kind, const char *record_key,
+                         int *fd_out, size_t *size_out)
+{
+  char path[VS_HISTORY_PATH_MAX];
+  struct stat st;
+  unsigned int seq;
+  int fd;
+  int ret;
+
+  if (!vs_history_kind_valid(kind) || fd_out == NULL || size_out == NULL ||
+      vs_history_key_parse(record_key, &seq) < 0)
+    {
+      return -EINVAL;
+    }
+
+  pthread_mutex_lock(&g_history_lock);
+  if (!g_kind_ready[kind])
+    {
+      pthread_mutex_unlock(&g_history_lock);
       return -ENODEV;
     }
 
-  if (g_count >= CONFIG_VS_HISTORY_MAX_RECORDS)
+  ret = vs_history_find_key_locked(kind, record_key);
+  if (ret < 0)
     {
-      return -ENOSPC;
+      pthread_mutex_unlock(&g_history_lock);
+      return ret;
     }
 
-  seq = g_next_seq;
-  snprintf(index->record_key, sizeof(index->record_key), "R%08u", seq);
-
-  if (full_json != NULL)
+  vs_history_body_path(kind, seq, false, path, sizeof(path));
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
     {
-      snprintf(path, sizeof(path), VS_HISTORY_FMT_JSN, seq);
-      snprintf(tmp, sizeof(tmp), VS_HISTORY_FMT_TMP, seq);
+      ret = -errno;
+      pthread_mutex_unlock(&g_history_lock);
+      return ret;
+    }
 
-      ret = vs_history_atomic_write(tmp, path, full_json);
-      if (ret < 0)
+  if (fstat(fd, &st) < 0 || st.st_size <= 0 ||
+      (uint64_t)st.st_size > (uint64_t)SIZE_MAX)
+    {
+      ret = errno != 0 ? -errno : -EIO;
+      close(fd);
+      pthread_mutex_unlock(&g_history_lock);
+      return ret;
+    }
+
+  *fd_out = fd;
+  *size_out = (size_t)st.st_size;
+  pthread_mutex_unlock(&g_history_lock);
+  return 0;
+}
+
+int vs_history_read_full(enum vs_history_kind_e kind, const char *record_key,
+                         char *buf, size_t len)
+{
+  size_t size;
+  int fd;
+  int ret;
+
+  if (buf == NULL || len == 0)
+    {
+      return -EINVAL;
+    }
+
+  ret = vs_history_open_full(kind, record_key, &fd, &size);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (size >= len)
+    {
+      close(fd);
+      return -E2BIG;
+    }
+
+  if (size > INT_MAX)
+    {
+      close(fd);
+      return -EFBIG;
+    }
+
+  ret = vs_history_read_all(fd, buf, size);
+  close(fd);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  buf[size] = '\0';
+  return (int)size;
+}
+
+int vs_history_append(enum vs_history_kind_e kind,
+                      struct vs_history_index_s *index,
+                      const char *full_json)
+{
+  struct vs_history_index_s *candidate;
+  struct vs_history_index_s entry;
+  char temporary[VS_HISTORY_PATH_MAX];
+  char destination[VS_HISTORY_PATH_MAX];
+  char evicted_path[VS_HISTORY_PATH_MAX];
+  cJSON *body;
+  unsigned int old_count;
+  unsigned int new_count;
+  unsigned int copy_count;
+  unsigned int seq = 0;
+  bool evict;
+  int ret;
+
+  if (!vs_history_kind_valid(kind) || index == NULL || full_json == NULL ||
+      full_json[0] == '\0')
+    {
+      return -EINVAL;
+    }
+
+  body = cJSON_Parse(full_json);
+  if (body == NULL || !cJSON_IsObject(body))
+    {
+      cJSON_Delete(body);
+      return -EBADMSG;
+    }
+  cJSON_Delete(body);
+
+  candidate = malloc(CONFIG_VS_HISTORY_MAX_RECORDS * sizeof(*candidate));
+  if (candidate == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  pthread_mutex_lock(&g_history_lock);
+  if (!g_kind_ready[kind])
+    {
+      ret = -ENODEV;
+      goto out_unlock;
+    }
+
+  ret = vs_history_choose_seq_locked(kind, &seq);
+  if (ret < 0)
+    {
+      goto out_unlock;
+    }
+
+  entry = *index;
+  vs_history_normalize_entry(&entry, kind, seq);
+
+  old_count = g_count[kind];
+  evict = old_count >= CONFIG_VS_HISTORY_MAX_RECORDS;
+  new_count = evict ? CONFIG_VS_HISTORY_MAX_RECORDS : old_count + 1u;
+  copy_count = new_count - 1u;
+  candidate[0] = entry;
+  if (copy_count > 0)
+    {
+      memcpy(&candidate[1], g_index[kind],
+             copy_count * sizeof(candidate[0]));
+    }
+
+  evicted_path[0] = '\0';
+  if (evict)
+    {
+      unsigned int evicted_seq;
+
+      if (vs_history_key_parse(g_index[kind][old_count - 1u].record_key,
+                               &evicted_seq) == 0)
         {
-          return ret;
+          vs_history_body_path(kind, evicted_seq, false, evicted_path,
+                               sizeof(evicted_path));
         }
     }
 
-  /* Insert at the front: index 0 is always the newest, matching how
-   * vs_app.c's KEY_NEXT/KEY_BACK walk this array and how the seed data is
-   * ordered. */
-
-  memmove(&g_index[1], &g_index[0],
-          g_count * sizeof(g_index[0]));
-  g_index[0] = *index;
-  g_count++;
-  g_next_seq = seq + 1;
-
-  ret = vs_history_save_index();
+  vs_history_body_path(kind, seq, true, temporary, sizeof(temporary));
+  vs_history_body_path(kind, seq, false, destination, sizeof(destination));
+  ret = vs_history_atomic_write(g_history_dir[kind], temporary, destination,
+                                full_json);
   if (ret < 0)
     {
-      /* The record body (if any) is already durable and simply will not be
-       * listed until the next successful index save; do not lose the
-       * in-memory entry over a transient write failure. */
-
-      printf("vs_history: index save failed (%d), record %s kept in "
-             "memory only\n", ret, index->record_key);
+      goto out_unlock;
     }
 
-  return 0;
+  ret = vs_history_write_index_locked(kind, candidate, new_count);
+  if (ret < 0)
+    {
+      unlink(destination);
+      vs_history_sync_dir(g_history_dir[kind]);
+      goto out_unlock;
+    }
+
+  memcpy(g_index[kind], candidate, new_count * sizeof(candidate[0]));
+  g_count[kind] = new_count;
+  g_next_seq[kind] = seq == VS_HISTORY_SEQ_MAX ? 0 : seq + 1u;
+  *index = entry;
+
+  if (evicted_path[0] != '\0' && unlink(evicted_path) < 0 && errno != ENOENT)
+    {
+      /* The committed index is authoritative; a failed cleanup is only an
+       * orphan and must not turn a durable append into a reported failure.
+       */
+
+      printf("vs_history: could not remove evicted body %s: %d\n",
+             evicted_path, -errno);
+    }
+  else if (evicted_path[0] != '\0')
+    {
+      vs_history_sync_dir(g_history_dir[kind]);
+    }
+
+  ret = 0;
+
+out_unlock:
+  pthread_mutex_unlock(&g_history_lock);
+  free(candidate);
+  return ret;
 }
 
 void vs_history_close(void)
 {
-  g_ready = false;
-  g_count = 0;
-  g_next_seq = 0;
+  unsigned int kind;
+
+  pthread_mutex_lock(&g_history_lock);
+  g_opened = false;
+  memset(g_kind_ready, 0, sizeof(g_kind_ready));
+  memset(g_count, 0, sizeof(g_count));
+  memset(g_next_seq, 0, sizeof(g_next_seq));
+  for (kind = 0; kind < VS_HISTORY_KIND_COUNT; kind++)
+    {
+      free(g_index[kind]);
+      g_index[kind] = NULL;
+    }
+
+  pthread_mutex_unlock(&g_history_lock);
 }

@@ -1,12 +1,15 @@
 /****************************************************************************
  * app/provisioning_web/include/velasight_provisioning.h
  *
- * AP-mode provisioning web entry.  The application switches the radio into
- * SoftAP itself, calls velasight_provisioning_start(), and gets told when a
- * phone has submitted credentials.  This service never touches the Wi-Fi
- * role: it does not associate, does not run wapi, does not start DHCPD and
- * does not switch back to STA.  Owning both the HTTP page and the radio would
- * make it impossible for the application to decide when the network may drop.
+ * HTTP provisioning and local-history entry.  The application owns the Wi-Fi
+ * role and may keep this listener on either its temporary SoftAP or an
+ * already-connected STA interface.  The service binds INADDR_ANY but never
+ * associates, runs DHCP, or switches radio mode itself.
+ *
+ * The service is unauthenticated HTTP.  Applications exposing it on STA must
+ * rely on the trusted LAN boundary or add a stronger access-control layer;
+ * history and credential changes are available to every client that can
+ * reach the configured port.
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
@@ -72,6 +75,42 @@ struct velasight_prov_credentials_s
   bool     open_network; /* Password is empty */
 };
 
+/* Optional read-only history provider.  The HTTP core deliberately owns no
+ * VelaSight storage types: a product adapter supplies compact index entries
+ * and opens one stable full-record descriptor for streaming. */
+
+#define VELASIGHT_PROV_HISTORY_KEY_MAX      8
+#define VELASIGHT_PROV_HISTORY_DATE_MAX     39
+#define VELASIGHT_PROV_HISTORY_TITLE_MAX    39
+#define VELASIGHT_PROV_HISTORY_SUMMARY_MAX 127
+#define VELASIGHT_PROV_HISTORY_MAX_ENTRIES 256
+
+struct velasight_prov_history_entry_s
+{
+  char    record_key[VELASIGHT_PROV_HISTORY_KEY_MAX + 1];
+  char    date[VELASIGHT_PROV_HISTORY_DATE_MAX + 1];
+  char    title[VELASIGHT_PROV_HISTORY_TITLE_MAX + 1];
+  char    summary[VELASIGHT_PROV_HISTORY_SUMMARY_MAX + 1];
+  uint8_t calm;
+  uint8_t happy;
+  uint8_t tense;
+  bool    incomplete;
+};
+
+typedef int (*velasight_prov_history_snapshot_cb_t)(
+    unsigned int offset, struct velasight_prov_history_entry_s *out,
+    size_t capacity, unsigned int *total, unsigned int *copied, void *arg);
+
+typedef int (*velasight_prov_history_open_cb_t)(
+    const char *record_key, int *fd, size_t *size, void *arg);
+
+struct velasight_prov_history_provider_s
+{
+  velasight_prov_history_snapshot_cb_t snapshot;
+  velasight_prov_history_open_cb_t     open;
+  void                                *arg;
+};
+
 /* Called after the success page has been written and the connection closed,
  * never before.  The application may leave SoftAP from here, but keeping the
  * listener alive is also valid and lets the user submit another record. Doing
@@ -93,6 +132,7 @@ struct velasight_prov_config_s
   const char               *store_path; /* NULL selects the built-in path */
   velasight_prov_saved_cb_t on_saved;   /* May be NULL */
   void                     *cb_arg;
+  struct velasight_prov_history_provider_s history; /* Both callbacks or none */
 };
 
 /****************************************************************************

@@ -60,6 +60,26 @@ test -s "$AP_BIN" || die "missing AP binary: $AP_BIN"
 grep -q '^CONFIG_LV_TXT_ENC_UTF8=y$' "$AP_OUT/.config" || die 'UTF-8 is disabled'
 grep -q '^# CONFIG_LV_FONT_FMT_TXT_LARGE is not set$' "$AP_OUT/.config" || die 'large LVGL font format wastes flash'
 grep -q '^CONFIG_VS_SHORT_PRESS_MAX_MS=500$' "$AP_OUT/.config" || die 'short-press limit is not 500 ms'
+# The analog capture gain is tuned against hardware, so assert the value that
+# reached .config rather than trusting the Kconfig default to have been picked
+# up: editing Kconfig without a distclean silently keeps the cached old value,
+# and the symptom (clipped audio the recognizer refuses) looks like a code bug.
+grep -q '^CONFIG_VS_AUDIO_MIC_GAIN=6$' "$AP_OUT/.config" || die "MIC gain is not 6: $(grep '^CONFIG_VS_AUDIO_MIC_GAIN=' "$AP_OUT/.config")"
+# The playback ring must hold a whole spoken answer.  Anything smaller lets a
+# blocked write stop the TTS socket being read, which stalls the server and
+# truncates the reply mid-sentence -- observed at the previous 128 KiB.
+grep -q '^CONFIG_VS_AUDIO_PLAYBACK_RING_BYTES=655360$' "$AP_OUT/.config" || die "playback ring is not 655360: $(grep '^CONFIG_VS_AUDIO_PLAYBACK_RING_BYTES=' "$AP_OUT/.config")"
+# Playback must not start on the first chunk.  Synthesis arrives slower than
+# real time, so a player with no pre-buffer runs the ring dry between bursts and
+# the reply comes out chopped.
+grep -q '^CONFIG_VS_AUDIO_PLAYBACK_PREBUFFER_MS=1000$' "$AP_OUT/.config" || die "playback pre-buffer is not 1000 ms: $(grep '^CONFIG_VS_AUDIO_PLAYBACK_PREBUFFER_MS=' "$AP_OUT/.config")"
+grep -q 'vs_settings_save_volume' "$AP_OUT/System.map" || die 'volume persistence is not linked'
+# The network buffer pool feeds TCP read-ahead, and a 16 KiB TLS record needs
+# eleven of these buffers before mbedtls can decrypt any of it.  At the stock 32
+# the receive window closed and reopened repeatedly, which arrived as burst-mode
+# audio and gaps in playback.  It cannot move to PSRAM: iob_initialize() runs
+# before the CP powers PSRAM up.
+grep -q '^CONFIG_IOB_NBUFFERS=40$' "$AP_OUT/.config" || die "IOB pool is not 40: $(grep '^CONFIG_IOB_NBUFFERS=' "$AP_OUT/.config")"
 for app in KVDB_TOOL AGENT_CAMERA AUDIO_TEST CONV CAMERA_PREVIEW CTRLC_TEST \
            HELLO_SCREEN PERIPH_SELFTEST SOCIAL_CUE SDNAND_INIT WEB_TOOL; do
   grep -q "^CONFIG_LVX_USE_DEMO_CONTEST2026_264_${app}=y$" \
@@ -68,8 +88,11 @@ done
 grep -q 'velasight_font_16_ui' "$AP_OUT/System.map" || die 'UI font is not linked'
 grep -q '^ \* Bpp: 1$' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not 1bpp'
 grep -q -- '--no-prefilter' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not the pixel-font build'
-grep -q 'voice_vad_process' "$AP_OUT/System.map" || die 'VAD is not linked'
 grep -q 'vs_voice_start' "$AP_OUT/System.map" || die 'idle voice assistant worker is not linked'
+grep -q 'vs_audio_volume_set' "$AP_OUT/System.map" || die 'volume page control is not linked'
+if grep -q 'voice_vad_process' "$AP_OUT/System.map"; then
+  die 'VAD is linked (it was removed; the round ends on the keys, the listening window and the recognizer)'
+fi
 grep -q 'llm_chat_vision_raw' "$AP_OUT/System.map" || die 'vision model call is not linked'
 if grep -qw 'velaclaw_ask' "$AP_OUT/System.map"; then
   die 'velaclaw_ask is linked (decision was to bypass it, see vs_voice.c)'

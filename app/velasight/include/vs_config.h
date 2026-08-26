@@ -14,6 +14,11 @@ struct vs_wifi_config_s
   uint8_t ap_channel;
 };
 
-int vs_config_load_wifi(struct vs_wifi_config_s *config);
+/* Load Wi-Fi settings.  When generation is non-NULL it receives the
+ * generation of the durable provisioning record, or 0 when first-boot
+ * Kconfig defaults were used. */
+
+int vs_config_load_wifi(struct vs_wifi_config_s *config,
+                        uint32_t *generation);
 
 #endif

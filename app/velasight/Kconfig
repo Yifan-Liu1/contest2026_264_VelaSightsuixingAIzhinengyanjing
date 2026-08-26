@@ -8,6 +8,7 @@ config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	depends on NET_IPv4 && NET_UDP && NETUTILS_DHCPC
 	depends on ARCH_CHIP_BK7258 && BK7258_WIFI
 	depends on BK7258_SDIO && BK7258_SDNAND_AUTOMOUNT && FS_FAT
+	depends on BK7258_AUDIO && BK7258_AUDIO_CAPTURE
 	depends on EXAMPLES_AI_AGENT_VELA
 	select GRAPHICS_LVGL
 	select WIRELESS_WAPI
@@ -20,6 +21,13 @@ config LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 		against packages/ai_agent's LLM proxy, router and Volcengine voice
 		backends (see vs_voice.c's header comment for why it drives those
 		one layer below ai_agent's own voice_channel.c state machine).
+
+		Depends on BK7258_AUDIO and BK7258_AUDIO_CAPTURE because the idle
+		assistant records and speaks through /dev/audio/pcm0c and
+		/dev/audio/pcm0p directly (vs_audio.c).  ai_agent's own capture and
+		playback backends need either the Allwinner ALSA tree or the media
+		framework, and this board configures neither, so without these the
+		voice pages could only fail at runtime.
 
 config VS_INPUT_POLL_MS
 	int "VelaSight input polling interval (ms)"
@@ -98,10 +106,27 @@ config VS_VOICE_RESP_MAX_BYTES
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 
 config VS_VOICE_RECORD_MAX_MS
-	int "VelaSight idle assistant maximum recording (ms)"
-	default 30000
+	int "VelaSight idle assistant listening window (ms)"
+	default 15000
 	range 3000 60000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long one utterance is recorded when the user does not end it
+		with the confirm key.
+
+		This is the only thing that ends an utterance automatically.  The
+		assistant deliberately has no local speech detector: an energy
+		threshold calibrated for a different microphone sat above normal
+		speech at this board's gain and silently discarded whole
+		recordings, so ending a round is left to the confirm key, the back
+		key, and the recognizer's own verdict on whether there was
+		anything to transcribe.
+
+		It therefore serves two purposes: a bound on how long a user who
+		walked away is listened to before the conversation is written to
+		chat history, and a safety net if a key event is ever missed.
+		Because a truncated question is worse than a short wait, prefer
+		raising this over lowering it.
 
 config VS_VOICE_STACKSIZE
 	int "VelaSight idle assistant worker thread stack (bytes)"
@@ -131,3 +156,272 @@ config VS_HISTORY_MAX_RECORDS
 	---help---
 		Bounds both the in-memory index array and how many records
 		vs_history_open() will load from SD-NAND at startup.
+
+config VS_VOICE_MAX_TURNS
+	int "VelaSight idle assistant maximum turns per conversation"
+	default 20
+	range 2 100
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Local cap on how many question/answer turns one conversation can
+		retain.  Every accepted turn is kept verbatim for the final CHAT
+		record even after its replay context has been semantically compacted.
+
+config VS_VOICE_TURN_STORAGE_MAX_BYTES
+	int "VelaSight retained full-turn storage budget (bytes)"
+	default 131072
+	range 16384 1048576
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Hard aggregate heap budget for the complete UTF-8 questions and
+		answers retained until CHAT persistence.  The implementation never
+		clips a turn to fit this budget: an answer that would exceed it is
+		rejected explicitly and all earlier accepted turns are still saved.
+
+config VS_VOICE_CONTEXT_MAX_BYTES
+	int "VelaSight idle assistant conversation context budget (bytes)"
+	default 65536
+	range 8192 1048576
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Upper bound on the JSON-escaped conversation context replayed into
+		the next model request.  At the configured percentage, prior turns
+		are replaced in the prompt by a semantic summary.  Their complete
+		text remains in the separate retained-turn budget above so the final
+		CHAT history record is lossless.
+
+config VS_VOICE_CONTEXT_COMPACT_PERCENT
+	int "VelaSight idle assistant context compaction threshold (percent)"
+	default 80
+	range 50 95
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Percentage of CONFIG_VS_VOICE_CONTEXT_MAX_BYTES at which the
+		running conversation is compacted (see above).  The product
+		requirement this implements is stated in terms of the model's
+		own maximum context (mimo-v2.5 advertises a 1M-token window);
+		CONFIG_VS_VOICE_CONTEXT_MAX_BYTES is deliberately a much smaller,
+		locally-enforced budget, because this device's own conversation
+		length in one sitting never approaches a million tokens and a
+		budget sized to it would make local RAM the only limit that
+		exists in practice.  See vs_voice.c's chat-context module for the
+		full reasoning.
+config VS_AUDIO_PLAYBACK_RING_BYTES
+	int "VelaSight TTS playback staging ring (bytes)"
+	default 655360
+	range 16384 2097152
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Size of the ring vs_audio.c stages TTS audio in, taken from PSRAM
+		with the SRAM heap only as a fallback.
+
+		The DAC pipeline itself is only CONFIG_AUDIO_NUM_BUFFERS x
+		CONFIG_AUDIO_BUFFER_NUMBYTES, which is a quarter of a second at
+		16 kHz.  Writing the WebSocket's PCM straight into that would pace
+		the network at the speed of the speaker.
+
+		The default is 20 seconds of 16 kHz mono audio, which is what the
+		PSRAM heap can actually spare: measured on hardware it has about
+		900 KiB free at the point playback opens, so asking for the 40
+		seconds that would hold the longest possible answer only produced
+		a halving retry and a warning on every reply.
+
+		A ring that fills is no longer dangerous, only slow.  Since the
+		client answers the server's keep-alive pings, a blocked write
+		merely applies backpressure and the reply arrives at the speed it
+		is spoken.  What the size still buys is headroom against the
+		opposite problem: audio arriving slower than it plays, which is
+		what CONFIG_VS_AUDIO_PLAYBACK_PREBUFFER_MS addresses.
+
+config VS_AUDIO_PLAYBACK_PREBUFFER_MS
+	int "VelaSight TTS playback pre-buffer (ms)"
+	default 1000
+	range 0 10000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How much audio to accumulate before the DAC is allowed to start
+		consuming it.
+
+		The failure this prevents is the opposite of a full ring.  The TTS
+		service produces speech in bursts and slower than real time -- one
+		measured reply delivered about four seconds of audio over five and
+		a half seconds of wall clock -- so a player that starts on the
+		first chunk runs the ring dry between bursts.  The driver handles
+		that without complaining: its transmit interrupt masks itself when
+		no buffer is queued and re-arms on the next one, so an empty ring
+		is silence rather than an error, and the reply comes out audibly
+		chopped.
+
+		One second is enough for the arrival rate measured here.  With
+		audio arriving at a fraction r of real time, a reply of T seconds
+		needs T(1-r)/r of head start to play without a gap; the measured
+		r was 0.73 over a 2.2 second reply, which needs 0.8 s.
+
+		It was 3000, and that was worse than useless: a whole reply is
+		often smaller than three seconds of audio, so the level never
+		reached the mark and only vs_audio_playback_drain() could release
+		the gate -- which happens after the TTS stream ends, five seconds
+		later than the audio was actually in hand.  A timeout now releases
+		the gate as well, so a short reply no longer waits for audio that
+		is never coming.
+
+		Zero starts playback on the first chunk.
+
+		This is the starting value and the floor. The actual watermark
+		adapts at runtime between this and
+		CONFIG_VS_AUDIO_PLAYBACK_PREBUFFER_MAX_MS.
+
+config VS_AUDIO_PLAYBACK_PREBUFFER_MAX_MS
+	int "VelaSight TTS playback pre-buffer ceiling (ms)"
+	default 4000
+	range 0 10000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Upper bound on the adaptive playback watermark.
+
+		The watermark doubles after any reply that starved and decays
+		slowly after replies that did not, because the arrival rate is a
+		property of the service and the link rather than of one sentence --
+		measured on this hardware it swings between 0.60x and 1.93x real
+		time, so no single value is right for both.  It is remembered
+		across replies; relearning it per sentence would starve the first
+		one every time.
+
+		The ceiling exists because the watermark is also the delay before
+		a reply starts speaking.  Beyond a few seconds it is better to
+		accept a gap than to make the user wait, and a link that cannot
+		sustain speech at four seconds of head start has a problem this
+		cannot paper over.
+
+config VS_VOICE_TTS_SPEAKER
+	string "VelaSight TTS voice (Volcengine voice_type)"
+	default "zh_female_wanwanxiaohe_moon_bigtts"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Volcengine voice_type used for spoken replies, seeded into the
+		agent config store next to the ASR cluster.  Leave empty to keep
+		packages/ai_agent's own default, which is the male voice
+		zh_male_beijingxiaoye_emo_v2_mars_bigtts.
+
+		Voices are entitlements, not just identifiers: an account that has
+		not activated the one named here is refused, and the refusal shows
+		up as "[volc_tts_ws] server error" in the log rather than as a
+		configuration complaint.  Check the console for the voices your
+		app_id actually has, and put one of those here.
+
+		Known-good fallback if this voice is not activated:
+		zh_male_beijingxiaoye_emo_v2_mars_bigtts
+
+config VS_AUDIO_CAPTURE_SETTLE_BUFFERS
+	int "VelaSight capture buffers discarded while the ADC settles"
+	default 2
+	range 0 32
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Upper bound on how many driver buffers may be dropped at the start
+		of a recording because the analog front end is still settling.
+
+		This is a ceiling, not a quota.  Only buffers that are saturated
+		almost sample for sample are actually dropped, and the first
+		buffer that is not ends the phase, so an utterance keeps its
+		opening syllables even when the user starts talking immediately.
+
+		Kept deliberately low.  The second reason this used to exist -- a
+		local VAD reading full-scale settling noise as speech -- is gone
+		along with the VAD, and the remaining risk runs the other way:
+		every buffer dropped here is audio the recognizer never sees, and
+		the recognizer handles a short burst of noise far better than it
+		handles a missing first word.  At the default 2048-byte buffer this
+		bounds the loss at about 128 ms of 16 kHz mono audio.
+
+config VS_VOICE_ASR_CLUSTER
+	string "Volcengine streaming ASR cluster"
+	default "volcengine_streaming_common"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Cluster name sent in the streaming ASR request, written into
+		ai_agent's config store next to the provisioned app_id and token.
+
+		The service turns this into the entitlement it checks.
+		"volcengine_streaming_common" maps to resource id
+		volc.streamingasr.common.cn, and an app that has not been granted
+		that resource is refused with HTTP 403 and backend_code 45000030
+		("requested resource not granted") -- note that this is not an
+		authentication failure, so the app_id and token can be perfectly
+		valid and the request still be rejected.
+
+		Change this only to match what the Volcengine console shows as
+		enabled for the app whose credentials were provisioned.  Switching
+		to the large-model streaming ASR service is not just a cluster
+		rename: it uses a different endpoint and request protocol than
+		AGENT_DOUBAO_ASR_WS_PATH implements.
+
+config VS_AUDIO_MIC_GAIN
+	int "VelaSight microphone analog pre-amplifier gain"
+	default 6
+	range 0 15
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Analog MIC gain sent to the capture driver before it configures the
+		ADC (its private BK7258_AUDIOIOC_SET_CAPGAIN ioctl).
+
+		This stage sits ahead of the ADC, so it is the only gain that
+		improves the signal-to-noise ratio -- and the only one that can
+		clip irrecoverably.  Tune it against the "capture level" line the
+		voice worker logs after every utterance, which reports peak and RMS
+		on the samples' own 0..32767 scale.
+
+		Measured on this board, all against that full scale:
+
+		  gain 0, empty quiet room ............ rms 28
+		  gain 3, several people talking,
+		          clearly audible to a person . rms 55, peak 541
+		  gain 7, near-field speech ........... rms 2671, peak 32767 (clipped)
+
+		The middle row is the case that matters and the reason the default
+		is not lower: conversation a person hears without effort sat barely
+		above the empty room's noise floor, and the recognizer answered
+		"no valid speech" every time.  Far-field pickup simply needs much
+		more gain than near-field does.
+
+		The default trades against the third row.  It is below the setting
+		that clipped on close speech while leaving room for the far-field
+		case to reach a usable level.  If peak reaches 32767, lower this;
+		if the recognizer still finds nothing while peak stays in the low
+		thousands, raise it.  Prefer this over the digital gain below.
+
+config VS_AUDIO_ADC_GAIN
+	int "VelaSight ADC digital gain"
+	default 45
+	range 0 63
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Digital gain applied after the ADC, where 45 (0x2d) is 0 dB and the
+		range spans roughly -45 dB to +18 dB in 1 dB steps.
+
+		Digital gain cannot improve the signal-to-noise ratio -- it
+		amplifies the noise floor with the signal -- so raise
+		VS_AUDIO_MIC_GAIN first and use this only for the last few dB once
+		the analog stage is as high as it can go without clipping.
+
+config VS_AUDIO_CAPTURE_RING_BYTES
+	int "VelaSight capture staging ring (bytes)"
+	default 131072
+	range 16384 1048576
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Size of the ring a reader thread stages captured audio in, taken
+		from PSRAM with the SRAM heap only as a fallback.
+
+		The consumer hands every chunk to the ASR service over TLS, which
+		blocks.  The driver holds only CONFIG_AUDIO_NUM_BUFFERS x
+		CONFIG_AUDIO_BUFFER_NUMBYTES -- about 256 ms at 16 kHz -- and its
+		interrupt handler discards samples once that queue is empty,
+		reporting nothing at all.  A network write that stalled longer than
+		that therefore lost speech invisibly: a measured 15 s window came
+		back holding 12.7 s of audio, and the recognizer saw chopped words.
+
+		This ring is the slack between the two, so a stall costs buffer
+		space instead of audio.  The default is four seconds of 16 kHz mono.
+		If the "capture level" log line ever reports dropped bytes, the
+		consumer fell further behind than this covers.
