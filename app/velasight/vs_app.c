@@ -1553,6 +1553,15 @@ static void vs_handle_event(struct vs_display_s *display,
                     break;
                   }
 
+                /* Voice comes up on a background task at boot; until it is
+                 * ready, show a brief hint rather than failing the start. */
+
+                if (!vs_voice_ready())
+                  {
+                    vs_set_response(runtime, VS_KEY_CONFIRM, "准备中");
+                    break;
+                  }
+
                 memset(&request, 0, sizeof(request));
                 request.ctx = VS_VOICE_CTX_RECORD;
                 snprintf(request.record_key, sizeof(request.record_key),
@@ -1611,6 +1620,12 @@ static void vs_handle_event(struct vs_display_s *display,
             if (event->key == VS_KEY_CONFIRM)
               {
                 struct vs_voice_request_s request;
+
+                if (!vs_voice_ready())
+                  {
+                    vs_set_response(runtime, VS_KEY_CONFIRM, "准备中");
+                    break;
+                  }
 
                 memset(&request, 0, sizeof(request));
                 request.ctx = VS_VOICE_CTX_PHOTO;
@@ -1850,6 +1865,21 @@ static void vs_handle_event(struct vs_display_s *display,
     }
 }
 
+/* vs_voice_open() brings up config store, LLM/ASR/TTS backends and seeds
+ * credentials -- seconds of SD-NAND and setup that nothing on the home screen
+ * needs.  Running it on this task instead of inline lets the event loop start
+ * as soon as history is loaded; readiness is published through
+ * vs_voice_ready().
+ */
+
+static int vs_voice_open_task(int argc, FAR char *argv[])
+{
+  (void)argc;
+  (void)argv;
+  vs_voice_open();
+  return 0;
+}
+
 int vs_app_run(void)
 {
   struct vs_display_s *display = NULL;
@@ -1949,7 +1979,18 @@ int vs_app_run(void)
       }
   }
 
-  vs_voice_open();
+  /* Off the boot path: the home screen is fully usable without it, and it is
+   * the single biggest thing that used to keep the UI frozen on the preparing
+   * frame.  vs_voice_ready() gates the 询问/拍照 entry points until it lands.
+   */
+
+  ret = task_create("velasight_voiceinit", SCHED_PRIORITY_DEFAULT, 8192,
+                    vs_voice_open_task, NULL);
+  if (ret < 0)
+    {
+      printf("velasight: voice init task failed (%d), opening inline\n", ret);
+      vs_voice_open();
+    }
 
   vs_render(display, &runtime);
   for (;;)

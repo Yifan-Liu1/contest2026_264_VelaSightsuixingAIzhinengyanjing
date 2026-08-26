@@ -57,7 +57,7 @@
  * re-seed of SOCIAL on the next open.
  */
 
-#define VS_HISTORY_SOCIAL_SEED_VERSION 2
+#define VS_HISTORY_SOCIAL_SEED_VERSION 3
 #define VS_HISTORY_INDEX_TMP  "INDEX.TMP"
 #define VS_HISTORY_PATH_MAX   96
 #define VS_HISTORY_SEQ_MAX    9999999u
@@ -107,22 +107,24 @@ static const struct vs_history_index_s g_social_seed[] =
   },
 };
 
-/* Normalized contents of the protocol's msgEvent-2 response object, one
- * per index entry above.  schemaVersion/kind are the local envelope;
- * every emotionDetail is from the cloud doc's fixed set.  Record 0 is a
- * TTS soak test: its text_minutes documents that "你好" should be
- * answered by counting one to thirty, which exercises long synthesis
- * without asking the model to break format.  Record 1 is an ordinary
- * pleasant conversation; record 2 carries anger turning to sadness.
+/* Each entry is exactly the interface doc's msgEvent-2 result payload: a
+ * single `response` object holding ttsMinutes, txtMinutes, audioTimeline
+ * and emotionTimeline, with the documented string types and the fixed
+ * emotionColor/emotionDetail sets.  No local envelope is added -- the
+ * social/ vs chat/ directory already carries the kind -- so a downloaded
+ * record is byte-for-byte the shape the cloud returns.  Record 0 is a TTS
+ * soak test whose text documents that "你好" is answered by counting one
+ * to thirty; record 1 is an ordinary pleasant talk; record 2 carries
+ * anger turning to sadness.
  */
 
 static const char *const g_social_seed_body[] =
 {
-  "{\"schemaVersion\":1,\"kind\":\"social\",\"ttsMinutes\":\"\",\"txtMinutes\":\"这是一条语音播报（TTS）测试记录。约定：当用户说“你好”时，助手用中文从一数到三十（一、二、三、……、三十）连续朗读，用于验证长文本语音合成与播放是否完整、连贯、无中断。\",\"audioTimeline\":[{\"sentence\":\"你好\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.96\",\"timestampBegin\":\"0.0\",\"timestampEnd\":\"0.8\"},{\"sentence\":\"一二三四五六七八九十\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestampBegin\":\"1.0\",\"timestampEnd\":\"6.5\"}],\"emotionTimeline\":[{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.95\",\"timestamp\":\"500\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestamp\":\"3500\"}]}",
+  "{\"response\":{\"ttsMinutes\":\"\",\"txtMinutes\":\"这是一条语音播报（TTS）测试记录。约定：当用户说“你好”时，助手用中文从一数到三十（一、二、三、……、三十）连续朗读，用于验证长文本语音合成与播放是否完整、连贯、无中断。\",\"audioTimeline\":[{\"sentence\":\"你好\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.96\",\"timestampBegin\":\"0.0\",\"timestampEnd\":\"0.8\"},{\"sentence\":\"一二三四五六七八九十\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestampBegin\":\"1.0\",\"timestampEnd\":\"6.5\"}],\"emotionTimeline\":[{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.95\",\"timestamp\":\"500\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestamp\":\"3500\"}]}}",
 
-  "{\"schemaVersion\":1,\"kind\":\"social\",\"ttsMinutes\":\"\",\"txtMinutes\":\"午间与同事一起吃饭，聊到最近的项目进度、周末计划和一部刚上映的电影，整体气氛轻松愉快。中途对下周的排期安排有一点疑惑，简单确认后达成一致。全程情绪平稳，以愉悦和中立为主，没有需要特别关注的片段。\",\"audioTimeline\":[{\"sentence\":\"这家店的午餐还挺不错的\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.93\",\"timestampBegin\":\"0.0\",\"timestampEnd\":\"2.4\"},{\"sentence\":\"你周末有什么安排吗\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestampBegin\":\"5.1\",\"timestampEnd\":\"7.0\"},{\"sentence\":\"我打算去看那部新上映的电影\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.92\",\"timestampBegin\":\"7.5\",\"timestampEnd\":\"10.2\"},{\"sentence\":\"下周的排期我还有点不确定\",\"emotionColor\":\"blue\",\"emotionDetail\":\"疑惑\",\"confidence\":\"0.84\",\"timestampBegin\":\"20.3\",\"timestampEnd\":\"23.0\"},{\"sentence\":\"那我们等确认了再定吧\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.88\",\"timestampBegin\":\"24.0\",\"timestampEnd\":\"26.1\"},{\"sentence\":\"好的没问题\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.94\",\"timestampBegin\":\"26.5\",\"timestampEnd\":\"27.8\"}],\"emotionTimeline\":[{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.93\",\"timestamp\":\"1200\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.89\",\"timestamp\":\"6000\"},{\"emotionColor\":\"blue\",\"emotionDetail\":\"疑惑\",\"confidence\":\"0.83\",\"timestamp\":\"21500\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.92\",\"timestamp\":\"27000\"}]}",
+  "{\"response\":{\"ttsMinutes\":\"\",\"txtMinutes\":\"午间与同事一起吃饭，聊到最近的项目进度、周末计划和一部刚上映的电影，整体气氛轻松愉快。中途对下周的排期安排有一点疑惑，简单确认后达成一致。全程情绪平稳，以愉悦和中立为主，没有需要特别关注的片段。\",\"audioTimeline\":[{\"sentence\":\"这家店的午餐还挺不错的\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.93\",\"timestampBegin\":\"0.0\",\"timestampEnd\":\"2.4\"},{\"sentence\":\"你周末有什么安排吗\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.90\",\"timestampBegin\":\"5.1\",\"timestampEnd\":\"7.0\"},{\"sentence\":\"我打算去看那部新上映的电影\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.92\",\"timestampBegin\":\"7.5\",\"timestampEnd\":\"10.2\"},{\"sentence\":\"下周的排期我还有点不确定\",\"emotionColor\":\"blue\",\"emotionDetail\":\"疑惑\",\"confidence\":\"0.84\",\"timestampBegin\":\"20.3\",\"timestampEnd\":\"23.0\"},{\"sentence\":\"那我们等确认了再定吧\",\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.88\",\"timestampBegin\":\"24.0\",\"timestampEnd\":\"26.1\"},{\"sentence\":\"好的没问题\",\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.94\",\"timestampBegin\":\"26.5\",\"timestampEnd\":\"27.8\"}],\"emotionTimeline\":[{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.93\",\"timestamp\":\"1200\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"中立\",\"confidence\":\"0.89\",\"timestamp\":\"6000\"},{\"emotionColor\":\"blue\",\"emotionDetail\":\"疑惑\",\"confidence\":\"0.83\",\"timestamp\":\"21500\"},{\"emotionColor\":\"green\",\"emotionDetail\":\"愉悦\",\"confidence\":\"0.92\",\"timestamp\":\"27000\"}]}}",
 
-  "{\"schemaVersion\":1,\"kind\":\"social\",\"ttsMinutes\":\"\",\"txtMinutes\":\"傍晚的一次对话中出现明显冲突。对方语气升高、多次表达不满与愤怒，随后情绪转为低落和伤心，交流未能达成一致，气氛紧张。建议先暂停争论，给彼此一些冷静的时间，待情绪平复后再心平气和地沟通。\",\"audioTimeline\":[{\"sentence\":\"你怎么又把这件事搞砸了\",\"emotionColor\":\"red\",\"emotionDetail\":\"生气\",\"confidence\":\"0.95\",\"timestampBegin\":\"2.0\",\"timestampEnd\":\"4.6\"},{\"sentence\":\"我真的受够了这样\",\"emotionColor\":\"red\",\"emotionDetail\":\"反感\",\"confidence\":\"0.90\",\"timestampBegin\":\"5.0\",\"timestampEnd\":\"7.3\"},{\"sentence\":\"我也不想这样其实我很难过\",\"emotionColor\":\"blue\",\"emotionDetail\":\"伤心\",\"confidence\":\"0.87\",\"timestampBegin\":\"30.2\",\"timestampEnd\":\"33.5\"}],\"emotionTimeline\":[{\"emotionColor\":\"red\",\"emotionDetail\":\"生气\",\"confidence\":\"0.94\",\"timestamp\":\"3000\"},{\"emotionColor\":\"red\",\"emotionDetail\":\"反感\",\"confidence\":\"0.89\",\"timestamp\":\"6000\"},{\"emotionColor\":\"blue\",\"emotionDetail\":\"伤心\",\"confidence\":\"0.86\",\"timestamp\":\"31500\"}]}",
+  "{\"response\":{\"ttsMinutes\":\"\",\"txtMinutes\":\"傍晚的一次对话中出现明显冲突。对方语气升高、多次表达不满与愤怒，随后情绪转为低落和伤心，交流未能达成一致，气氛紧张。建议先暂停争论，给彼此一些冷静的时间，待情绪平复后再心平气和地沟通。\",\"audioTimeline\":[{\"sentence\":\"你怎么又把这件事搞砸了\",\"emotionColor\":\"red\",\"emotionDetail\":\"生气\",\"confidence\":\"0.95\",\"timestampBegin\":\"2.0\",\"timestampEnd\":\"4.6\"},{\"sentence\":\"我真的受够了这样\",\"emotionColor\":\"red\",\"emotionDetail\":\"反感\",\"confidence\":\"0.90\",\"timestampBegin\":\"5.0\",\"timestampEnd\":\"7.3\"},{\"sentence\":\"我也不想这样其实我很难过\",\"emotionColor\":\"blue\",\"emotionDetail\":\"伤心\",\"confidence\":\"0.87\",\"timestampBegin\":\"30.2\",\"timestampEnd\":\"33.5\"}],\"emotionTimeline\":[{\"emotionColor\":\"red\",\"emotionDetail\":\"生气\",\"confidence\":\"0.94\",\"timestamp\":\"3000\"},{\"emotionColor\":\"red\",\"emotionDetail\":\"反感\",\"confidence\":\"0.89\",\"timestamp\":\"6000\"},{\"emotionColor\":\"blue\",\"emotionDetail\":\"伤心\",\"confidence\":\"0.86\",\"timestamp\":\"31500\"}]}}",
 };
 
 /****************************************************************************
@@ -553,27 +555,6 @@ static int vs_history_write_index_locked(
   return ret;
 }
 
-static int vs_history_check_body_locked(enum vs_history_kind_e kind,
-                                        const char *key)
-{
-  char path[VS_HISTORY_PATH_MAX];
-  struct stat st;
-  unsigned int seq;
-
-  if (vs_history_key_parse(key, &seq) < 0)
-    {
-      return -EBADMSG;
-    }
-
-  vs_history_body_path(kind, seq, false, path, sizeof(path));
-  if (stat(path, &st) < 0)
-    {
-      return errno == ENOENT ? -EBADMSG : -errno;
-    }
-
-  return st.st_size > 0 ? 0 : -EBADMSG;
-}
-
 static int vs_history_load_index_locked(enum vs_history_kind_e kind)
 {
   struct vs_history_index_s *entries;
@@ -638,10 +619,15 @@ static int vs_history_load_index_locked(enum vs_history_kind_e kind)
       unsigned int seq;
       int j;
 
+      /* No stat() of the body here.  On SD-NAND that was one VFAT lookup per
+       * record -- thirteen for the chat index -- on the boot path, and a
+       * missing or empty body is caught anyway when the record is opened or
+       * downloaded.  A single bad body should not fail the whole index load.
+       */
+
       if (!vs_history_parse_entry(kind, cJSON_GetArrayItem(root, i),
                                   &entries[i]) ||
-          vs_history_key_parse(entries[i].record_key, &seq) < 0 ||
-          vs_history_check_body_locked(kind, entries[i].record_key) < 0)
+          vs_history_key_parse(entries[i].record_key, &seq) < 0)
         {
           free(entries);
           ret = -EBADMSG;

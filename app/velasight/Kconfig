@@ -95,8 +95,8 @@ config VS_AP_CHANNEL
 
 config VS_VOICE_PROMPT_MAX_BYTES
 	int "VelaSight idle assistant prompt budget (bytes)"
-	default 16384
-	range 2048 65536
+	default 32768
+	range 2048 131072
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 
 config VS_VOICE_RESP_MAX_BYTES
@@ -295,13 +295,20 @@ config VS_AUDIO_PLAYBACK_PREBUFFER_MAX_MS
 
 config VS_VOICE_TTS_SPEAKER
 	string "VelaSight TTS voice (Volcengine voice_type)"
-	default "zh_female_wanwanxiaohe_moon_bigtts"
+	default "zh_female_meilinvyou_emo_v2_mars_bigtts"
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		Volcengine voice_type used for spoken replies, seeded into the
-		agent config store next to the ASR cluster.  Leave empty to keep
-		packages/ai_agent's own default, which is the male voice
+		agent config store next to the ASR cluster.  The product default is
+		the female voice zh_female_meilinvyou_emo_v2_mars_bigtts, which is
+		what Volcengine's own reference client uses and which pairs with the
+		volcano_tts cluster this firmware sends.  Leave empty to fall back
+		to packages/ai_agent's compiled-in male voice,
 		zh_male_beijingxiaoye_emo_v2_mars_bigtts.
+
+		Stay within the emo_v2_mars_bigtts family: a voice from another
+		family such as *_moon_bigtts belongs to a different cluster and the
+		request, which sends cluster=volcano_tts, would be refused.
 
 		Voices are entitlements, not just identifiers: an account that has
 		not activated the one named here is refused, and the refusal shows

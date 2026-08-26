@@ -44,6 +44,14 @@ struct vs_voice_request_s
 
 void vs_voice_open(void);
 
+/* True once vs_voice_open() has finished bringing the voice subsystem up.
+ * It now runs on a background task so the UI need not wait for it at boot;
+ * callers check this before starting a request and show a "preparing" hint
+ * until it returns true.
+ */
+
+bool vs_voice_ready(void);
+
 /* Re-read the durable provisioning record and refresh the live MiMo and
  * Volcengine providers.  When a conversation is active the request is
  * coalesced and applied after its worker finishes, before another worker may
