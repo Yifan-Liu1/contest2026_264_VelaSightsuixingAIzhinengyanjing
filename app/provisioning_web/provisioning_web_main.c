@@ -302,7 +302,7 @@ static int provision_selftest(void)
                   strstr(reply, "name=\"password\"") != NULL,
                   "the form carries both inputs");
 
-  ret = provision_exchange("POST /save HTTP/1.1\r\nHost: localhost\r\n"
+  ret = provision_exchange("POST / HTTP/1.1\r\nHost: localhost\r\n"
                            "Content-Type: application/x-www-form-urlencoded"
                            "\r\nContent-Length: 45\r\n\r\n"
                            "ssid=" PROV_TEST_SSID

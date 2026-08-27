@@ -72,9 +72,19 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_STATUS_SHORT_Y       44
 #define VS_STATUS_SHORT_WIDTH   156
 #define VS_STATUS_SHORT_HEIGHT  48
-#define VS_STATUS_LONG_X        16
+#define VS_STATUS_LONG_X        12
+
+/* 136 px at x=12 is the same span as the lower divider below it, so it is
+ * already known to clear the bezel; the chord is 142 px wide at y=43, the
+ * highest and therefore narrowest row this box occupies.  The extra 8 px over
+ * the original 128 exist so a line of eight full-width CJK glyphs (16.0 px
+ * each in velasight_font_16_ui) is comfortably inside the box rather than
+ * exactly equal to it.  Text is centred, so wider changes nothing for the
+ * single-line values that also use this layout.
+ */
+
 #define VS_STATUS_LONG_Y        43
-#define VS_STATUS_LONG_WIDTH    128
+#define VS_STATUS_LONG_WIDTH    136
 #define VS_STATUS_LONG_HEIGHT   61
 
 struct vs_panel_s

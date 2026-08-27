@@ -39,8 +39,11 @@ PC输入
 
 - OpenVela AP开发目录：`contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/chips/bk7258/`。
 - OpenVela board配置：`contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/boards/bk7258/bk7258-ap/`。
-- CP可复现覆盖的权威副本：`contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/external/bk_avdk_smp/`。
-- CP实际构建树：`bk_avdk_smp/`。CP改动必须先落权威副本，再按该目录`README.md`同步到构建树并逐字节检查。
+- CP完整文件 overlay：`contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/external/bk_avdk_smp/`。
+- CP实际构建树：`bk_avdk_smp/`。CP改动先在真实仓实现和测试，再把完整最终文件按同一
+  相对路径加入 overlay；从比赛仓根按 [`external/README.md`](../../external/README.md)
+  执行 `./external/prepare.sh install` 安装、`./external/prepare.sh check` 只读验证，
+  不再手工同步或维护嵌套 README 文件表。
 - `bk_idk`、`bk_solution_ai`、`vendor_beken`和网页文档仅作为参考，不是BK7258 OpenVela正式开发目录。
 
 ### 2.2 本轮范围
@@ -574,9 +577,9 @@ ready门禁新增：MB_UART RX已能整包复制并调用NuttX worker，TX/STATE
 
 建议在公开结构上编译期断言：message 16字节、header offset 0、payload地址offset 4、length offset 8、flags offset 10、CRC offset 11。
 
-### 10.2 CP覆盖
+### 10.2 CP完整文件 overlay
 
-| 权威副本目标 | 修改 |
+| CP overlay 完整目标文件 | 修改 |
 | --- | --- |
 | `external/bk_avdk_smp/cp/middleware/driver/common/driver.c`或新增bridge文件 | MB_UART0统一双向bridge、RAW/LOG输出、TX ring和统计 |
 | `external/bk_avdk_smp/cp/components/bk_cli/shell_task.c` | CP_CLI/AP_CONSOLE输入owner状态机和退出转义 |
@@ -586,7 +589,11 @@ ready门禁新增：MB_UART RX已能整包复制并调用NuttX worker，TX/STATE
 | `external/bk_avdk_smp/cp/middleware/driver/mailbox/mbox0_adapter.c` | 以command/ACK专用稳定slot替换无所有权的双slot轮转，直到协议事件证明对端已复制后才复用 |
 | CP CMake源列表 | 仅在新增独立bridge源时修改 |
 
-比赛仓当前external镜像尚未包含完整CP源码树。实施前要把所有实际修改文件加入权威覆盖目录并更新`external/bk_avdk_smp/README.md`的同步表和命令，不能只保留一个`driver.c`覆盖而遗漏shell/mb_uart改动。
+`external/bk_avdk_smp/` 不是完整仓库副本，而是按目标路径组织的受管完整文件集合。
+实施时必须把所有实际修改文件以完整最终内容加入对应相对路径；若 shell、MB-UART、
+bridge 或构建清单有改动，均不能遗漏。安装和验证只使用
+`./external/prepare.sh install` / `./external/prepare.sh check`，详细规则见
+[`external/README.md`](../../external/README.md)。
 
 ## 11. 分阶段实施
 
@@ -638,7 +645,8 @@ ready门禁新增：MB_UART RX已能整包复制并调用NuttX worker，TX/STATE
 - OpenVela AP `-Werror`构建通过；最终SMP `all-app.bin`完整构建通过。
 - map中SWAP地址、大小、NOLOAD和AP heap边界正确；AP TX/RX指针分别固定为`0x2809fd00/0x2809fc00`。
 - GPIO0/1没有UART1 pinmux，二进制无物理UART1 console初始化。
-- CP覆盖副本与`bk_avdk_smp`目标文件`cmp -s`一致。
+- 从比赛仓根执行 `./external/prepare.sh check`，确认所有受管 CP 完整目标文件与
+  `external/bk_avdk_smp/` 一致；单文件 `cmp` 只可作为附加诊断，不是同步协议。
 - 静态扫描不存在ISR内sleep、无界semaphore wait、printf或直接阻塞UART0输出。
 
 ### 12.2 功能
@@ -689,7 +697,7 @@ cp>
 4. **panic日志限制**：MB_UART依赖中断，不能冒充真正polling UART。验收只要求正常调度和可屏蔽短临界区下工作，不承诺hard-fault关中断后的完整日志。
 5. **SMP并发**：当前AP为单核时可用local IRQ lock；正式启用CPU2前，transport和ring必须切换为NuttX SMP-safe spinlock并明确CPU1 owner或跨核代理。
 6. **cache**：首版SWAP non-cacheable。任何启cache改动必须两端同时验证，不能只加一个DMB就宣称安全。
-7. **CP改动维护成本**：完整输入owner必须修改shell路径，而不是只改`driver.c`。这些文件必须纳入external覆盖和构建说明，否则下一次清理构建会丢失功能。
+7. **CP改动维护成本**：完整输入owner必须修改shell路径，而不是只改`driver.c`。每个实际修改文件都必须以完整最终内容纳入`external/bk_avdk_smp/`并通过`external/prepare.sh check`，否则下一次清理构建会丢失功能。
 
 ## 14. 参考源码索引
 

@@ -225,7 +225,16 @@ struct vs_ui_snapshot_s
   char content_body[VS_TEXT_LONG];
   char content_meta[VS_TEXT_SHORT];
   char status_title[VS_TEXT_SHORT];
-  char status_value[VS_TEXT_SHORT];
+
+  /* The right screen's centre text.  Sized for more than one line because
+   * some pages put an explanatory line under the first one -- the SoftAP page
+   * shows the hotspot name and then how to reset its password, which alone is
+   * longer than VS_TEXT_SHORT once encoded as UTF-8.  vs_render_status()
+   * already stages this through a VS_TEXT_LONG buffer and switches to a taller
+   * layout past twelve characters, so a value that wraps is a supported case.
+   */
+
+  char status_value[VS_TEXT_LONG];
   char status_meta[VS_TEXT_SHORT];
 };
 

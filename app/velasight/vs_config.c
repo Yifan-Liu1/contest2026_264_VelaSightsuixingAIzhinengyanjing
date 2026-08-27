@@ -9,6 +9,7 @@
 
 #include "velasight_provisioning.h"
 #include "include/vs_config.h"
+#include "include/vs_settings.h"
 
 static int vs_config_wait_for_store(void)
 {
@@ -112,5 +113,41 @@ int vs_config_load_wifi(struct vs_wifi_config_s *config,
   snprintf(config->ap_password, sizeof(config->ap_password), "%s",
            CONFIG_VS_AP_PASSWORD);
   config->ap_channel = CONFIG_VS_AP_CHANNEL;
+
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+  /* The one read that makes the SoftAP passphrase survive a reboot.  It lands
+   * in the caller's config, which vs_network_open() keeps for the life of the
+   * process, so entering AP mode later touches no storage at all.
+   *
+   * The Kconfig value above is still written first and deliberately not
+   * skipped: it is what the AP falls back to if this record is absent on a
+   * build where generation somehow does not happen, and leaving the field
+   * empty would silently turn the hotspot into an open network.
+   *
+   * Guarded by the option so a build without it does no extra I/O here.
+   */
+
+  {
+    char stored[sizeof(config->ap_password)];
+    int ret = vs_settings_load_ap_password(stored, sizeof(stored));
+
+    if (ret == 0)
+      {
+        snprintf(config->ap_password, sizeof(config->ap_password), "%s",
+                 stored);
+        config->ap_password_random = true;
+      }
+    else if (ret != -ENOENT)
+      {
+        /* Not fatal, and not silent: the next AP entry will draw a fresh
+         * passphrase and overwrite the bad record, but a card that keeps
+         * producing this is worth seeing in the boot log.
+         */
+
+        printf("velasight: stored AP password rejected (%d)\n", ret);
+      }
+  }
+#endif
+
   return 0;
 }

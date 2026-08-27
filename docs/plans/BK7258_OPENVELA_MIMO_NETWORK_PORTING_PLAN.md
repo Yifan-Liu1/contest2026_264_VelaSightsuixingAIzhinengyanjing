@@ -8,9 +8,16 @@ contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/
 └── boards/bk7258/bk7258-ap/
 ```
 
-对公共仓（`packages/ai_agent`、`packages/demos/mimo` 等）的修改，本机通过
-`board/beken/boards/bk7258/bk7258-ap/ai_agent/apply.sh` 的 patch 机制落地，
-最终需按 `README.md` 第五节以 PR 提交到 `dev-ai-contest-2026` 分支。
+对公共仓的修改必须先在对应真实仓中实现和测试，再把每个完整最终文件按相同相对路径
+放入比赛仓的完整文件 overlay。例如 `packages/ai_agent/<path>` 对应
+`external/packages/ai_agent/<path>`；`apps`、`nuttx` 的修改分别进入对应的 external
+子树，由 `external/prepare.sh install` 安装、`check` 只读验证。当前四棵 overlay
+未覆盖 `packages/demos/mimo`；若未来确需修改该仓，必须先把该目标仓正式纳入统一
+manifest/overlay，而不能恢复旧的差分应用旁路。所有公共仓修复最终仍需按
+`README.md` 第五节以 PR 提交到 `dev-ai-contest-2026` 分支。
+
+完整流程见 `external/README.md`；四仓固定基线和构建镜像见
+`external/manifest.tsv`。
 
 构建、打包、烧录与提交规则继续遵守：
 
@@ -152,27 +159,21 @@ contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/
 
 ## 4. 实施步骤
 
-构建/烧录总流程（各阶段共用，详见 `docs/固件构建步骤.md`，config 换成 `ai_agent`）：
+构建/烧录总流程（各阶段共用，详见 `docs/固件构建步骤.md`）：
 
 ```bash
-# 1) 应用 board patch（含本方案新增 patch）
-cd /home/mi/vela_competition/contest
-sh contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/boards/bk7258/bk7258-ap/ai_agent/apply.sh
-
-# 2) 构建 AP（改过 defconfig 先 distclean）
-./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8
-# 产物: cmake_out/bk7258-ap_ai_agent/nuttx.bin
-
-# 3) 打包 + 烧录（照 docs/固件构建步骤.md §3-§5 与 autoflash.sh）
-cp cmake_out/bk7258-ap_ai_agent/nuttx.bin /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
-cd /home/mi/vela_competition/bk_avdk_smp
-podman run --rm --userns=keep-id -v "$PWD:/armino" -w /armino \
-  localhost/bekencorp/armino-idk:1.5 \
-  make -C projects/app_ab bk7258 SDK_DIR=/armino \
-  EXTERNAL_AP_BIN=/armino/build/openvela-ap.bin
 cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
-./autoflash.sh -b 1500000
+
+# 安装四棵完整文件 overlay 后构建 ai_agent、打包 all-app.bin
+./build_and_flash.sh --prepare-overlay
+
+# 需要实板烧录时使用同一入口
+./build_and_flash.sh --prepare-overlay --flash -p /dev/ttyUSB0 -n 0
 ```
+
+不带 `--prepare-overlay` 时统一入口只读执行 `external/prepare.sh check`，不会修改目标仓。
+手工高级构建仅用于故障诊断，必须先执行 `./external/prepare.sh check`；所有 AP 注入仍走
+`EXTERNAL_AP_BIN`，不手工覆盖 packager 输入。
 
 ### 阶段 M0：SNTP 可信时间（实施并实机验收）
 
@@ -206,8 +207,10 @@ date                           # 期望: 真实日期（非 1970）
 ```
 
 **M0.3 自动化**：`network_wifi_reconnect()`（`packages/ai_agent/src/infra/network_manager.c:872-891`
-非 RPMSG 变体）在 `renew <dev>` 成功后追加 `ntpcstart`（`system()` 调用即可）。
-以 `board/.../ai_agent/` 下新 patch `0002-*.patch` 落地，随 apply.sh 应用。
+非 RPMSG 变体）在 `renew <dev>` 成功后追加 `ntpcstart`（`system()` 调用即可）。先在真实
+`packages_ai_agent` 仓实现和测试，再把完整最终文件复制到
+`external/packages/ai_agent/src/infra/network_manager.c`，由 `external/prepare.sh`
+安装和验证；最终仍提交上游 PR。
 
 **M0.4 替换时钟伪造**：`vela_tls.c:255-259` 的 `forcing to 2026` 改为失败保护——
 在 M1 完成前保留原逻辑，M1 合入后改为：
@@ -227,7 +230,10 @@ date                           # 期望: 真实日期（非 1970）
 
 ### 阶段 M1：CA 证书 + VERIFY_REQUIRED（实施并实机验收）
 
-**M1.1 新增证书头文件** `packages/ai_agent/src/infra/vela_tls_ca.h`（board patch 落地）：
+**M1.1 新增证书头文件** `packages/ai_agent/src/infra/vela_tls_ca.h`。先在真实公共仓
+实现和测试；交付时将完整新文件放到
+`external/packages/ai_agent/src/infra/vela_tls_ca.h`，由 `prepare.sh` 按新目标文件
+规则安装：
 
 ```c
 /* DigiCert Global Root G2 (root, trust anchor, valid until 2038-01-15)
@@ -427,8 +433,9 @@ TLS 证书校验通过（无 OPTIONAL 跳过日志）；10 次连续请求无 OO
 音频格式**（探测 404 证明不是 OpenAI 标准路径）。
 
 **M6.1 multipart/form-data 上传（ASR）**：webclient 无 multipart（3.2 核验），
-在 board patch 中新增 `multipart_body_builder`：边界生成、字段头、音频
-（16kHz/16bit/mono 的 PCM 或压缩格式）二进制段。上传大小核算：2s PCM = 64KB，
+在真实 `packages_ai_agent` 仓新增 `multipart_body_builder`：边界生成、字段头、音频
+（16kHz/16bit/mono 的 PCM 或压缩格式）二进制段。测试后将涉及的每个完整最终文件放到
+`external/packages/ai_agent/` 下同一相对路径。上传大小核算：2s PCM = 64KB，
 建议先传短样本（≤5s）。
 
 **M6.2 二进制安全接收（TTS）**：`vela_tls.c` `tls_read_response` 目前 NUL 截断
@@ -495,9 +502,11 @@ TLS 证书校验均通过。
   （README 既有告诫）。
 - 新增源文件加入 `packages/ai_agent/src/infra/` 时同步
   `packages/ai_agent/Makefile` 与 `CMakeLists.txt` 的 CSRCS。
-- board patch 命名沿用 `board/.../ai_agent/` 下 `000N-*.patch` 与 apply.sh
-  幂等机制；新文件（如 `vela_tls_ca.h`）以 patch 中 `new file mode` 落地。
-- `-Werror` 在 `ai_agent` 配置不可用（既有上游告警），保持现状。
+- 每个公共仓改动都先在真实仓实现和测试，再把完整最终文件复制到对应
+  `external/<repository>/` 子树的同一相对路径；新增文件（如 `vela_tls_ca.h`）也直接以
+  完整新文件纳入 overlay。运行 `./external/prepare.sh install` 后必须通过只读
+  `./external/prepare.sh check`，最终仍提交上游 PR。
+- 安装完整 overlay 后，`ai_agent` 已单独通过 `-Werror` 验证；标准产品构建不强制该参数。
 
 ## 8. 风险和待确认事项
 
@@ -531,4 +540,5 @@ TLS 证书校验均通过。
 - 流式输出首 token 延迟记录在案（M4 范围项）。
 - API Key/CA 持久化到 flash 并断电验证（M5 范围项）。
 - `docs/8.16基础适配门禁验收记录.md` 原三格回归通过。
-- 所有本机公共仓改动以 board patch 归档，并已按 README 第五节发起上游 PR。
+- 所有本机公共仓改动均以同路径完整目标文件纳入 external overlay、通过
+  `external/prepare.sh check`，并已按 README 第五节发起上游 PR。

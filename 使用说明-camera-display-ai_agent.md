@@ -105,7 +105,7 @@ BK7258 DevKit 上逐条敲出来的结果。
 | `agent_camera out=/mnt/ram/cap.jpg` | ✅ | `wrote 59851 bytes to /mnt/ram/cap.jpg` |
 | `agent_camera b64` | ✅ | 见第五节，取回后主机零警告解码 |
 | `agent_camera low` | ✅ | 复现 ai_agent 默认请求：`S_FMT JPEG 320x180 failed: 22` → `320x180 refused, using enumerated 480x480` → `OK` |
-| `agent_camera low strict` | ✅ | 不协商，`FAILED (-22)`——这正是未打补丁的 ai_agent 的行为 |
+| `agent_camera low strict` | ✅ | 不协商，`FAILED (-22)`——这正是固定基线中未安装 overlay 时 ai_agent 的行为 |
 | `nxcamera` | ✅ | 交互式：`input /dev/video0` → `output /mnt/ram/n.jpg 1` → `stream 480 480 30 JPEG` → `q`，产出 18567 字节 |
 | `jpeg_test` | ⬜ | 软件 M2M 编解码器自测，本配置已启用（`enc`/`show`/`cam`/`dump`/`info`） |
 
@@ -285,8 +285,9 @@ API key saved.
 
 **如果返回 401**：MiMo 的 curl 示例用的是 `api-key: <key>` 头，而 agent 发的是
 OpenAI 风格的 `Authorization: Bearer <key>`（`llm_proxy.c:344-346`）。官方同时提供
-OpenAI SDK 示例（SDK 发的就是 Bearer），所以 Bearer 应当可用；万一被拒，就是要在
-`llm_proxy.c` 加一个 `api-key` 头，属于上游补丁范畴。
+OpenAI SDK 示例（SDK 发的就是 Bearer），所以 Bearer 应当可用；万一被拒，应先在
+真实 `packages/ai_agent` 公共仓中修复 `llm_proxy.c` 并提交上游 PR；交付前将完整最终
+文件放到 `external/packages/ai_agent/src/llm/llm_proxy.c`，由 overlay 统一安装和验证。
 
 **表情识别这条链的完整形态**：`camera_preview ... jpeg` 产出 JPEG（第二节）→ base64 →
 `data:image/jpeg;base64,...` 交给 `mimo-v2.5` → 按 skill 文档
@@ -322,30 +323,32 @@ OpenAI SDK 示例（SDK 发的就是 Bearer），所以 Bearer 应当可用；�
 # 桌面单测（不需要硬件）——实测 all checks passed + test_face + test_jpeg_enc
 (cd contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/chips/bk7258/sim_tests && make)
 
-# 构建（必须走 cmake 路径）
-# nsh 只是最小启动/对照配置；最终 VelaSight 固件必须使用 ai_agent。
-./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8   # 不能加 -Werror
+# 从比赛仓根安装并只读复核四棵完整文件 overlay
+cd contest2026_264_VelaSightsuixingAIzhinengyanjing
+./external/prepare.sh install
+./external/prepare.sh check
 
-# 打包 + 一致性校验（不能省）
-cp cmake_out/bk7258-ap_ai_agent/nuttx.bin bk_avdk_smp/build/openvela-ap.bin
-(cd bk_avdk_smp && podman run --rm --userns=keep-id -v "$PWD:/armino" -w /armino \
-  localhost/bekencorp/armino-idk:1.5 make -C projects/app_ab bk7258 \
-  SDK_DIR=/armino EXTERNAL_AP_BIN=/armino/build/openvela-ap.bin)
-sha256sum cmake_out/bk7258-ap_ai_agent/nuttx.bin \
-  bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin   # 两份必须相同
+# 推荐：安装 overlay 后一键构建、打包
+./build_and_flash.sh --prepare-overlay
 
-# 烧录
+# 一键构建、打包并烧录
+./build_and_flash.sh --prepare-overlay --flash -p /dev/ttyUSB0 -n 0
+
+# 已有合格固件时的独立烧录/握手入口
 ./autoflash.sh          # 全烧，约 33-40 s
 ./autoflash.sh -A       # 只烧 AP 分区，约 20 s（只改了 AP 侧代码时用）
 ./autoflash.sh -t       # 只测握手，0.3 s
 ```
 
-改了 defconfig 必须 `rm -rf cmake_out/bk7258-ap_<config>` 再构建，否则改动不生效。
+不带 `--prepare-overlay` 时，`build_and_flash.sh` 只读执行 overlay `check`，未安装或
+不一致会停止；它还会校验 `external/manifest.tsv` 固定的 Armino 镜像 ID、通过
+`EXTERNAL_AP_BIN` 注入 AP、比较三份 AP 二进制，并在成功或失败退出时恢复最小 CP
+config。改了 defconfig 必须执行 CMake `distclean` 后再构建，否则改动可能不生效。
 烧录波特率别往上加：2000000 不比 1500000 快（瓶颈是 flash 编程），3000000 会在擦除完成
 之后失败并把板子留成空的。
 
-`apply.sh` 实测幂等：重复执行报 `already applied`，`--revert` 报 `reverted`，再执行报
-`applied`。
+`external/prepare.sh install` 会在全量预检通过后安装，随后自动复核；显式的 `check`
+始终只读，可用于确认所有受管完整目标文件与 overlay 逐字节一致。
 
 ## 配置持久化：NAND 配网文件（KVDB 已废弃）
 
@@ -484,32 +487,37 @@ for i in $(seq 1 40); do printf 'ap_console open\r\n' > /dev/ttyUSB0; sleep 0.3;
 
 ### 10.12 ai_agent 修复：`-Werror` 已可用，首次 `ask` 假超时已修（2026-08-17）
 
-新增三个存档补丁，`apply.sh` 自动纳入（按 `[0-9]*.patch` 遍历）：
+当时确认的三个缺陷现由 `external/packages/ai_agent` 下的完整目标文件交付，不再保留
+编号补丁或单独应用脚本：
 
-| 补丁 | 修的问题 |
+| 完整 overlay 文件 | 修的问题 |
 |---|---|
-| `0003-fix-format-truncation-and-uint32-format-specifier` | `agent_loop.c:665` 把最长 511 字节消息塞进 512 缓冲（`-Wformat-truncation`）；截断落在消息中间即**切断 UTF-8 序列**，把非法字节发到对话通道。改为按 `sizeof(remind_msg) + 64` 分配。另修 `skill_loader.c:448` 用 `%x` 打 `uint32_t`，改 `PRIx32` |
-| `0004-llm-watchdog-use-monotonic-clock` | **首次 `ask` 假超时的根因**：看门狗用 `gettimeofday()`，而 `vela_tls.c` 首次握手把时钟从 1970 推到 2026，跨越跳变的调用被算成约 2.7e9 ms 判超时。新增 `agent_elapsed_mark()` 取 `CLOCK_MONOTONIC`（失败才回退），`calc_elapsed_ms()` 及其六个调用点不动 |
-| `0005-allow-overriding-llm-timeout` | `AGENT_LLM_TIMEOUT_SEC` 原为无条件 `#define`，`agent_secrets.h` 无法调大。**该改动此前存在于工作树但未归档**，导致全新 checkout + `apply.sh` 复现不出已烧录的那棵树 |
+| `src/core/agent_loop.c`、`src/tools/skill_loader.c` | `agent_loop.c:665` 把最长 511 字节消息塞进 512 缓冲（`-Wformat-truncation`）；截断落在消息中间即**切断 UTF-8 序列**，把非法字节发到对话通道。改为按 `sizeof(remind_msg) + 64` 分配。另修 `skill_loader.c:448` 用 `%x` 打 `uint32_t`，改 `PRIx32` |
+| `src/core/agent_loop.c` | **首次 `ask` 假超时的根因**：看门狗用 `gettimeofday()`，而 `vela_tls.c` 首次握手把时钟从 1970 推到 2026，跨越跳变的调用被算成约 2.7e9 ms 判超时。新增 `agent_elapsed_mark()` 取 `CLOCK_MONOTONIC`（失败才回退），`calc_elapsed_ms()` 及其六个调用点不动 |
+| `include/agent_config.h` | `AGENT_LLM_TIMEOUT_SEC` 原为无条件 `#define`，`agent_secrets.h` 无法调大。该改动此前存在于工作树但未进入旧交付归档，导致全新 checkout 复现不出已烧录的那棵树 |
 
 **两条旧结论作废**：
 
 1. 第二节「`configs/ai_agent` 不能加 `-Werror`」不成立 —— 实测 `-e -Werror` 通过，产物 828736 B。
-2. 5.5.2「先跑 net_test 校准时钟再 ask」不再需要（补丁 0004）。缓存那条仍有效：同一问题会命中缓存（含失败文案），重测要换问题。
+2. 5.5.2「先跑 net_test 校准时钟再 ask」不再需要；`src/core/agent_loop.c` 已改用 monotonic 计时。缓存那条仍有效：同一问题会命中缓存（含失败文案），重测要换问题。
 
-补丁集完整性往返检查（判断归档有没有漏的唯一办法）：
+完整文件 overlay 的安装与只读复核：
 
 ```bash
-sh .../bk7258-ap/ai_agent/apply.sh --revert
-git -C packages/ai_agent diff --stat -- src include     # 期望：空
-sh .../bk7258-ap/ai_agent/apply.sh                     # 五个全部 applied
+cd contest2026_264_VelaSightsuixingAIzhinengyanjing
+./external/prepare.sh install
+./external/prepare.sh check
 ```
 
-实测 revert 后 `git diff` 为空、re-apply 后五个全部应用。**补丁 0005 的存在正是因为此前这步不干净**；以后改了 `packages/ai_agent` 都要跑一次这个往返。
+`check` 会逐字节验证所有受管目标文件。以后修改 `packages/ai_agent` 时，应先在真实公共仓
+实现和测试，再将每个完整最终文件复制到 `external/packages/ai_agent/` 下的同一相对
+路径，并继续向上游提交 PR。
 
 上板回归：`ai_agent` 正常启动（`Tools JSON loaded: 10363 bytes`、`All network services started!`）、`net_test` → `Handshake OK: TLSv1.2 / TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256` → `SUCCESS! HTTP Status: 200`、`heap_info` → `arena=6447864 free=6053816 used=394048`；`/dev/video0` 仍为软件编码器。
 
-**未验证**：补丁 0004 的直接效果需可用 LLM key 才能端到端确认，本次无 key，仅验证编译与运行期无回归。拿到 key 后请**直接 `ask`、不要先跑 net_test**；若仍报超时说明 0004 没覆盖全部计时路径。
+**未验证**：monotonic 看门狗修复的直接效果需可用 LLM key 才能端到端确认，本次无 key，
+仅验证编译与运行期无回归。拿到 key 后请**直接 `ask`、不要先跑 net_test**；若仍报超时，
+说明 `external/packages/ai_agent/src/core/agent_loop.c` 没覆盖全部计时路径。
 
 ### 10.13 命令逐条复测（2026-08-18，收口为软件编码器之后）
 
@@ -523,7 +531,7 @@ sh .../bk7258-ap/ai_agent/apply.sh                     # 五个全部 applied
 | `agent_camera` | ✅ | auto 选 480x480，`bytesused=46016`，structure 五项全 yes |
 | `agent_camera 640x480` | ✅ | `bytesused=31901`，五项全 yes |
 | `agent_camera out=/mnt/ram/cap.jpg` | ✅ | `wrote 45716 bytes`，`ls -l /mnt/ram` 一致 |
-| `agent_camera low` | ✅ | `320x180 refused, using enumerated 480x480` → OK（补丁 0001 生效） |
+| `agent_camera low` | ✅ | `320x180 refused, using enumerated 480x480` → OK（`external/packages/ai_agent/src/tools/tool_camera.c` overlay 生效） |
 | `agent_camera low strict` | ✅ | `FAILED (-22)`，符合预期 |
 | `agent_camera 640x480 n=8` | ✅ | 8/8，`set_buf_live=8 armed=1` |
 | `agent_camera 640x480 n=10` | ✅ | 10/10，`measured=1.26 fps`，`sampler_skipped=124` |

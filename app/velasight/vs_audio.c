@@ -16,7 +16,8 @@
  * Elapsed-time budgets here use CLOCK_MONOTONIC on purpose.  The realtime
  * clock on this board jumps from 1970 to the present the first time TLS
  * completes a handshake, which is the same trap that made the agent's LLM
- * watchdog fire spuriously (see the board's ai_agent patch 0004).  Only the
+ * watchdog fire spuriously; the corresponding complete target file is
+ * managed at `external/packages/ai_agent/src/core/agent_loop.c`.  Only the
  * absolute deadlines handed to mq_timedreceive() are CLOCK_REALTIME, because
  * that is the clock POSIX defines for them; a jump there merely shortens one
  * poll inside a loop.

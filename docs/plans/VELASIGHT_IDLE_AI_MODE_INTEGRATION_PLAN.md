@@ -173,12 +173,13 @@ voice_channel_speak(answer) -> volc_tts 流式 -> audio_playback
 cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 git status --short
 git log -1 --oneline
-git -C /home/mi/vela_competition/contest/apps/packages/ai_agent log -1 --oneline
+git -C /home/mi/vela_competition/contest/packages/ai_agent log -1 --oneline
 ```
 
-若 `packages/ai_agent` 有本地修改，必须说明修改是以 patch 形式携带
-（`aa42c2d feat(ai_agent): carry the local agent fixes as patches`）还是直接改动，
-否则不得把产物称为可复现构建。
+若 `packages/ai_agent` 有产品所需的本地修改，必须先在真实目标仓实现和测试，再把
+完整最终文件复制到比赛仓 `external/packages/ai_agent/` 的相同相对路径，并通过
+`external/prepare.sh install` 与只读 `check`。不得以未受管的直接修改或旧 patch
+作为可复现构建输入。
 
 ## 2. 已取证的可复用能力
 

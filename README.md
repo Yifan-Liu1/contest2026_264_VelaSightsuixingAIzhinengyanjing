@@ -31,7 +31,14 @@ Camera/Audio 基础门禁，以及板载 SD-NAND 的可写 MMCSD/VFAT 链路。S
 ```text
 app/                         比赛应用与板级验证命令
 board/beken/                 BK7258 OpenVela 芯片层和板级适配
-external/bk_avdk_smp/        可复现的 Armino CP 覆盖文件
+external/                    统一外部完整文件 overlay
+external/apps/               OpenVela apps 的完整目标文件
+external/nuttx/              OpenVela nuttx 的完整目标文件
+external/packages/ai_agent/  packages/ai_agent 的完整目标文件
+external/bk_avdk_smp/        Armino CP 的完整目标文件
+external/prepare.sh          overlay 安装和只读检查入口
+external/manifest.tsv        四仓基线、构建镜像和离线包摘要
+external/README.md           overlay 权威流程说明
 docs/                        构建说明、移植方案、验收记录和参考资料
 docs/plans/                  7 份活跃实施方案
 docs/archive/                未启动或已归档的历史方案与工具说明
@@ -44,6 +51,7 @@ autoflash.sh                 BK7258 固件自动烧录脚本
 文档入口：
 
 - [固件构建步骤](docs/固件构建步骤.md)
+- [外部完整文件 overlay](external/README.md)
 - [项目技能规范](docs/SKILLS.md)
 - [GitHub 开发指南](docs/github开发指南.md)
 - [基础适配门禁验收记录](docs/8.16基础适配门禁验收记录.md)
@@ -52,7 +60,7 @@ autoflash.sh                 BK7258 固件自动烧录脚本
 
 ## 四、构建、烧录与运行
 
-### 4.1 工作区布局
+### 4.1 工作区布局与 overlay
 
 本项目需要比赛仓、OpenVela 工作树和 Beken AVDK SMP 工程：
 
@@ -63,49 +71,45 @@ autoflash.sh                 BK7258 固件自动烧录脚本
 └── bk_avdk_smp/
 ```
 
-先按 [external/bk_avdk_smp/README.md](external/bk_avdk_smp/README.md) 将比赛仓中的
-CP 权威覆盖文件同步到 `bk_avdk_smp`，并执行逐字节校验。
-
-### 4.2 构建 OpenVela AP
-
-`nsh` 和 `ai_agent` 是两个不同的板级配置。`nsh` 是最小 NSH 启动和底层
-资源对照配置；`ai_agent` 才是 VelaSight 产品配置，包含 VelaSight App、
-LVGL 双屏界面、UTF-8 中文和英文显示以及 `packages/ai_agent`。早期基础
-移植使用 `nsh` 是为了验证 AP 启动链，不能据此构建最终产品镜像。最终烧录
-必须使用 `ai_agent`，否则会得到能够启动但不包含目标 UI 的最小固件。
+`external/apps`、`external/nuttx`、`external/packages/ai_agent` 和
+`external/bk_avdk_smp` 按目标仓相对路径保存完整最终文件，不再通过旧 patch 或
+手工复制维护外部仓改动。权威说明见 [external/README.md](external/README.md)。需要单独
+准备工作区时，从比赛仓根执行：
 
 ```bash
-cd /home/mi/vela_competition/contest
-
-./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
-  --cmake distclean
-
-./build.sh \
-  vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
-  -e -Werror \
-  --cmake \
-  -j8
+./external/prepare.sh install
+./external/prepare.sh check
 ```
 
-### 4.3 打包最终固件
+`install` 会在全量预检通过后安全安装；`check` 不修改目标仓文件，只验证已安装内容。
+四仓固定基线和 Armino 镜像信息以 `external/manifest.tsv` 为准。
+
+### 4.2 推荐一键构建
+
+最终产品推荐从比赛仓根使用统一入口：
 
 ```bash
-cp /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
-
-cd /home/mi/vela_competition/bk_avdk_smp
-podman run --rm \
-  --userns=keep-id \
-  -v "$PWD:/armino" \
-  -w /armino \
-  localhost/bekencorp/armino-idk:1.5 \
-  make -C projects/app_ab bk7258 \
-  SDK_DIR=/armino \
-  EXTERNAL_AP_BIN=/armino/build/openvela-ap.bin
+cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+./build_and_flash.sh --prepare-overlay
 ```
 
-完整步骤、产物路径和哈希校验见 [docs/固件构建步骤.md](docs/固件构建步骤.md)。
+需要同时烧录时：
+
+```bash
+./build_and_flash.sh --prepare-overlay --flash -p /dev/ttyUSB1 -n 1
+```
+
+`--prepare-overlay` 先安装完整文件 overlay；不带该参数时脚本仅执行只读 `check`，
+overlay 未准备好会立即停止。脚本固定构建 `ai_agent`，通过 `EXTERNAL_AP_BIN` 注入 AP，
+构建 Armino CP 并生成 `all-app.bin`；无论构建成功或失败，都会恢复最小 CP config。
+
+### 4.3 高级展开步骤
+
+`nsh` 只用于最小 NSH 启动和底层资源对照；`ai_agent` 才是包含 VelaSight App、
+LVGL 双屏界面和 `packages/ai_agent` 的产品配置。需要调查 AP 构建、CP 打包、产物路径
+或哈希门禁时，先运行 `./external/prepare.sh check`，再按
+[docs/固件构建步骤.md](docs/固件构建步骤.md) 中标为高级的展开步骤操作；产品交付仍以
+上面的一键入口为准。
 
 ### 4.4 烧录和控制台
 

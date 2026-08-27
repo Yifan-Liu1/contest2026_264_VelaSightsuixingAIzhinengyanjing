@@ -874,8 +874,8 @@ SoftAP 页面由 `vs_network` 负责调用 WAPI、IPv4 和 DHCP；服务器、SS
 
 - 运行长会话、快速按键、弱网、断网、存储满、单屏失败和低内存压力测试。
 - 检查音频连续性、图片丢帧策略、显示刷新耗时、线程栈余量、堆峰值和文件恢复。
-- 使用 `ai_agent` 配置完成构建、执行 AP/CP 打包、镜像哈希一致和实板回归；该配置当前不能使用 `-Werror`，
-  因为上游 `packages/ai_agent` 仍有告警。
+- 使用 `ai_agent` 配置完成构建、执行 AP/CP 打包、镜像哈希一致和实板回归；安装完整
+  `external/packages/ai_agent` overlay 后，该配置已单独通过 `-Werror`，标准产品构建不强制该参数。
 
 ## 11. 测试矩阵
 
@@ -932,4 +932,6 @@ cd /home/mi/vela_competition/contest
 - 取消、断网、超时、非法响应和存储失败都停止采集并释放资源。
 - SoftAP 基础切换已实现；凭据显示/重置、Web Server 和持久化仍未完成，UI 不能宣称这些能力已完成。
 - Web Server 保持未实现并明确移交，不计入 MCU App 完成范围。
-- `ai_agent` 配置构建、最终固件打包、哈希核对和实板测试记录全部通过；上游告警清理后再增加 `-Werror` 门禁。
+- `ai_agent` 配置构建、最终固件打包、哈希核对和实板测试记录全部通过；完整
+  `external/packages/ai_agent` overlay 已修复已知上游告警并单独通过 `-Werror`，
+  标准产品构建仍使用默认告警策略。

@@ -1,7 +1,8 @@
 # BK7258 OpenVela 项目技能规范
 
-> 本文件与工作区根目录 `/home/mi/vela_competition/SKILLS.md` 手工同步。文中相对
-> 路径均以该工作区根目录为基准；根目录版本是 AI 操作入口，本副本用于比赛交付。
+> 本文件是比赛仓内的项目级交付规范，路径以
+> `/home/mi/vela_competition` 工作区根目录为基准；它在工作区根通用规则之上补充
+> `external` 完整文件 overlay、构建与验收要求，以本副本为比赛仓内权威说明。
 
 本文件是 AI 在本工作区进行 BK7258 OpenVela 移植开发时必须遵守的项目级操作规范。
 它不复制各移植方案的具体设计，只固定稳定规则、当前状态、任务路由和验证门禁。
@@ -35,10 +36,16 @@ contest/vendor/beken/
     构建入口符号链接，不是源码所有权目录，不要在此直接编辑
 contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/固件构建步骤.md
     已验证的 OpenVela AP + Armino CP 构建和打包流程
+contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/external/README.md
+    apps、nuttx、packages/ai_agent、bk_avdk_smp 四棵完整目标文件 overlay 的权威流程
+contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/external/manifest.tsv
+    四个目标仓固定基线、Armino 镜像 ID、官方来源和离线包 SHA-256
+contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/external/prepare.sh
+    overlay 安全安装与只读检查的唯一入口
 contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/docs/plans/
     各子系统移植方案，按需阅读
 bk_avdk_smp
-    BK7258 原厂 1CP2AP 参考工程，CP/bootloader/分区/打包来源，已产生对部分cp源码的更改
+    BK7258 原厂 1CP2AP 目标 checkout，提供 CP/bootloader/分区/打包；外部改动只由完整文件 overlay 安装和验证
 bk_avdk_smp_original_backup
     bk_avdk_smp工程的原厂备份，读取作为对比参考，当“分析/对比原厂实现”时使用
 bk_idk
@@ -154,7 +161,8 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 ## 6. 开发工作流
 
 1. 读取任务路由中对应方案和 GitHub 指南。
-2. 确认修改目标在 `board/beken/` 内，不在参考目录。
+2. 比赛仓自有 AP/board 修改应位于 `board/beken/`，不在参考目录；公共仓修改先在真实
+   目标仓实现和测试，再以完整文件同步到对应 `external/<repository>/` 相对路径。
 3. 确认改动不违反第 3 节架构约束。
 4. 实现改动，Make 和 CMake 源列表必须一致。
 5. 按第 7 节构建和验证。
@@ -162,6 +170,18 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 7. 每次完成更改后都需 commit 到 `dev-ai-contest-2026` 分支。
 
 ## 7. 构建与打包门禁
+
+任何当前构建命令之前都必须阅读 `external/README.md`，并从比赛仓根执行只读检查：
+
+```bash
+cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+./external/prepare.sh check
+```
+
+尚未安装 overlay 时，使用 `./external/prepare.sh install`，或直接走推荐产品入口
+`./build_and_flash.sh --prepare-overlay`。Armino 镜像的 Docker Hub/Beken 官方来源、固定
+image ID 与离线包 SHA-256 只以 `external/manifest.tsv` 为准；tag 或历史日志不能替代
+该门禁。
 
 ### 7.1 OpenVela AP 构建
 

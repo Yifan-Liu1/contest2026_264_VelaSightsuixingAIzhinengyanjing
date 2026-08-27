@@ -18,21 +18,38 @@
 
 #include "velasight_provisioning.h"
 
-/* Request headers and body caps.  A provisioning form needs a few hundred
- * bytes; anything larger is a mistake or a probe.
+/* Request headers and body caps.
+ *
+ * The body cap has to cover the worst legal submit, not the typical one: a
+ * 512-byte API key, a 128-byte token, a 64-byte app id, a 63-byte passphrase
+ * and a 32-byte network name, plus field names and separators, is about 850
+ * bytes of plain ASCII.  Percent-encoding is where that stops being the
+ * answer -- a Chinese network name costs 9 bytes per character once encoded,
+ * and a key containing reserved characters triples -- so the earlier 1024
+ * byte cap turned a legal submit into an unexplained refusal.
  */
 
 #define VP_HTTP_MAX_HEADERS 2048
-#define VP_HTTP_MAX_BODY    1024
+#define VP_HTTP_MAX_BODY    2048
 
-/* Enough for the form page plus the largest status page. */
+/* Enough for the setup page, which is the largest response built in one
+ * piece, plus its header.  History listings stream instead, one fragment at
+ * a time.
+ *
+ * The worst case is measured, not estimated: a 32-byte network name of pure
+ * markup characters expands sixfold when escaped, and the confirmation page
+ * adds a warning plus all five field names on top of that.  The host tests
+ * build exactly that page and assert it still fits, because the failure mode
+ * of getting this wrong is a builder returning zero and the phone receiving
+ * an empty response with nothing to explain it.
+ */
 
-#define VP_HTTP_RESPONSE_MAX 4096
+#define VP_HTTP_RESPONSE_MAX 5120
 
 enum vp_http_action_e
 {
   VP_HTTP_ACTION_PAGE = 0,       /* GET / -- serve the form */
-  VP_HTTP_ACTION_SAVE,           /* POST /save -- body is a form submit */
+  VP_HTTP_ACTION_SAVE,           /* POST / -- body is a form submit */
   VP_HTTP_ACTION_HISTORY_LIST,   /* GET /history */
   VP_HTTP_ACTION_HISTORY_JSON,   /* GET /history/<key> */
   VP_HTTP_ACTION_HISTORY_DOWNLOAD, /* GET /history/<key>/download */
@@ -82,19 +99,80 @@ int vp_http_parse(const char *buf, size_t len,
 
 int vp_html_escape(const char *in, char *out, size_t outlen);
 
+/****************************************************************************
+ * What the setup page tells the user the device already has.
+ *
+ * The three key fields and the passphrase are booleans on purpose.  A page
+ * that could render a stored secret would eventually render it over an open
+ * SoftAP; carrying only "is it set" makes that impossible rather than merely
+ * unintended.  The host tests assert the absence directly.
+ ****************************************************************************/
+
+struct vp_http_state_s
+{
+  bool        have_record;      /* A readable record exists */
+  const char *ssid;             /* Stored name; NULL when nothing is stored */
+  bool        open_network;     /* The stored network has no password */
+  bool        have_api_key;
+  bool        have_volc_appid;
+  bool        have_volc_token;
+  uint32_t    generation;       /* Times saved; 0 when unknown */
+  bool        history_enabled;
+
+  /* What to put back in the name box, when that differs from what is stored.
+   *
+   * A refused submit has to come back carrying what the user typed, not what
+   * the device remembers.  Pre-filling the stored name instead would quietly
+   * revert their edit: they would fix the password, press save, and store the
+   * old network under a new passphrase without ever seeing the substitution.
+   * NULL means "use ssid", which is the ordinary GET case.
+   */
+
+  const char *form_ssid;
+};
+
 /* Response builders.  Each returns the number of bytes written, or 0 when the
  * buffer is too small.  No password is ever part of a response body, which
  * the host tests assert directly rather than trust.
  */
 
-size_t vp_http_form_page(char *buf, size_t buflen, const char *notice);
+/****************************************************************************
+ * Name: vp_http_setup_page
+ *
+ * Description:
+ *   The setup form, answered for GET / and for a refused submit.  state may
+ *   be NULL, which reads as "nothing stored yet".  notice, when given, is
+ *   rendered as a problem to fix; it must be short enough to survive
+ *   escaping into a 256-byte field, which is why the long explanations live
+ *   in the static help text instead.
+ *
+ *   The status follows the notice: without one this is a plain 200, with one
+ *   it is a 400 that still carries the whole form.  A refused submit that
+ *   answered a bare status page would cost the user everything they had
+ *   already typed, which is how a single mistyped character turns into
+ *   retyping a 512-byte key.
+ *
+ ****************************************************************************/
 
-size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
-                                   const char *notice,
-                                   const char *current_ssid);
+size_t vp_http_setup_page(char *buf, size_t buflen,
+                          const struct vp_http_state_s *state,
+                          const char *notice);
 
-size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
-                          uint32_t generation, bool open_network);
+/****************************************************************************
+ * Name: vp_http_saved_page
+ *
+ * Description:
+ *   The confirmation, carrying the state that was just written.  changed is
+ *   a mask of VP_FORM_CHANGED_* so the page can name the fields it altered
+ *   without echoing any of their values, and state->open_network drives an
+ *   explicit warning: a network saved without a password is either what the
+ *   user meant or the one mistake they most need told about.
+ *
+ ****************************************************************************/
+
+size_t vp_http_saved_page(char *buf, size_t buflen,
+                          const struct vp_http_state_s *state,
+                          unsigned int changed);
 
 size_t vp_http_status_page(char *buf, size_t buflen, int status,
                            const char *message);
@@ -103,11 +181,6 @@ size_t vp_http_status_page(char *buf, size_t buflen, int status,
  * history_*_fragment write body fragments only. */
 
 bool vp_http_history_key_valid(const char *key);
-
-size_t vp_http_form_page_with_ssid_history(char *buf, size_t buflen,
-                                           const char *notice,
-                                           const char *current_ssid,
-                                           bool history_enabled);
 
 size_t vp_http_response_header(char *buf, size_t buflen, int status,
                                const char *content_type,

@@ -5,19 +5,12 @@
  *
  * packages/ai_agent's camera_capture tool (src/tools/tool_camera.c) reaches
  * the camera through V4L2 and then hands the frame straight to a Vision LLM.
- * On this board the LLM half cannot run yet -- the AP core has no network
- * device (Wi-Fi lives on CP) -- so the tool as a whole cannot be exercised
- * on hardware.  Everything up to the LLM call can be, and that half is what
- * the board actually has to provide.
+ * The AP now has a real wlan0 backed by the CP, so the managed tool can run
+ * end to end.  This command remains the focused camera-side bench: it uses
+ * the same capture sequence but validates or exports the JPEG locally instead
+ * of requiring an LLM response.
  *
- * This command runs exactly that half: the same ioctl order, the same
- * V4L2_MEMORY_MMAP buffers, the same JPEG-then-ENTROPY format fallback, the
- * same poll() timeout, the same "one frame, then stop" shape.  What it does
- * differently is only what happens afterwards: instead of posting the frame
- * to an LLM it checks the JPEG markers, prints the byte count and can write
- * the frame to a file.
- *
- * Two things it is meant to answer, in this order:
+ * It answers two camera-specific questions:
  *
  *   1. Does the JPEG capture path work at all through V4L2?  The path is
  *      new (bk7258_jpeg_enc.c plus the JPEG branch of
@@ -25,16 +18,13 @@
  *      board evidence behind it, so "JPEG works" cannot be assumed from
  *      "preview works".
  *
- *   2. Does tool_camera.c's *request* fit this board?  It asks for
- *      320x180 (its "low", the default) or 1280x720 ("high").  This driver
- *      programs 480x480 / 640x480 / 864x480 and rejects anything else --
- *      bk7258_gc2145_find_mode() is an exact match, not a nearest one --
- *      so the tool's own geometry is expected to fail VIDIOC_S_FMT here.
- *      `agent_camera low` reproduces that failure deliberately; `auto`
- *      picks a size the driver enumerates and shows the path works once
- *      the geometry is right.  The fix belongs upstream in tool_camera.c
- *      (negotiate via VIDIOC_ENUM_FRAMESIZES instead of hardcoding), and
- *      the negotiation implemented here is the prototype for it.
+ *   2. Does tool_camera.c's requested geometry fit this board?  The pinned
+ *      upstream baseline asks for 320x180 ("low") or 1280x720 ("high"),
+ *      while this driver programs 480x480 / 640x480 / 864x480 and rejects
+ *      any other exact size.  The complete managed tool_camera.c now retries
+ *      an enumerated size.  This bench mirrors that algorithm: `low` succeeds
+ *      through negotiation, while `low strict` reproduces the pinned
+ *      baseline's rejected-geometry behavior.
  *
  * Usage:
  *   agent_camera [auto|low|high|<W>x<H>] [options]
@@ -226,7 +216,7 @@ static void agent_camera_usage(void)
          "  auto     first JPEG size the driver enumerates (default)\n"
          "  low      320x180, tool_camera.c's default request\n"
          "  high     1280x720, tool_camera.c's \"high\" request\n"
-         "  strict   do not negotiate a refused geometry (pre-patch\n"
+         "  strict   do not negotiate a refused geometry (pinned upstream\n"
          "           tool_camera.c behaviour)\n"
          "  b64      print the last frame as base64 (retrieve without a\n"
          "           filesystem; see the file header)\n"
@@ -386,12 +376,13 @@ static int agent_camera_try_format(int fd, int width, int height,
  *   tool_camera.c's format step: ask for V4L2_PIX_FMT_JPEG and, if that is
  *   refused, ask for V4L2_PIX_FMT_ENTROPY.
  *
- *   When negotiate is true this also mirrors the geometry negotiation added
- *   to tool_camera.c by
- *   board/beken/boards/bk7258/bk7258-ap/ai_agent/0001-tool_camera-negotiate-frame-size.patch:
- *   a refused geometry is retried at the enumerated size whose pixel count
+ *   When negotiate is true this also mirrors the geometry negotiation in the
+ *   overlay-managed complete target file:
+ *   external/packages/ai_agent/src/tools/tool_camera.c
+ *   A refused geometry is retried at the enumerated size whose pixel count
  *   is closest.  Same algorithm, same device, same driver, so `low` versus
- *   `low strict` is a direct before/after of that patch on this board.
+ *   `low strict` directly compares the overlay behavior with the fixed
+ *   baseline on this board.
  *
  *   Note that VIDIOC_ENUM_FRAMESIZES cannot be trusted to filter by pixel
  *   format: v4l2_cap.c's capture_enum_frmsize() indexes the imgsensor's

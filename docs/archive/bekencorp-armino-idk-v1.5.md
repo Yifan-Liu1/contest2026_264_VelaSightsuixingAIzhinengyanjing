@@ -1,7 +1,18 @@
 # 使用 Podman 构建 BK7258
 
 > 归档状态：早期容器构建记录。当前完整 AP/CP 构建、打包和哈希校验流程以
-> `docs/固件构建步骤.md` 为准。
+> `docs/固件构建步骤.md` 为准；完整文件 overlay 的当前入口见
+> [`external/README.md`](../../external/README.md)。镜像官方来源、固定 image ID 和
+> 离线归档 SHA-256 统一以 `external/manifest.tsv` 为准，不以本页历史输出或 tag 代替。
+>
+> 执行下方任何历史展开命令前，先从比赛仓根运行只读检查：
+>
+> ```bash
+> ./external/prepare.sh check
+> ```
+>
+> 当前产品推荐使用 `./build_and_flash.sh --prepare-overlay`；以下命令保持历史原貌，
+> 仅用于理解或诊断底层 Podman 流程。
 
 `bk_sdk_project.py`已支持通过`EXTERNAL_AP_BIN`链接外部OpenVela AP固件。Podman使用与Docker相同的ARMINO官方镜像，因此仍然使用镜像内的官方工具链，不需要修改宿主机GCC或工具链路径。
 

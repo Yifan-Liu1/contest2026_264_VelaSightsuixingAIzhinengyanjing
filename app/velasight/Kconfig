@@ -64,8 +64,26 @@ config VS_AP_RANDOM_PASSWORD
 	default n
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		Generate a new eight-character alphanumeric password on every AP start.
+		Give the SoftAP an eight-character alphanumeric passphrase drawn from
+		the hardware TRNG instead of the fixed VS_AP_PASSWORD.
 		Disabled by default while AP provisioning is in testing.
+
+		The passphrase is drawn once and persisted to /mnt/sdnand/prov/APPW.BIN,
+		then read back into memory at startup, so the hotspot keeps the same
+		password across reboots and across STA/AP switches.  It has to: the
+		password is shown on the device's screen and typed into a phone, and
+		redrawing it on every AP start would invalidate whatever the user
+		already saved there.  Entering AP mode when a stored passphrase exists
+		performs no storage access at all.
+
+		A new passphrase is drawn only when there is none stored, when the
+		stored record fails its CRC or range checks, or when the user asks:
+		holding 下一条 (VS_KEY_NEXT) for VS_LONG_PRESS_MS on the SoftAP page
+		restarts the hotspot with a fresh passphrase and saves it.  The page
+		advertises that key while the gesture is available.  The gesture is
+		tied to this option because with a fixed VS_AP_PASSWORD there is
+		nothing to reset -- restarting the AP would hand back the same string
+		and only cost the user their connection.
 
 config VS_STA_SSID
 	string "VelaSight development STA SSID"

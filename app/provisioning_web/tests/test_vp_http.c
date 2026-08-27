@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "vp_form.h"
 #include "vp_http.h"
 
 static int g_checks;
@@ -81,27 +82,49 @@ static void test_dispatch(void)
         req.action == VP_HTTP_ACTION_REJECT && req.status == 405,
         "an unsupported method is 405");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n"
               "Content-Length: 27\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_SAVE && req.content_length == 27,
         "a well formed submit is accepted");
 
+  /* The submit posts back to the page it came from, so the whole service lives
+   * at one address and the tab bar always points at where the user is.
+   */
+
+  CHECK(parse("POST /index.html HTTP/1.1\r\n"
+              "Content-Type: application/x-www-form-urlencoded\r\n"
+              "Content-Length: 27\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_SAVE,
+        "the submit is accepted at the same two paths the page is served at");
+
   CHECK(parse("POST /save HTTP/1.1\r\n"
+              "Content-Type: application/x-www-form-urlencoded\r\n"
+              "Content-Length: 27\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_REJECT && req.status == 404,
+        "the separate save endpoint is gone rather than kept as an alias");
+
+  CHECK(parse("POST /?x=1 HTTP/1.1\r\n"
+              "Content-Type: application/x-www-form-urlencoded\r\n"
+              "Content-Length: 27\r\n\r\n", &req) == 0 &&
+        req.action == VP_HTTP_ACTION_SAVE,
+        "a query string on the submit target is stripped, not routed on");
+
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Sec-Fetch-Site: cross-site \t\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n"
               "Content-Length: 27\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_REJECT && req.status == 403,
         "an explicit cross-site browser submit is refused");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "sEc-FeTcH-sItE: same-origin\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n"
               "Content-Length: 27\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_SAVE && req.content_length == 27,
         "a same-origin browser submit remains accepted");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "content-type: application/x-www-form-urlencoded; charset=UTF-8"
               "\r\nCONTENT-LENGTH: 5\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_SAVE && req.content_length == 5,
@@ -122,30 +145,30 @@ static void test_limits(void)
         "incomplete headers ask for more");
   CHECK(parse("GE", &req) == -EAGAIN, "a partial request line asks for more");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n\r\n", &req)
         == 0 && req.action == VP_HTTP_ACTION_REJECT && req.status == 411,
         "a submit without Content-Length is 411");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n"
               "Content-Length: 99999\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_REJECT && req.status == 413,
         "an oversized body is 413");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n"
               "Content-Length: abc\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_REJECT && req.status == 400,
         "a non-numeric Content-Length is 400");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Content-Type: text/plain\r\n"
               "Content-Length: 5\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_REJECT && req.status == 415,
         "a non-form content type is 415");
 
-  CHECK(parse("POST /save HTTP/1.1\r\n"
+  CHECK(parse("POST / HTTP/1.1\r\n"
               "Content-Type: application/x-www-form-urlencoded\r\n"
               "Transfer-Encoding: chunked\r\n\r\n", &req) == 0 &&
         req.action == VP_HTTP_ACTION_REJECT && req.status == 400,
@@ -165,7 +188,7 @@ static void test_limits(void)
 static void test_header_len(void)
 {
   static const char request[] =
-    "POST /save HTTP/1.1\r\n"
+    "POST / HTTP/1.1\r\n"
     "Content-Type: application/x-www-form-urlencoded\r\n"
     "Content-Length: 4\r\n\r\nssid";
   struct vp_http_request_s req;
@@ -189,67 +212,246 @@ static void test_escape(void)
         "escaping refuses to overflow");
 }
 
+static unsigned int count_occurrences(const char *haystack,
+                                      const char *needle)
+{
+  unsigned int n = 0;
+  const char *p = haystack;
+
+  while ((p = strstr(p, needle)) != NULL)
+    {
+      n++;
+      p += strlen(needle);
+    }
+
+  return n;
+}
+
+/* A device that has been set up once: a network with a password, a key and
+ * both voice fields.  Everything the page may say about it is a boolean, so
+ * the record itself never reaches the renderer.
+ */
+
+static void configured_state(struct vp_http_state_s *state)
+{
+  memset(state, 0, sizeof(*state));
+  state->have_record      = true;
+  state->ssid             = "AIPC";
+  state->open_network     = false;
+  state->have_api_key     = true;
+  state->have_volc_appid  = true;
+  state->have_volc_token  = false;
+  state->generation       = 3;
+  state->history_enabled  = false;
+}
+
 static void test_pages(void)
 {
+  struct vp_http_state_s state;
   char buf[VP_HTTP_RESPONSE_MAX];
   size_t len;
 
-  len = vp_http_form_page(buf, sizeof(buf), NULL);
-  CHECK(len > 0 && len < sizeof(buf), "the form page is generated");
+  len = vp_http_setup_page(buf, sizeof(buf), NULL, NULL);
+  CHECK(len > 0 && len < sizeof(buf), "the setup page is generated");
 
-  /* Adding the two Volcengine fields pushed the form past one IOB
-   * (1514 bytes); vp_write_all() loops until every byte is sent, so a
-   * response spanning two TCP segments is a minor efficiency cost on a
-   * SoftAP link, not a correctness issue.  The bound here still exists so
-   * a future addition that meaningfully bloats the page (a stray debug
-   * dump, an accidentally duplicated block) gets caught instead of silently
-   * growing forever. */
+  /* The page already spans more than one IOB (1514 bytes); vp_write_all()
+   * loops until every byte is sent, so several TCP segments on a SoftAP link
+   * are an efficiency cost rather than a correctness issue.  The bound exists
+   * so a future addition that meaningfully bloats the page -- a stray debug
+   * dump, an accidentally duplicated block -- is caught instead of silently
+   * growing until it no longer fits the response buffer at all.
+   */
 
-  CHECK(len < 2200, "the form response stays within a couple of IOBs");
+  CHECK(len < 3600, "the setup response stays inside its buffer with room");
   CHECK(strncmp(buf, "HTTP/1.1 200 OK\r\n", 17) == 0,
-        "the form page carries a 200 status line");
+        "the setup page carries a 200 status line");
   CHECK(strstr(buf, "Content-Length: ") != NULL,
-        "the form page declares its length");
+        "the setup page declares its length");
   CHECK(strstr(buf, "name=\"ssid\"") != NULL &&
         strstr(buf, "name=\"password\"") != NULL &&
+        strstr(buf, "name=\"no_password\"") != NULL &&
         strstr(buf, "name=\"mimo_apikey\"") != NULL &&
         strstr(buf, "name=\"volc_appid\"") != NULL &&
         strstr(buf, "name=\"volc_token\"") != NULL,
-        "the form has Wi-Fi, MiMo and Volcengine inputs");
-  CHECK(strstr(buf, "action=\"/save\"") != NULL &&
+        "the form has Wi-Fi, the no-password box, MiMo and voice inputs");
+  CHECK(strstr(buf, "action=\"/\"") != NULL &&
         strstr(buf, "method=\"post\"") != NULL,
-        "the form posts to /save");
+        "the form posts back to the page it came from");
   CHECK(strstr(buf, "type=\"password\"") != NULL,
         "the passphrase field is masked in the browser");
+  CHECK(strstr(buf, "设备还没有记住任何 Wi-Fi") != NULL,
+        "an unconfigured device says so in plain words");
 
-  len = vp_http_form_page(buf, sizeof(buf), "密码长度不合法");
-  CHECK(len > 0 && strstr(buf, "密码长度不合法") != NULL,
-        "a notice is rendered on the form page");
+  /* Every user-visible string is ordinary Chinese.  A protocol reason phrase
+   * or an errno on this page would be unreadable to the person it is for, so
+   * their absence is asserted rather than assumed.
+   */
 
-  len = vp_http_saved_page(buf, sizeof(buf), "AIPC", 3, false);
+  CHECK(strstr(buf, "SSID") == NULL && strstr(buf, "PSK") == NULL &&
+        strstr(buf, "开放网络") == NULL && strstr(buf, "配网") == NULL &&
+        strstr(buf, "errno") == NULL,
+        "the setup page uses no jargon for the Wi-Fi fields");
+
+  /* The key fields keep their product names, which is the one place a proper
+   * noun is the clearest thing to write.
+   */
+
+  CHECK(strstr(buf, "MiMo API key") != NULL &&
+        strstr(buf, "语音 App ID") != NULL &&
+        strstr(buf, "语音 Token") != NULL,
+        "the key fields are still named the way the consoles name them");
+
+  /* Help text, not just labels: "leave blank to keep it" is the whole reason
+   * an empty box is safe now, so the page has to say it.
+   */
+
+  CHECK(strstr(buf, "留空表示不改动") != NULL,
+        "the page explains that a blank box changes nothing");
+
+  len = vp_http_setup_page(buf, sizeof(buf), NULL, "请填写 Wi-Fi 名称。");
+  CHECK(len > 0 && strstr(buf, "请填写 Wi-Fi 名称。") != NULL,
+        "a notice is rendered on the setup page");
+  CHECK(strncmp(buf, "HTTP/1.1 400 ", 13) == 0,
+        "a setup page carrying a problem answers 400");
+  CHECK(strstr(buf, "class=\"err\">") != NULL,
+        "the problem notice is styled as a problem");
+  CHECK(strstr(buf, "name=\"ssid\"") != NULL,
+        "a refused submit still gets the whole form back");
+
+  configured_state(&state);
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(len > 0 && strstr(buf, "AIPC") != NULL,
+        "the setup page names the stored network");
+  CHECK(strstr(buf, "value=\"AIPC\"") != NULL,
+        "the stored network name is pre-filled so it need not be retyped");
+
+  /* The box and the input answer different questions.  On a refused submit the
+   * box still reports what the device remembers while the input carries what
+   * the user typed, so fixing one field cannot silently revert another.
+   */
+
+  state.form_ssid = "JustTyped";
+  len = vp_http_setup_page(buf, sizeof(buf), &state, "请填写 Wi-Fi 密码。");
+  CHECK(len > 0 && strstr(buf, "value=\"JustTyped\"") != NULL &&
+        strstr(buf, "Wi-Fi 名称：AIPC") != NULL,
+        "the input keeps what was typed while the box reports what is stored");
+  CHECK(strstr(buf, "value=\"AIPC\"") == NULL,
+        "the stored name does not overwrite what was typed");
+  state.form_ssid = NULL;
+  CHECK(strstr(buf, "已经保存过 3 次") != NULL,
+        "the save count is shown in plain words, not as a generation");
+  CHECK(count_occurrences(buf, "已填写") == 2 &&
+        count_occurrences(buf, "还没填写") == 1,
+        "each key field reports only whether it is set");
+  CHECK(strstr(buf, "Wi-Fi 密码：已设置") != NULL,
+        "a stored passphrase is reported as set, never shown");
+
+  state.open_network = true;
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(len > 0 && strstr(buf, "这个 Wi-Fi 没有密码") != NULL,
+        "a stored network with no password says so");
+
+  configured_state(&state);
+  len = vp_http_saved_page(buf, sizeof(buf), &state,
+                           VP_FORM_CHANGED_PASSWORD |
+                           VP_FORM_CHANGED_VOLC_TOKEN);
   CHECK(len > 0 && strstr(buf, "AIPC") != NULL &&
-         strstr(buf, "HTTP/1.1 200 OK") != NULL,
-        "the saved form shows the SSID");
+        strstr(buf, "HTTP/1.1 200 OK") != NULL,
+        "the saved page shows the network that was saved");
   CHECK(strstr(buf, "class=\"ok\">已保存") != NULL,
-        "the saved form shows a green success notice");
+        "the saved page shows a green success notice");
+  CHECK(strstr(buf, "这次改动了：Wi-Fi 密码、语音 Token。") != NULL,
+        "the saved page names the fields it changed, in order");
+  CHECK(strstr(buf, "MiMo API key。") == NULL,
+        "a field that did not move is not listed as changed");
   CHECK(strstr(buf, "name=\"password\"") != NULL &&
         strstr(buf, "href=\"/\"") == NULL,
         "saving stays on the input form without a return link");
-  CHECK(len < 2200, "the saved response stays within a couple of IOBs");
+  CHECK(len < 3600, "the saved response stays inside its buffer with room");
 
-  len = vp_http_saved_page(buf, sizeof(buf), "<script>", 1, true);
+  len = vp_http_saved_page(buf, sizeof(buf), &state, 0);
+  CHECK(len > 0 && strstr(buf, "这次没有改动任何设置。") != NULL,
+        "a submit that changed nothing says so instead of implying a change");
+
+  /* Saving a network without a password is either exactly what was meant or
+   * the one mistake that leaves the device unable to connect with no hint
+   * why, so the page has to say it out loud.
+   */
+
+  state.open_network = true;
+  len = vp_http_saved_page(buf, sizeof(buf), &state,
+                           VP_FORM_CHANGED_PASSWORD);
+  CHECK(len > 0 && strstr(buf, "class=\"warn\">注意") != NULL &&
+        strstr(buf, "记成了没有密码") != NULL,
+        "saving a network with no password raises an explicit warning");
+
+  configured_state(&state);
+  len = vp_http_saved_page(buf, sizeof(buf), &state, 0);
+  CHECK(len > 0 && strstr(buf, "class=\"warn\">") == NULL,
+        "a network with a password raises no warning");
+
+  configured_state(&state);
+  state.ssid = "<script>";
+  len = vp_http_saved_page(buf, sizeof(buf), &state, 0);
   CHECK(len > 0 && strstr(buf, "<script>") == NULL &&
         strstr(buf, "&lt;script&gt;") != NULL,
-        "an SSID cannot inject markup into the success page");
+        "a network name cannot inject markup into the success page");
 
-  len = vp_http_status_page(buf, sizeof(buf), 413, "too large");
+  /* The largest page the builders can be asked for.  Every variable part is
+   * at its maximum at once: a 32-byte network name made entirely of markup
+   * characters, which sextuples when escaped, the longest problem notice, all
+   * five field names listed as changed, the no-password warning and the
+   * history link.  Getting the buffer wrong makes a builder return zero and
+   * the phone receive an empty response, so the bound is tested rather than
+   * measured once and trusted.
+   */
+
+  {
+    static const char worst_ssid[] =
+        "\"'<&>\"'<&>\"'<&>\"'<&>\"'<&>\"'<&>ab";
+    static const char worst_notice[] =
+        "Wi-Fi 密码需要 8 到 63 个字符；想保留原来的密码请把这一栏留空；"
+        "这个 Wi-Fi 确实没有密码请勾选下面那一项。";
+    size_t worst_setup;
+    size_t worst_saved;
+
+    configured_state(&state);
+    state.ssid            = worst_ssid;
+    state.have_volc_token = true;
+    state.open_network    = true;
+    state.generation      = 4294967295u;
+    state.history_enabled = true;
+
+    worst_setup = vp_http_setup_page(buf, sizeof(buf), &state, worst_notice);
+    CHECK(worst_setup > 0 && strstr(buf, "&quot;&#39;&lt;&amp;&gt;") != NULL,
+          "the worst-case setup page is built, not silently refused");
+
+    worst_saved = vp_http_saved_page(buf, sizeof(buf), &state, 0xffffffffu);
+    CHECK(worst_saved > 0,
+          "the worst-case confirmation page is built, not silently refused");
+    CHECK(worst_saved < VP_HTTP_RESPONSE_MAX - 512,
+          "the worst-case page leaves room for further copy edits");
+  }
+
+  len = vp_http_status_page(buf, sizeof(buf), 413, "内容太多了");
   CHECK(len > 0 && strncmp(buf, "HTTP/1.1 413 ", 13) == 0,
         "a status page uses the requested status");
 
-  len = vp_http_status_page(buf, sizeof(buf), 403, "forbidden");
+  len = vp_http_status_page(buf, sizeof(buf), 403, "被拒绝了");
   CHECK(len > 0 &&
         strncmp(buf, "HTTP/1.1 403 Forbidden\r\n", 24) == 0,
-        "a 403 status page uses the Forbidden reason phrase");
+        "a 403 status line keeps the protocol reason phrase");
+
+  /* The number and the English belong on the wire; the heading belongs to
+   * whoever is holding the phone.
+   */
+
+  CHECK(strstr(buf, "<h1>这次提交被拒绝了</h1>") != NULL &&
+        strstr(buf, "<h1>403") == NULL &&
+        strstr(buf, "Forbidden</h1>") == NULL,
+        "the status page heading is plain Chinese, not the reason phrase");
+  CHECK(strstr(buf, "返回设置页") != NULL,
+        "the status page offers a way back in plain words");
   CHECK(vp_http_status_page(buf, 8, 400, "bad") == 0,
         "a status page refuses a buffer it cannot fill");
 }
@@ -257,6 +459,7 @@ static void test_pages(void)
 static void test_history_pages(void)
 {
   struct velasight_prov_history_entry_s entry;
+  struct vp_http_state_s state;
   char buf[VP_HTTP_RESPONSE_MAX];
   size_t len;
 
@@ -267,14 +470,32 @@ static void test_history_pages(void)
         !vp_http_history_key_valid("R00000/0"),
         "non-canonical history keys are invalid");
 
-  len = vp_http_form_page_with_ssid_history(buf, sizeof(buf), NULL,
-                                            "AIPC", true);
-  CHECK(len > 0 && strstr(buf, "href=\"/history\"") != NULL,
-        "the configured form exposes the history entry point");
-  len = vp_http_form_page_with_ssid_history(buf, sizeof(buf), NULL,
-                                            "AIPC", false);
-  CHECK(len > 0 && strstr(buf, "href=\"/history\"") == NULL,
-        "a form without a provider has no dead history link");
+  configured_state(&state);
+  state.history_enabled = true;
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(len > 0 &&
+        strstr(buf, "class=\"tab on\" href=\"/\">联网设置") != NULL &&
+        strstr(buf, "class=\"tab\" href=\"/history\">聊天记录") != NULL,
+        "the setup page carries the tab bar with its own tab marked");
+  CHECK(strstr(buf, "</main><nav") != NULL,
+        "the tab bar sits outside the card it is pinned in front of");
+
+  /* The confirmation is the same page, so it keeps the same bar.  Losing the
+   * way to the history vanished for exactly as long as the user was looking at
+   * the page that told them the save had worked.
+   */
+
+  len = vp_http_saved_page(buf, sizeof(buf), &state, 0);
+  CHECK(len > 0 &&
+        strstr(buf, "class=\"tab on\" href=\"/\">联网设置") != NULL &&
+        strstr(buf, "href=\"/history\"") != NULL,
+        "the confirmation keeps the tab bar, still on the setup tab");
+
+  state.history_enabled = false;
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(len > 0 && strstr(buf, "href=\"/history\"") == NULL &&
+        strstr(buf, "<nav") == NULL,
+        "without a provider there is no bar rather than a one-item bar");
 
   memset(&entry, 0, sizeof(entry));
   snprintf(entry.record_key, sizeof(entry.record_key), "R0000000");
@@ -297,9 +518,22 @@ static void test_history_pages(void)
   CHECK(strstr(buf, "href=\"/history/R0000000\"") != NULL &&
         strstr(buf, "href=\"/history/R0000000/download\"") != NULL,
         "each history entry links preview and download");
+  CHECK(strstr(buf, "查看内容") != NULL &&
+        strstr(buf, "下载文件") != NULL && strstr(buf, "JSON") == NULL,
+        "the entry links are labelled without naming a file format");
+  CHECK(strstr(buf, "这条记录不完整") != NULL,
+        "an incomplete record says so in a full sentence");
+  /* The tab bar is how you leave this page, and it has to say which of the two
+   * pages you are currently on -- a bar where neither tab is marked is a bar
+   * that tells you nothing about where you are.
+   */
+
   CHECK(vp_http_history_tail_fragment(buf, sizeof(buf)) > 0 &&
-        strstr(buf, "href=\"/\"") != NULL,
-        "the history page links back to provisioning");
+        strstr(buf, "class=\"tab\" href=\"/\">联网设置") != NULL &&
+        strstr(buf, "class=\"tab on\" href=\"/history\">聊天记录") != NULL,
+        "the history page carries the tab bar with its own tab marked");
+  CHECK(strstr(buf, "</main><nav") != NULL,
+        "the tab bar sits outside the card it is pinned in front of");
 
   len = vp_http_response_header(buf, sizeof(buf), 200,
                                 "application/json", 8193,
@@ -317,24 +551,40 @@ static void test_history_pages(void)
 static void test_password_never_echoed(void)
 {
   static const char secret[] = "VelaSecret2026";
+  struct vp_http_state_s state;
   char buf[VP_HTTP_RESPONSE_MAX];
   size_t len;
 
-  /* The password only ever reaches the page builders as part of an SSID by
-   * mistake, so the assertion is blunt on purpose: no builder output may
-   * contain it.
+  /* The builders now take a summary rather than a record, so a secret cannot
+   * reach them at all except through the one string that is still a string:
+   * the network name.  The assertion stays blunt on purpose.
    */
 
-  len = vp_http_saved_page(buf, sizeof(buf), "AIPC", 1, false);
+  configured_state(&state);
+  len = vp_http_saved_page(buf, sizeof(buf), &state, 0xffffffffu);
   CHECK(len > 0 && strstr(buf, secret) == NULL,
         "the success page contains no passphrase");
 
-  len = vp_http_form_page(buf, sizeof(buf), NULL);
-  CHECK(len > 0 && strstr(buf, secret) == NULL &&
-        strstr(buf, "value=\"") == NULL,
-        "the form page pre-fills nothing");
+  len = vp_http_setup_page(buf, sizeof(buf), NULL, NULL);
+  CHECK(len > 0 && strstr(buf, secret) == NULL,
+        "the setup page contains no passphrase");
 
-  len = vp_http_status_page(buf, sizeof(buf), 400, "invalid credentials");
+  /* Nothing is pre-filled except the network name, and with no record there
+   * is not even that.  The checkbox's own value="on" is the only attribute of
+   * that shape the page is allowed to carry.
+   */
+
+  CHECK(count_occurrences(buf, "value=\"") == 1 &&
+        strstr(buf, "value=\"on\"") != NULL,
+        "an unconfigured setup page pre-fills nothing but the checkbox");
+
+  configured_state(&state);
+  state.ssid = secret;
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(count_occurrences(buf, "value=\"") == 2,
+        "a configured setup page pre-fills only the network name");
+
+  len = vp_http_status_page(buf, sizeof(buf), 400, "填写的内容有问题");
   CHECK(len > 0 && strstr(buf, secret) == NULL,
         "an error page contains no passphrase");
 }

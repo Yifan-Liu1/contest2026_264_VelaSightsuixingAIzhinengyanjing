@@ -119,48 +119,110 @@ static void test_validate(void)
         "a control character in the password is rejected");
 }
 
+/* Parse a literal body without restating its length.
+ *
+ * Hand-counted lengths are their own bug source: a body that is one byte short
+ * ends in a truncated escape, so the test fails for a reason that has nothing
+ * to do with what it meant to check.  The cases that genuinely exercise a
+ * length build it instead.
+ */
+
+static int parse_str(const char *body, struct vp_form_submit_s *s,
+                     enum vp_form_field_e *which)
+{
+  return vp_form_parse(body, strlen(body), s, which);
+}
+
 static void test_form_parse(void)
 {
-  struct velasight_prov_credentials_s cred;
+  struct vp_form_submit_s s;
+  enum vp_form_field_e which;
   char body[512];
   size_t used;
   size_t i;
 
-  CHECK(vp_form_parse("ssid=AIPC&password=secretpw", 27, &cred) == 0 &&
-        strcmp(cred.ssid, "AIPC") == 0 &&
-        strcmp(cred.password, "secretpw") == 0 && !cred.open_network,
-        "both fields are parsed");
+  CHECK(parse_str("ssid=AIPC&password=secretpw", &s, &which) == 0 &&
+        strcmp(s.cred.ssid, "AIPC") == 0 &&
+        strcmp(s.cred.password, "secretpw") == 0 &&
+        s.have_ssid && s.have_password && !s.open_requested,
+        "both fields are parsed and marked present");
 
-  CHECK(vp_form_parse("password=secretpw&ssid=AIPC", 27, &cred) == 0 &&
-        strcmp(cred.ssid, "AIPC") == 0,
+  CHECK(parse_str("password=secretpw&ssid=AIPC", &s, &which) == 0 &&
+        strcmp(s.cred.ssid, "AIPC") == 0,
         "field order does not matter");
 
-  CHECK(vp_form_parse("ssid=My+Net&password=", 21, &cred) == 0 &&
-        strcmp(cred.ssid, "My Net") == 0 && cred.password[0] == '\0' &&
-        cred.open_network, "an empty password means an open network");
+  /* The parser reports what arrived and nothing more.  Deciding that an empty
+   * box means "this network has no password" is vp_form_resolve()'s job, and
+   * doing it here is what used to erase a stored passphrase.
+   */
 
-  CHECK(vp_form_parse("ssid=My%20Net", 13, &cred) == 0 &&
-        strcmp(cred.ssid, "My Net") == 0 && cred.open_network,
-        "a missing password field means an open network");
+  CHECK(parse_str("ssid=My+Net&password=", &s, &which) == 0 &&
+        strcmp(s.cred.ssid, "My Net") == 0 && s.cred.password[0] == '\0' &&
+        s.have_password && !s.open_requested && !s.cred.open_network,
+        "an empty password box is recorded as present but empty");
 
-  CHECK(vp_form_parse("password=secretpw", 17, &cred) == -EINVAL,
-        "a missing SSID is rejected");
+  CHECK(parse_str("ssid=My%20Net", &s, &which) == 0 &&
+        strcmp(s.cred.ssid, "My Net") == 0 && !s.have_password &&
+        !s.cred.open_network,
+        "an absent password field is recorded as absent");
 
-  CHECK(vp_form_parse("ssid=a&ssid=b&password=secretpw", 31, &cred)
-        == -EINVAL, "a duplicate SSID is rejected, not resolved");
+  CHECK(parse_str("ssid=Open&no_password=on", &s, &which) == 0 &&
+        s.open_requested, "the no-password box is parsed when ticked");
 
-  CHECK(vp_form_parse("ssid=a&password=secretpw&password=other", 39, &cred)
-        == -EINVAL, "a duplicate password is rejected");
+  CHECK(parse_str("ssid=Open&no_password=off", &s, &which) == 0 &&
+        !s.open_requested,
+        "a spelled-out off is not read as ticked");
 
-  CHECK(vp_form_parse("csrf=x&ssid=AIPC&extra=1&password=secretpw", 42,
-                      &cred) == 0 && strcmp(cred.ssid, "AIPC") == 0,
+  CHECK(parse_str("ssid=Open&no_password=", &s, &which) == 0 &&
+        !s.open_requested,
+        "an empty no-password value is not read as ticked");
+
+  CHECK(parse_str("password=secretpw", &s, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_SSID, "a missing SSID is rejected by name");
+
+  CHECK(parse_str("ssid=a&ssid=b&password=secretpw", &s, &which)
+        == -EINVAL && which == VP_FORM_FIELD_SSID,
+        "a duplicate SSID is rejected, not resolved");
+
+  CHECK(parse_str("ssid=a&password=secretpw&password=other", &s,
+                      &which) == -EINVAL &&
+        which == VP_FORM_FIELD_PASSWORD, "a duplicate password is rejected");
+
+  CHECK(parse_str("ssid=a&no_password=on&no_password=on", &s,
+                      &which) == -EINVAL,
+        "a duplicate no-password box is rejected");
+
+  CHECK(parse_str("csrf=x&ssid=AIPC&extra=1&password=secretpw", &s, &which) == 0 && strcmp(s.cred.ssid, "AIPC") == 0,
         "unknown fields are ignored");
 
-  CHECK(vp_form_parse("", 0, &cred) == -EINVAL, "an empty body is rejected");
-  CHECK(vp_form_parse("ssid", 4, &cred) == -EINVAL,
-        "a field without = is rejected");
-  CHECK(vp_form_parse("ssid=a%2&password=secretpw", 26, &cred) == -EINVAL,
-        "a malformed escape fails the whole submit");
+  CHECK(parse_str("", &s, &which) == -EINVAL,
+        "an empty body is rejected");
+  CHECK(parse_str("ssid", &s, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_BODY, "a field without = is rejected");
+  CHECK(parse_str("ssid=a%2&password=secretpw", &s, &which)
+        == -EINVAL, "a malformed escape fails the whole submit");
+
+  /* A 7-byte passphrase is a rule, not a syntax error, so the parser accepts
+   * it and vp_form_resolve() is the one that refuses it.  Keeping the two
+   * apart is what lets the page say which field to fix.
+   */
+
+  CHECK(parse_str("ssid=ok&password=short", &s, &which) == 0,
+        "a too-short password is not a parse failure");
+
+  /* Pasted keys arrive with keyboard whitespace attached far more often than
+   * not, and the platform's only answer to a token with a trailing newline is
+   * an unexplained 401.
+   */
+
+  CHECK(parse_str("ssid=ok&mimo_apikey=+key+&volc_token=%09tok%0A", &s, &which) == 0 &&
+        strcmp(s.cred.api_key, "key") == 0 &&
+        strcmp(s.cred.volc_token, "tok") == 0,
+        "surrounding whitespace is trimmed from the key fields");
+
+  CHECK(parse_str("ssid=ok&password=+pass+word+", &s, &which) == 0 &&
+        strcmp(s.cred.password, " pass word ") == 0,
+        "the Wi-Fi password keeps its spaces, which WPA2 allows");
 
   /* An SSID one byte over the limit must fail as a length error rather than
    * arrive silently truncated to something the phone never typed.
@@ -174,8 +236,9 @@ static void test_form_parse(void)
     }
 
   body[used] = '\0';
-  CHECK(vp_form_parse(body, used, &cred) == -EINVAL,
-        "a 33-byte SSID is rejected");
+  CHECK(vp_form_parse(body, used, &s, &which) == -E2BIG &&
+        which == VP_FORM_FIELD_SSID,
+        "a 33-byte SSID is refused as too long, by name");
 
   used = 0;
   used += (size_t)snprintf(body + used, sizeof(body) - used,
@@ -186,8 +249,22 @@ static void test_form_parse(void)
     }
 
   body[used] = '\0';
-  CHECK(vp_form_parse(body, used, &cred) == -EINVAL,
-        "a 64-byte password is rejected");
+  CHECK(vp_form_parse(body, used, &s, &which) == -E2BIG &&
+        which == VP_FORM_FIELD_PASSWORD,
+        "a 64-byte password is refused as too long, by name");
+
+  used = 0;
+  used += (size_t)snprintf(body + used, sizeof(body) - used,
+                           "ssid=ok&volc_appid=");
+  for (i = 0; i < VELASIGHT_PROV_VOLC_APPID_MAX + 1; i++)
+    {
+      body[used++] = 'n';
+    }
+
+  body[used] = '\0';
+  CHECK(vp_form_parse(body, used, &s, &which) == -E2BIG &&
+        which == VP_FORM_FIELD_VOLC_APPID,
+        "a 65-byte app id is refused as too long, by name");
 
   used = 0;
   for (i = 0; i < VP_FORM_MAX_FIELDS + 4; i++)
@@ -197,8 +274,162 @@ static void test_form_parse(void)
     }
 
   used += (size_t)snprintf(body + used, sizeof(body) - used, "ssid=AIPC");
-  CHECK(vp_form_parse(body, used, &cred) == -E2BIG,
+  CHECK(vp_form_parse(body, used, &s, &which) == -E2BIG,
         "too many fields is refused instead of parsed forever");
+}
+
+/* The stored record every merge test starts from: a network with a password,
+ * a key and both voice fields, so anything that goes missing is visible.
+ */
+
+static void stored_record(struct velasight_prov_credentials_s *out)
+{
+  memset(out, 0, sizeof(*out));
+  strcpy(out->ssid, "HomeNet");
+  strcpy(out->password, "oldpass123");
+  strcpy(out->api_key, "old-mimo-key");
+  strcpy(out->volc_appid, "old-appid");
+  strcpy(out->volc_token, "old-token");
+  out->generation = 7;
+}
+
+static void test_form_resolve(void)
+{
+  struct velasight_prov_credentials_s prev;
+  struct vp_form_submit_s s;
+  enum vp_form_field_e which;
+
+  /* The regression this whole split exists for: someone opens the page to add
+   * a key, the password box is blank because it is never pre-filled, and the
+   * stored passphrase has to survive that.
+   */
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=&mimo_apikey=new-key", &s,
+                      &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        strcmp(s.cred.password, "oldpass123") == 0 &&
+        !s.cred.open_network &&
+        strcmp(s.cred.api_key, "new-key") == 0 &&
+        strcmp(s.cred.volc_appid, "old-appid") == 0 &&
+        strcmp(s.cred.volc_token, "old-token") == 0,
+        "a key-only resubmit keeps the stored password and voice fields");
+
+  /* The flag has to travel with the passphrase.  Carrying one without the
+   * other produces a record whose two halves disagree, which reads as a
+   * different network depending on which field the reader trusts.
+   */
+
+  stored_record(&prev);
+  prev.password[0] = '\0';
+  prev.open_network = true;
+  CHECK(parse_str("ssid=HomeNet&password=", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        s.cred.password[0] == '\0' && s.cred.open_network,
+        "carrying a stored open network over keeps both halves in step");
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=brandnew1", &s, &which)
+        == 0 && vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        strcmp(s.cred.password, "brandnew1") == 0 && !s.cred.open_network,
+        "a typed password replaces the stored one");
+
+  /* Ticking the box is the only way to clear a stored passphrase, which is
+   * what makes an accidental clear impossible rather than merely unlikely.
+   */
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=&no_password=on", &s,
+                      &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        s.cred.password[0] == '\0' && s.cred.open_network,
+        "ticking the no-password box clears the stored password");
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=brandnew1&no_password=on", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_PASSWORD,
+        "the box and a typed password contradict each other");
+
+  /* First-time setup has nothing to fall back on, so an empty box cannot mean
+   * "leave it alone" and must not silently mean "no password" either.
+   */
+
+  CHECK(parse_str("ssid=FirstTime&password=", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_PASSWORD,
+        "a blank password with nothing stored is refused, not assumed open");
+
+  CHECK(parse_str("ssid=FirstTime&no_password=on", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == 0 &&
+        s.cred.open_network,
+        "first-time setup of a network with no password is allowed");
+
+  CHECK(parse_str("ssid=FirstTime&password=goodpass1", &s, &which)
+        == 0 && vp_form_resolve(&s, NULL, false, &which) == 0 &&
+        strcmp(s.cred.password, "goodpass1") == 0 &&
+        s.cred.api_key[0] == '\0',
+        "first-time setup with a password needs no stored record");
+
+  /* The name is pre-filled, so a blank box is a deliberate clear rather than
+   * an omission, and there is nothing sensible to store for a nameless one.
+   */
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=&password=", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_SSID,
+        "a blanked network name is refused rather than carried over");
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=short", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_PASSWORD,
+        "a too-short password is refused and named");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&volc_appid=%01", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_VOLC_APPID,
+        "an unprintable byte in the app id is refused and named");
+}
+
+static void test_changed(void)
+{
+  struct velasight_prov_credentials_s prev;
+  struct velasight_prov_credentials_s now;
+  unsigned int changed;
+
+  stored_record(&prev);
+  now = prev;
+  CHECK(vp_credentials_changed(&now, &prev, true) == 0,
+        "an identical record reports nothing changed");
+
+  now = prev;
+  strcpy(now.api_key, "new");
+  changed = vp_credentials_changed(&now, &prev, true);
+  CHECK(changed == VP_FORM_CHANGED_API_KEY,
+        "only the field that moved is reported");
+
+  now = prev;
+  now.password[0] = '\0';
+  now.open_network = true;
+  CHECK((vp_credentials_changed(&now, &prev, true) &
+         VP_FORM_CHANGED_PASSWORD) != 0,
+        "dropping the password counts as a password change");
+
+  now = prev;
+  strcpy(now.ssid, "Other");
+  strcpy(now.volc_token, "t2");
+  CHECK(vp_credentials_changed(&now, &prev, true) ==
+        (VP_FORM_CHANGED_SSID | VP_FORM_CHANGED_VOLC_TOKEN),
+        "two moved fields are both reported");
+
+  memset(&now, 0, sizeof(now));
+  strcpy(now.ssid, "Fresh");
+  now.open_network = true;
+  CHECK(vp_credentials_changed(&now, NULL, false) ==
+        (VP_FORM_CHANGED_SSID | VP_FORM_CHANGED_PASSWORD),
+        "with nothing stored every field that has a value is new");
 }
 
 int main(void)
@@ -206,6 +437,8 @@ int main(void)
   test_url_decode();
   test_validate();
   test_form_parse();
+  test_form_resolve();
+  test_changed();
 
   printf("%s: %d checks, %d failures\n",
          g_failures == 0 ? "PASS" : "FAIL", g_checks, g_failures);

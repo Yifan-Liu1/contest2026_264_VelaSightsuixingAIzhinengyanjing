@@ -39,7 +39,14 @@
 #define VP_SOCKET_TIMEOUT_SEC 2
 #define VP_SOCKET_LINGER_SEC 1
 #define VP_STORE_PATH_MAX  192
-#define VP_THREAD_STACK    8192
+/* The setup page is assembled in one VP_HTTP_BODY_BUILD buffer on this stack,
+ * on top of vp_handle()'s two credential records.  Keeping the page out of
+ * .bss is worth the reservation: the stack is claimed once at start and
+ * released on stop, while a static buffer would hold the same memory for the
+ * whole uptime of a device that is provisioned once.
+ */
+
+#define VP_THREAD_STACK    12288
 
 struct vp_server_s
 {
@@ -640,11 +647,96 @@ static int vp_send_history_file(int fd, const char *record_key,
  *
  ****************************************************************************/
 
+/* Summarise the stored record for the page.  Only "is it set" crosses over
+ * for the secrets, so the renderer has nothing to leak even by accident.
+ */
+
+static void vp_state_from(struct vp_http_state_s *state,
+                          const struct velasight_prov_credentials_s *cred)
+{
+  memset(state, 0, sizeof(*state));
+  state->history_enabled = vp_history_enabled();
+
+  if (cred == NULL)
+    {
+      return;
+    }
+
+  state->have_record     = true;
+  state->ssid            = cred->ssid;
+  state->open_network    = cred->open_network;
+  state->have_api_key    = cred->api_key[0] != '\0';
+  state->have_volc_appid = cred->volc_appid[0] != '\0';
+  state->have_volc_token = cred->volc_token[0] != '\0';
+  state->generation      = cred->generation;
+}
+
+/* What to tell the user to fix.
+ *
+ * Every branch names one field and one action.  The previous single message
+ * recited the rules for two fields at once and never said which of them was
+ * wrong, which meant a rejected submit carried no more information than a
+ * blank stare.  err separates "too long" from "not acceptable" because the
+ * remedy differs: shorten it, or check what was pasted.
+ */
+
+static const char *vp_fix_hint(int err, enum vp_form_field_e which,
+                               bool have_previous)
+{
+  if (err == -E2BIG)
+    {
+      switch (which)
+        {
+          case VP_FORM_FIELD_SSID:
+            return "Wi-Fi 名称太长了，最多 32 个英文字符，中文大约 10 个字。";
+          case VP_FORM_FIELD_PASSWORD:
+            return "Wi-Fi 密码太长了，最多 63 个字符。";
+          case VP_FORM_FIELD_API_KEY:
+            return "MiMo API key 太长了，最多 512 个字符。";
+          case VP_FORM_FIELD_VOLC_APPID:
+            return "语音 App ID 太长了，最多 64 个字符。";
+          case VP_FORM_FIELD_VOLC_TOKEN:
+            return "语音 Token 太长了，最多 128 个字符。";
+          default:
+            return "提交的内容太多了，请检查是否粘贴了多余的内容。";
+        }
+    }
+
+  switch (which)
+    {
+      case VP_FORM_FIELD_SSID:
+        return "请填写 Wi-Fi 名称，并确认其中没有奇怪的字符。";
+
+      case VP_FORM_FIELD_PASSWORD:
+        return have_previous ?
+          "Wi-Fi 密码需要 8 到 63 个字符；想保留原来的密码请把这一栏留空；"
+          "这个 Wi-Fi 确实没有密码请勾选下面那一项。" :
+          "请填写 8 到 63 个字符的 Wi-Fi 密码；"
+          "这个 Wi-Fi 确实没有密码请勾选下面那一项。";
+
+      case VP_FORM_FIELD_API_KEY:
+        return "MiMo API key 里有无法识别的字符，请重新复制粘贴。";
+
+      case VP_FORM_FIELD_VOLC_APPID:
+        return "语音 App ID 里有无法识别的字符，请重新复制粘贴。";
+
+      case VP_FORM_FIELD_VOLC_TOKEN:
+        return "语音 Token 里有无法识别的字符，请重新复制粘贴。";
+
+      default:
+        return "提交的内容没能读懂，请重新填写后再保存。";
+    }
+}
+
 static void vp_handle(int fd, bool *saved, int *save_status,
                       uint32_t *generation)
 {
-  struct velasight_prov_credentials_s cred;
+  struct velasight_prov_credentials_s previous;
+  struct vp_form_submit_s submit;
+  struct vp_http_state_s state;
   struct vp_http_request_s req;
+  enum vp_form_field_e which = VP_FORM_FIELD_NONE;
+  bool have_previous = false;
   size_t len = 0;
   int ret;
 
@@ -656,8 +748,9 @@ static void vp_handle(int fd, bool *saved, int *save_status,
     {
       if (ret == -E2BIG)
         {
-          len = vp_http_status_page(g_response, sizeof(g_response), 431,
-                                    "请求过大。");
+          len = vp_http_status_page(
+              g_response, sizeof(g_response), 431,
+              "浏览器发来的内容太长了，请关掉页面重新打开。");
         }
       else
         {
@@ -670,16 +763,9 @@ static void vp_handle(int fd, bool *saved, int *save_status,
     }
   else if (req.action == VP_HTTP_ACTION_PAGE)
     {
-       {
-         struct velasight_prov_credentials_s current;
-         const char *ssid = NULL;
-
-         if (velasight_provisioning_load(&current) == 0)
-           ssid = current.ssid;
-         len = vp_http_form_page_with_ssid_history(
-             g_response, sizeof(g_response), NULL, ssid,
-             vp_history_enabled());
-       }
+      have_previous = velasight_provisioning_load(&previous) == 0;
+      vp_state_from(&state, have_previous ? &previous : NULL);
+      len = vp_http_setup_page(g_response, sizeof(g_response), &state, NULL);
     }
   else if (req.action == VP_HTTP_ACTION_HISTORY_LIST)
     {
@@ -704,91 +790,84 @@ static void vp_handle(int fd, bool *saved, int *save_status,
     }
   else if (req.action == VP_HTTP_ACTION_REJECT)
     {
-      len = vp_http_status_page(g_response, sizeof(g_response), req.status,
-                               req.status == 404 ? "页面不存在。" :
-                               req.status == 403 ? "不允许跨站提交。" :
-                               req.status == 405 ? "不支持该请求方法。" :
-                               req.status == 413 ? "提交内容过大。" :
-                               req.status == 415 ? "提交格式不受支持。" :
-                               req.status == 411 ? "缺少 Content-Length。" :
-                                                   "请求无法解析。");
+      len = vp_http_status_page(
+          g_response, sizeof(g_response), req.status,
+          req.status == 404 ? "没有这个页面，请回到设置页。" :
+          req.status == 403 ? "这次提交不是从设备的设置页发出的，已被拒绝。" :
+          req.status == 405 ? "设备不支持这样的操作。" :
+          req.status == 413 ? "提交的内容太多了，"
+                             "请检查是否粘贴了多余的内容。" :
+          req.status == 415 ? "提交的格式不对，请回到设置页重新填写。" :
+          req.status == 411 ? "提交的内容不完整，请回到设置页重试。" :
+                              "这个请求没能读懂，请回到设置页重试。");
     }
   else
     {
-      memset(&cred, 0, sizeof(cred));
+      have_previous = velasight_provisioning_load(&previous) == 0;
+
       ret = vp_form_parse(g_request + req.header_len, req.content_length,
-                          &cred);
-      if (ret < 0)
+                          &submit, &which);
+      if (ret == 0)
         {
-          /* No detail about which field failed and no echo of what was typed:
-           * the notice has to be useful to the person at the phone without
-           * repeating a passphrase back over an open network.
+          /* Merge before validating.  An empty password box is only legal
+           * once it has been resolved against the stored record, so a
+           * validate-then-merge order would reject the ordinary "I only came
+           * to add a key" resubmit before the merge could rescue it.
            */
 
-           {
-             struct velasight_prov_credentials_s current;
-             const char *ssid = NULL;
-
-             if (velasight_provisioning_load(&current) == 0)
-               ssid = current.ssid;
-             len = vp_http_form_page_with_ssid(
-                 g_response, sizeof(g_response),
-                 "SSID 需 1-32 字节，密码需留空或 8-63 字节，"
-                 "API key 需为可打印字符，请检查后重试。", ssid);
-           }
-          if (len > 0)
-            {
-              /* Reuse the form page body but answer 400, so a client that
-               * checks the status still learns the submit failed.
-               */
-
-              len = vp_http_status_page(g_response, sizeof(g_response), 400,
-                                        "SSID 需 1-32 字节，密码需留空或 "
-                                        "8-63 字节。");
-            }
+          ret = vp_form_resolve(&submit, have_previous ? &previous : NULL,
+                                have_previous, &which);
         }
-        else
-          {
-            struct velasight_prov_credentials_s previous;
-            bool have_previous = velasight_provisioning_load(&previous) == 0;
 
-            /* None of the three secret fields are pre-filled in HTML.  An
-             * ordinary Wi-Fi-only resubmit must not erase any of them. */
-            if (cred.api_key[0] == '\0' && have_previous)
-              {
-                snprintf(cred.api_key, sizeof(cred.api_key), "%s",
-                         previous.api_key);
-              }
+      if (ret < 0)
+        {
+          /* The page names the field and keeps the form, but never echoes a
+           * secret: the notice has to be useful to the person holding the
+           * phone without repeating a passphrase back over an open network.
+           */
 
-            if (cred.volc_appid[0] == '\0' && have_previous)
-              {
-                snprintf(cred.volc_appid, sizeof(cred.volc_appid), "%s",
-                         previous.volc_appid);
-              }
+          vp_state_from(&state, have_previous ? &previous : NULL);
 
-            if (cred.volc_token[0] == '\0' && have_previous)
-              {
-                snprintf(cred.volc_token, sizeof(cred.volc_token), "%s",
-                         previous.volc_token);
-              }
+          /* Give back what was typed rather than what is stored, so fixing
+           * one field does not quietly revert another.  The exception is a
+           * name that is itself the problem: echoing an invisible bad
+           * character back would leave the user hunting for something they
+           * cannot see, so that case falls back to the known-good name.
+           */
 
-            cred.generation = vp_store_next_generation(g_server.store_path);
-          ret = vp_store_save(g_server.store_path, &cred);
+          if (submit.have_ssid && which != VP_FORM_FIELD_SSID &&
+              submit.cred.ssid[0] != '\0')
+            {
+              state.form_ssid = submit.cred.ssid;
+            }
+
+          len = vp_http_setup_page(g_response, sizeof(g_response), &state,
+                                   vp_fix_hint(ret, which, have_previous));
+        }
+      else
+        {
+          unsigned int changed = vp_credentials_changed(
+              &submit.cred, have_previous ? &previous : NULL, have_previous);
+
+          submit.cred.generation =
+              vp_store_next_generation(g_server.store_path);
+          ret = vp_store_save(g_server.store_path, &submit.cred);
           if (ret < 0)
             {
               *saved = false;
               *save_status = ret;
-              len = vp_http_status_page(g_response, sizeof(g_response), 500,
-                                        "写入持久存储失败，凭据未保存。");
+              len = vp_http_status_page(
+                  g_response, sizeof(g_response), 500,
+                  "设备存储写入失败，这次没有保存，请再试一次。");
             }
           else
             {
               *saved = true;
               *save_status = 0;
-              *generation = cred.generation;
+              *generation = submit.cred.generation;
+              vp_state_from(&state, &submit.cred);
               len = vp_http_saved_page(g_response, sizeof(g_response),
-                                       cred.ssid, cred.generation,
-                                       cred.open_network);
+                                       &state, changed);
             }
         }
     }

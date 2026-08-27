@@ -33,6 +33,7 @@
 #ifndef __APP_VELASIGHT_INCLUDE_VS_SETTINGS_H
 #define __APP_VELASIGHT_INCLUDE_VS_SETTINGS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Speaker volume as a percentage of full scale, the same 0..100 the volume
@@ -53,5 +54,36 @@
 int vs_settings_load_volume(uint8_t *level);
 
 int vs_settings_save_volume(uint8_t level);
+
+/* The SoftAP passphrase generated on this device
+ * (CONFIG_VS_AP_RANDOM_PASSWORD).  Persisted so the hotspot keeps the same
+ * password across reboots and across STA/AP switches: it is printed on the
+ * device's own screen and typed into a phone, so drawing a new one every time
+ * the AP starts would invalidate whatever the user already saved there, for
+ * no security gain the reset gesture does not already provide.
+ *
+ * The whole point of storing it is to make the common path do no I/O at all.
+ * load is called once, from vs_config_load_wifi() during vs_network_open(),
+ * and the value it returns lives in struct vs_wifi_config_s for the rest of
+ * the process; entering AP mode then reads nothing.  save is called only when
+ * a new passphrase was actually drawn -- first ever AP entry, an unreadable
+ * record, or an explicit reset -- so a device that is simply used never
+ * writes here again.
+ *
+ * Both run on the network worker thread, never on the UI task, and neither
+ * waits for the filesystem: call them only once something has established
+ * that /mnt/sdnand is mounted.  vs_config_load_wifi() blocks for exactly that
+ * on its first call and is already on the startup path.
+ *
+ * password must have room for 64 bytes.  load returns 0, -ENOENT when nothing
+ * has been stored, or -EBADMSG when a record was found and rejected; the
+ * caller treats both the same way -- draw a new passphrase -- but -EBADMSG is
+ * worth a log line.  save returns 0 or a negative errno, and validates the
+ * passphrase against the 8..63 printable-ASCII range WPA2 accepts.
+ */
+
+int vs_settings_load_ap_password(char *password, size_t size);
+
+int vs_settings_save_ap_password(const char *password);
 
 #endif /* __APP_VELASIGHT_INCLUDE_VS_SETTINGS_H */

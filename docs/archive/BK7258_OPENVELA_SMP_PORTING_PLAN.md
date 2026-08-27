@@ -280,9 +280,10 @@ CP 侧建议增加显式配置 `CONFIG_OPENVELA_AP_480M`，只在外部 OpenVela
 - `cp/middleware/driver/pwr_clk/Kconfig`：增加 `CONFIG_OPENVELA_AP_480M` bool 选项，
   默认关闭；只在 `projects/app_ab/cp/config/bk7258/config` 中由 OpenVela 构建启用。
 
-所有 CP 源码修改必须同时在比赛仓 `external/bk_avdk_smp/` 权威副本中保留，并更新
-`external/bk_avdk_smp/README.md` 的覆盖文件表和同步命令，不能只修改
-`bk_avdk_smp` 构建树。同步方法见该 README 第 2 节。
+所有 CP 源码修改必须以完整最终文件保存在比赛仓 `external/bk_avdk_smp/` 的同一
+相对路径中，不能只修改 `bk_avdk_smp` 构建树。当前安装与验证流程以
+[`external/README.md`](../../external/README.md) 为准；从比赛仓根执行
+`./external/prepare.sh install`，并以只读 `./external/prepare.sh check` 作为构建前门禁。
 
 按本方案实施时，权威覆盖至少会新增实际修改到的以下路径；若实现落在其他文件，也必须
 一并加入，不能把此表当成封闭清单：
@@ -301,9 +302,9 @@ cp/middleware/soc/bk7258/hal/sys_hal.c
 cp/middleware/driver/mailbox/mb_ipc_heartbeat.c
 ```
 
-其中 `common/driver.c`、`pwr_clk.c` 和heartbeat文件已在当前镜像中；其余文件只有发生
-修改时才新增。每次构建前，README列出的全部覆盖文件与目标工作树必须逐字节 `cmp -s`
-一致。
+其中 `common/driver.c`、`pwr_clk.c` 和 heartbeat 文件已在当前 overlay 中；其余文件
+只有发生修改时才新增。每次构建前必须从比赛仓根执行
+`./external/prepare.sh check`，确认全部受管完整目标文件一致。
 
 OpenVela boot transaction 必须返回明确错误，不能沿用当前始终返回 `BK_OK` 的
 boot-vote外层接口。首次失败即进入按stage反向释放的rollback；删除当前CPU1 timeout时
@@ -850,10 +851,19 @@ S2/S3分别替换上述fail-stop和IPI占位实现后才允许烧录启动。
 
 ## 11. 构建与产物门禁
 
-修改Kconfig/defconfig或CP config后必须clean：
+修改Kconfig/defconfig或CP config后必须clean。
 
-构建前先按比赛仓 `external/bk_avdk_smp/README.md` 第2节同步全部CP覆盖并完成逐文件
-`cmp -s`。然后执行：
+当前 overlay 操作以 [`external/README.md`](../../external/README.md) 为准；构建前从比赛仓根
+安装并只读验证全部受管完整文件：
+
+```bash
+cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+./external/prepare.sh install
+./external/prepare.sh check
+```
+
+下面保留的是本归档方案当时使用的 `nsh` 专用高级构建命令，不是当前 VelaSight 产品
+一键入口；命令本身不改写：
 
 ```bash
 cd /home/mi/vela_competition/contest
@@ -898,8 +908,8 @@ rg 'CONFIG_OPENVELA_AP_480M|CONFIG_CPU_DEFAULT_FREQ_60M|CONFIG_CLK_FORCE_MAX_CPU
   `CONFIG_INT_WDT_PERIOD_MS`，并且timeout rollback不再切换PSRAM后 `goto` 重试。
 - PM诊断证明软件slot/cache与clock、voltage、power和PSRAM owner寄存器实读一致。
 - `sys_hal_core_bus_clock_ctrl()` 反汇编/源码确认写入bus divider，且切频错误能传回事务。
-- 比赛仓 `external/bk_avdk_smp/README.md` 已列出全部新增覆盖；README同步命令执行后每个
-  文件 `cmp -s` 返回0。
+- 所有实际修改的 CP 文件均以完整最终内容纳入 `external/bk_avdk_smp/`，且从比赛仓根
+  执行 `./external/prepare.sh check` 通过。
 
 三个AP文件必须哈希一致：
 
@@ -985,9 +995,10 @@ SYSTEM_TIME64 + CP 480 MHz单一生命周期slot
 
 ## 15. SMP 实板调试记录
 
-> 来源：`external/bk_avdk_smp/README.md` 原第 330-755 行。以下内容是连续保留的
+> 来源：已删除的旧 CP overlay 子目录 README 原第 330-755 行。以下内容是连续保留的
 > SMP 实板调试历史记录，其中判断和哈希均只对应记录当时的版本；历史 hash 不能视作
-> 当前产物，也不得据此将历史判断改写为当前状态。
+> 当前产物，也不得据此将历史判断改写为当前状态。当前 overlay 操作只以
+> [`external/README.md`](../../external/README.md) 和 `external/prepare.sh` 为准。
 
 实板首次联调发现 AP 在 `arm_serialinit()` 的 scheduler-lock 上下文中等待新建 mailbox
 worker，导致 worker 无法运行、物理 mailbox 未启动便进入 SMP，最终 CP 在 stage 4

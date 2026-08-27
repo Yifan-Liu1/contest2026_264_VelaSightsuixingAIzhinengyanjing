@@ -236,7 +236,15 @@ int vs_input_poll(struct vs_input_s *input, struct vs_input_event_s *event)
           return 1;
         }
 
-      if (key == VS_KEY_CONFIRM || key == VS_KEY_BACK)
+      /* Every key that owns a hold gesture needs these intermediate values,
+       * because the ring on screen is drawn from them and nothing else
+       * reports how far a hold has got.  VS_KEY_NEXT joined the list when the
+       * SoftAP page gave it a hold to reset the hotspot password; pages with
+       * no hold bound to a key just let its progress events fall through.
+       */
+
+      if (key == VS_KEY_CONFIRM || key == VS_KEY_BACK ||
+          key == VS_KEY_NEXT)
         {
           uint32_t progress_ms;
           uint32_t progress_range;

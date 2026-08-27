@@ -20,13 +20,14 @@ out rather than spending flash on them.
 
 ```sh
 cd <openvela work tree root>
-sh contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/boards/bk7258/bk7258-ap/ai_agent/apply.sh
+./contest2026_264_VelaSightsuixingAIzhinengyanjing/external/prepare.sh install
+./contest2026_264_VelaSightsuixingAIzhinengyanjing/external/prepare.sh check
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8
 ```
 
-`-Werror` cannot be used with this config: `packages/ai_agent` itself does not
-build warning-free (see "Upstream defects" below). The `nsh` config keeps
-`-Werror`.
+With the managed complete-file overlay installed, this config builds clean under
+`-Werror`; the standard product build does not force that flag. The `nsh`
+config also keeps its `-Werror` gate.
 
 ## Measured footprint
 
@@ -110,10 +111,11 @@ sequence on hardware, and both are now measured rather than argued:
   ("high"). This driver programs 480x480 / 640x480 / 864x480 and
   `bk7258_gc2145_find_mode()` matches exactly, so `VIDIOC_S_FMT` refuses
   both and the tool gives up with no way to discover what it should have
-  asked for. Fixed by patch 0001: when the requested geometry is refused,
-  enumerate `VIDIOC_ENUM_FRAMESIZES` and retry at the closest size the
-  driver offers. The requested geometry is still tried first, so devices
-  that support it are unaffected.
+  asked for. The complete target file
+  `external/packages/ai_agent/src/tools/tool_camera.c` fixes this: when the
+  requested geometry is refused, it enumerates `VIDIOC_ENUM_FRAMESIZES` and
+  retries at the closest size the driver offers. The requested geometry is
+  still tried first, so devices that support it are unaffected.
 
 ### Measured on hardware
 
@@ -174,15 +176,15 @@ counts and pass/fail results are unaffected; only the time axis was wrong.
 > That is the lesson worth keeping from this retraction: the acceptance test
 > has to be a real decoder, not a marker scan and not a tool that exits 0.
 
-The patch, before and after, on the tool's own default request:
+The complete-file overlay, before and after, on the tool's own default request:
 
 | Command | Result |
 |---|---|
-| `agent_camera low` (negotiates, = patched tool) | `S_FMT JPEG 320x180 failed: 22` → `320x180 refused, using enumerated 480x480` → `bytesused=13651` → `OK` |
-| `agent_camera low strict` (= unpatched tool) | `S_FMT JPEG 320x180 failed: 22`, `S_FMT ENTR 320x180 failed: 22`, `FAILED (-22)` |
+| `agent_camera low` (negotiates, overlay installed) | `S_FMT JPEG 320x180 failed: 22` → `320x180 refused, using enumerated 480x480` → `bytesused=13651` → `OK` |
+| `agent_camera low strict` (fixed-baseline behavior) | `S_FMT JPEG 320x180 failed: 22`, `S_FMT ENTR 320x180 failed: 22`, `FAILED (-22)` |
 
-So the unpatched `camera_capture` cannot work on this board at all, and the
-patched one captures a valid JPEG.
+So the fixed-baseline `camera_capture` cannot work on this board at all, and
+the overlay-managed implementation captures a valid JPEG.
 
 Three frames in one session, first one saved: `bytesused` 13531 / 12535 /
 39915, `wrote 13531 bytes to /mnt/cap.jpg`, `ls -l /mnt` reports `13531
@@ -322,8 +324,10 @@ To get a frame onto the host and check it with a real decoder — which is the
 only way to catch what the marker check missed — see
 `docs/reference/camera.md` 14.5.
 
-Its negotiation is the same algorithm as patch 0001, so `low` versus
-`low strict` is a before/after of that patch against the real driver.
+Its negotiation is the same algorithm delivered by
+`external/packages/ai_agent/src/tools/tool_camera.c`, so `low` versus
+`low strict` compares the installed overlay with the fixed-baseline behavior
+against the real driver.
 
 ## Network
 
@@ -427,30 +431,32 @@ Until a network is joined the agent degrades cleanly rather than hanging:
 
 ## Enabling it on your own board
 
-Three steps, in this order.  The first two are what makes the LLM reachable at
-all; skipping either leaves an agent that starts and then cannot call anything.
+Three steps, in this order. The first two make the LLM reachable; skipping
+either leaves an agent that starts and then cannot call anything.
 
 ```sh
 cd <openvela work tree root>
 
-# 1. Upstream patches (idempotent, --revert supported)
-sh contest2026_264_.../board/beken/boards/bk7258/bk7258-ap/ai_agent/apply.sh
+# 1. Install and verify the complete-file overlays from the OpenVela root
+./contest2026_264_VelaSightsuixingAIzhinengyanjing/external/prepare.sh install
+./contest2026_264_VelaSightsuixingAIzhinengyanjing/external/prepare.sh check
 
 # 2. Your own API key, never committed
-cp contest2026_264_.../ai_agent/agent_secrets.h.example \
+cp contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/boards/\
+bk7258/bk7258-ap/ai_agent/agent_secrets.h.example \
    packages/ai_agent/include/agent_secrets.h
 $EDITOR packages/ai_agent/include/agent_secrets.h     # fill in the key
 
-# 3. Build, package, flash
-./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8
-./autoflash.sh -A
+# 3. Build and package; add --flash and serial options when required
+./contest2026_264_VelaSightsuixingAIzhinengyanjing/build_and_flash.sh
 ```
 
-`agent_secrets.h` is picked up by `__has_include` in `agent_config.h`.  Two
+`agent_secrets.h` is picked up by `__has_include` in `agent_config.h`. Two
 things bite here: ninja does not know that a *previously absent* header has
 appeared, so the first build after creating it needs `touch` on a file that
 includes it (or delete the `.o`); and the key ends up in plaintext in the
-firmware, so a `.bin` built this way must not be handed around.
+firmware, so a `.bin` built this way must not be handed around. The secret is
+an unrelated local file and is deliberately not part of the overlay.
 
 **MiMo has two credential sets and mixing them up looks like a bad key.**
 Measured with a real key: `tp-` prefix against `api.xiaomimimo.com` returns
@@ -484,27 +490,36 @@ fills the frame.
 
 ## Upstream defects found while porting
 
-To be sent as pull requests against `open-vela/packages_ai_agent`
-(`dev-ai-contest-2026`). Until they are merged, `apply.sh` puts them in the
-work tree; patches here are archived copies, not a fork.
+These fixes should still be submitted as pull requests against
+`open-vela/packages_ai_agent` (`dev-ai-contest-2026`). Until they are merged,
+the complete desired files live at matching relative paths under
+`external/packages/ai_agent/`; `external/prepare.sh` is the only installation
+and verification entry point. No board patch files are required or retained.
 
-| File | Defect | Status |
+| File | Defect | Complete-file overlay status |
 |---|---|---|
-| `src/tools/tool_camera.c` | Hardcoded geometry with no negotiation; 6 `%u` conversions applied to `uint32_t` (wrong on this ABI, and fatal under `-Werror=format`) | patch 0001 |
-| `src/core/agent_loop.c:665` | `-Wformat-truncation`: `%s` may write up to 511 bytes into a 473..483 byte region. A cut would land mid-message, i.e. mid UTF-8 sequence, putting an invalid byte on the wire to the channel | patch 0003 |
-| `src/core/agent_loop.c` (`calc_elapsed_ms`) | **The LLM watchdog times calls with `gettimeofday()`, and `vela_tls.c` sets the wall clock forward during the first handshake** (`Clock too old, forcing to 2026`). The first `ask` after boot therefore measures ~2.7e9 ms and is declared timed out even when the answer arrives. The helper already guards against the clock going *backwards*; forwards is the case that actually happens here. Should use `CLOCK_MONOTONIC` | patch 0004 -- the `net_test`-first workaround is no longer needed |
-| `src/llm/llm_proxy.c` (endpoint + diagnostics) | `AGENT_LLM_API_HOST` is an unconditional `#define`, so `agent_secrets.h` can supply a key and model but not a host -- a board configured entirely at build time has nowhere to send the request. Also, "Failed to parse API JSON" logged nothing about what arrived, which hid a captive-portal redirect page behind what looked like a model problem | patch 0002 |
-| agent response cache | An identical question replays the cached answer, including a cached *error* string: after a failed call, re-asking the same question prints the old failure with `Cache hit, skipping LLM call` and never retries. Cost us a wrong conclusion once | not patched -- vary the question when retesting |
-| `src/tools/skill_loader.c:448` | `%x` applied to `uint32_t` (wrong on this ABI, fatal under `-Werror=format`) | patch 0003 |
+| `src/tools/tool_camera.c` | Hardcoded geometry with no negotiation; 6 `%u` conversions applied to `uint32_t` (wrong on this ABI, and fatal under `-Werror=format`) | `external/packages/ai_agent/src/tools/tool_camera.c` |
+| `src/core/agent_loop.c:665` | `-Wformat-truncation`: `%s` may write up to 511 bytes into a 473..483 byte region. A cut would land mid-message, i.e. mid UTF-8 sequence, putting an invalid byte on the wire to the channel | `external/packages/ai_agent/src/core/agent_loop.c` |
+| `src/core/agent_loop.c` (`calc_elapsed_ms`) | **The LLM watchdog times calls with `gettimeofday()`, and `vela_tls.c` sets the wall clock forward during the first handshake** (`Clock too old, forcing to 2026`). The first `ask` after boot therefore measures ~2.7e9 ms and is declared timed out even when the answer arrives. The helper already guards against the clock going *backwards*; forwards is the case that actually happens here. Should use `CLOCK_MONOTONIC` | `external/packages/ai_agent/src/core/agent_loop.c`; the `net_test`-first workaround is no longer needed |
+| `src/llm/llm_proxy.c` (endpoint + diagnostics) | `AGENT_LLM_API_HOST` is an unconditional `#define`, so `agent_secrets.h` can supply a key and model but not a host -- a board configured entirely at build time has nowhere to send the request. Also, "Failed to parse API JSON" logged nothing about what arrived, which hid a captive-portal redirect page behind what looked like a model problem | `external/packages/ai_agent/src/llm/llm_proxy.c` |
+| agent response cache | An identical question replays the cached answer, including a cached *error* string: after a failed call, re-asking the same question prints the old failure with `Cache hit, skipping LLM call` and never retries. Cost us a wrong conclusion once | Not changed; design question outside the external overlay, so vary the question when retesting |
+| `src/tools/skill_loader.c:448` | `%x` applied to `uint32_t` (wrong on this ABI, fatal under `-Werror=format`) | `external/packages/ai_agent/src/tools/skill_loader.c` |
+| `include/agent_config.h` | `AGENT_LLM_TIMEOUT_SEC` was an unconditional `#define`, so `agent_secrets.h` could not raise it for a slow link. An earlier work tree contained the change but its delivery archive did not, so a fresh checkout failed to reproduce the flashed tree | `external/packages/ai_agent/include/agent_config.h` |
+| `include/agent_config.h` | WebSocket TTS hardcoded 24 kHz although BK7258 cannot produce that rate; make the rate overridable and default to 16 kHz | `external/packages/ai_agent/include/agent_config.h` |
+| `include/agent_config.h` | No control over how much PCM is buffered before playback starts, so a network stall in the first ~200-300ms of a sentence drained the queue and produced audible underruns; added `AGENT_TTS_PREROLL_MS` (default 250ms) | `external/packages/ai_agent/include/agent_config.h` |
+| `CMakeLists.txt` | The Vela build omitted the local VelaClaw client implementation from its source list | `external/packages/ai_agent/CMakeLists.txt` |
+| LLM/config/vision paths | Oversized token budgets, discarded MiMo thinking, unconstrained structured replies and repeated config-file parsing inflated voice latency and made JSON replies unreliable | external overlay (matching complete files under `include/`, `src/llm/` and `src/tools/`) |
+| `src/voice/volc_asr.c`, `volc_tts.h`, `volc_tts_ws.c` | Handle WebSocket control frames and partial reads correctly; distinguish empty ASR input; add cancellable TTS, unique request IDs and invalidatable credential caching | complete files under `external/packages/ai_agent/src/voice/` |
+| `src/voice/volc_tts_ws.c` | The ws_binary TTS request sent the output rate under the key `sample_rate`, which the service silently ignores -- it names the field `rate` -- so playback always ran at the service's own 24kHz default regardless of `AGENT_TTS_WS_SAMPLE_RATE` | `external/packages/ai_agent/src/voice/volc_tts_ws.c` |
+| `src/voice/audio_playback.c` | `media_player_start()` was called before any PCM was queued, so a network stall in the first ~200-300ms of a sentence emptied the queue and produced audible underruns; buffer `AGENT_TTS_PREROLL_MS` of PCM before starting. `audio_playback_close()` also now logs the real playback duration (bytes / actual rate) instead of only a byte count | `external/packages/ai_agent/src/voice/audio_playback.c` |
 
-| `include/agent_config.h` | `AGENT_LLM_TIMEOUT_SEC` was an unconditional `#define`, so `agent_secrets.h` could not raise it for a slow link. This change existed in the work tree but was **not archived as a patch**, so a fresh checkout plus `apply.sh` did not reproduce the tree that had been built and flashed | patch 0005 |
+With the managed complete files installed, `configs/ai_agent` **builds clean
+under `-Werror`**; the note elsewhere that it cannot is obsolete. The response
+cache remains a design question rather than a defect: vary the question when
+retesting.
 
-With 0003-0005 in place `configs/ai_agent` **builds clean under `-Werror`**;
-the note elsewhere that it cannot is obsolete. The remaining unpatched entry is
-the response cache, which is a design question rather than a defect: vary the
-question when retesting.
-
-`apply.sh --revert` now leaves `packages/ai_agent` pristine (verified: empty
-`git diff` over `src` and `include`), and re-applying restores all five. That
-round trip is the check that the archive is complete -- patch 0005 exists
-because it was not.
+`external/prepare.sh check` is the reproducibility gate: it read-only verifies
+every managed `packages/ai_agent` target against the complete-file overlay.
+When another public-stack file changes, implement and test it in the real
+repository, copy the complete final file to the same relative path under
+`external/packages/ai_agent/`, and still send the final fix upstream.

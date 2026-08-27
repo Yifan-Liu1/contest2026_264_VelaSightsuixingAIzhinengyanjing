@@ -11,6 +11,18 @@ struct vs_wifi_config_s
   bool sta_open_network;
   char ap_ssid[33];
   char ap_password[64];
+
+  /* True when ap_password holds a passphrase this device generated and
+   * persisted, false when it is still the CONFIG_VS_AP_PASSWORD fallback.
+   *
+   * This is what keeps entering AP mode free of I/O.  vs_network_apply_ap()
+   * draws a new passphrase only when the flag is clear, so the normal case --
+   * a device that has been in AP mode before -- reuses the cached value and
+   * writes nothing.  Clearing the flag is how the reset gesture asks for a
+   * new one.  Always false without CONFIG_VS_AP_RANDOM_PASSWORD.
+   */
+
+  bool ap_password_random;
   uint8_t ap_channel;
 };
 

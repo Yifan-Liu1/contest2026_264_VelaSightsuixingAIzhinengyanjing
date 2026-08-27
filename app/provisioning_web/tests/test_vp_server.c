@@ -26,6 +26,13 @@
 #include "velasight_provisioning.h"
 #include "vp_store.h"
 
+/* One byte past VELASIGHT_PROV_VOLC_APPID_MAX, so the field is refused on
+ * length rather than on content.
+ */
+
+#define LONG_APPID_65 \
+  "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"
+
 static int g_checks;
 static int g_failures;
 
@@ -319,7 +326,7 @@ static void test_stop_interrupts_client(void)
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   CHECK(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0,
         "the stalled client connects");
-  CHECK(write(fd, "POST /save HTTP/1.1\r\n", 21) == 21,
+  CHECK(write(fd, "POST / HTTP/1.1\r\n", 17) == 17,
         "the stalled client sends an incomplete request");
   usleep(50000);
 
@@ -499,10 +506,21 @@ static void test_history_routes(void)
   char *json = malloc(json_len);
   char *reply = malloc(json_len + 16384);
   char *body;
+
+  /* Its own store.  This test submits once to prove the confirmation renders
+   * in place, and the shared record's generation counter is asserted exactly
+   * by test_get_and_save(), so sharing the file would make one test's coverage
+   * depend on the other's execution order.
+   */
+
+  char store[sizeof(g_path) + 16];
   size_t written = 0;
   int history_fd;
   int before;
   int len;
+
+  snprintf(store, sizeof(store), "%s.hist", g_path);
+  unlink(store);
 
   CHECK(json != NULL && reply != NULL,
         "history route test buffers allocate");
@@ -541,7 +559,7 @@ static void test_history_routes(void)
   CHECK(written == json_len, "the fake history file is complete");
 
   memset(&cfg, 0, sizeof(cfg));
-  cfg.store_path = g_path;
+  cfg.store_path = store;
   cfg.history.snapshot = history_snapshot;
   CHECK(velasight_provisioning_start(&cfg) == -EINVAL,
         "a half-configured history provider is rejected");
@@ -557,12 +575,35 @@ static void test_history_routes(void)
   CHECK(len > 0 && strstr(reply, "href=\"/history\"") != NULL,
         "the root page exposes history when configured");
 
+  /* The submit answers at the address it was posted to, carrying both the
+   * result and the tab bar.  This is the whole point of dropping the separate
+   * endpoint: the phone stays on one URL, so the bar it can see is the bar for
+   * the page it is actually on.
+   */
+
+  len = http_exchange("POST / HTTP/1.1\r\n"
+                      "Content-Type: application/x-www-form-urlencoded\r\n"
+                      "Content-Length: 32\r\n\r\n"
+                      "ssid=TabBar&password=goodpass123",
+                      reply, json_len + 16384);
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL &&
+        strstr(reply, "class=\"ok\">已保存") != NULL,
+        "the submit answers in place and keeps its confirmation");
+  CHECK(strstr(reply, "class=\"tab on\" href=\"/\">联网设置") != NULL &&
+        strstr(reply, "class=\"tab\" href=\"/history\">聊天记录") != NULL,
+        "the confirmation carries the tab bar, so history stays reachable");
+  CHECK(strstr(reply, "action=\"/\"") != NULL &&
+        strstr(reply, "/save") == NULL,
+        "the form still posts to the page itself, never to a save endpoint");
+
   len = http_exchange("GET /history HTTP/1.1\r\n\r\n", reply,
                       json_len + 16384);
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL &&
         strstr(reply, "R0000001") != NULL &&
         strstr(reply, "href=\"/history/R0000000/download\"") != NULL,
         "the history list contains preview and download links");
+  CHECK(strstr(reply, "class=\"tab on\" href=\"/history\">聊天记录") != NULL,
+        "the history page marks itself as the page being shown");
   CHECK(strstr(reply, "<script>") == NULL &&
         strstr(reply, "&lt;script&gt;") != NULL &&
         strstr(reply, "A&amp;B") != NULL,
@@ -612,6 +653,7 @@ static void test_history_routes(void)
 
   free(reply);
   free(json);
+  unlink(store);
 }
 
 static void test_get_and_save(void)
@@ -637,7 +679,7 @@ static void test_get_and_save(void)
         "GET / returns the form and the peer closes");
   CHECK(cb_calls() == 0, "serving the page does not fire the callback");
 
-  len = http_exchange("POST /save HTTP/1.1\r\nHost: 192.168.10.1\r\n"
+  len = http_exchange("POST / HTTP/1.1\r\nHost: 192.168.10.1\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
                       "Content-Length: 30\r\n\r\n"
                       "ssid=AIPC&password=testpass123", reply, sizeof(reply));
@@ -677,22 +719,56 @@ static void test_get_and_save(void)
   CHECK(velasight_provisioning_is_running(),
         "the service keeps running after a save by default");
 
-  len = http_exchange("POST /save HTTP/1.1\r\n"
+  /* The regression this whole split exists for.  Someone opens the page to
+   * add a key; the password box is blank because it is never pre-filled.  The
+   * stored passphrase has to survive that, and until it did, a device that had
+   * been working came back as an open network it could no longer join.
+   */
+
+  len = http_exchange("POST / HTTP/1.1\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
-                      "Content-Length: 22\r\n\r\n"
-                      "ssid=OpenNet&password=", reply, sizeof(reply));
+                      "Content-Length: 43\r\n\r\n"
+                      "ssid=AIPC&password=&mimo_apikey=added-later",
+                      reply, sizeof(reply));
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL,
-        "an open network submit is accepted");
+        "a resubmit with a blank password box is accepted");
   for (len = 0; len < 200 && cb_calls() < 2; len++)
     {
       usleep(10000);
     }
 
-  CHECK(cb_calls() == 2 && g_cb_generation == 2,
-        "the second save produces generation 2");
   CHECK(velasight_provisioning_load_from(g_path, &cred) == 0 &&
-        strcmp(cred.ssid, "OpenNet") == 0 && cred.open_network,
-        "the replacement is what is stored");
+        strcmp(cred.password, "testpass123") == 0 && !cred.open_network,
+        "a blank password box leaves the stored passphrase alone");
+  CHECK(strcmp(cred.api_key, "added-later") == 0,
+        "the key that was actually submitted is stored");
+
+  /* Clearing it is still possible, but only by saying so.  The checkbox is
+   * the whole difference between an intention and an accident.
+   */
+
+  len = http_exchange("POST / HTTP/1.1\r\n"
+                      "Content-Type: application/x-www-form-urlencoded\r\n"
+                      "Content-Length: 37\r\n\r\n"
+                      "ssid=OpenNet&password=&no_password=on",
+                      reply, sizeof(reply));
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 200 OK") != NULL,
+        "a submit for a network with no password is accepted");
+  CHECK(strstr(reply, "记成了没有密码") != NULL,
+        "the confirmation warns that the network was stored without one");
+  for (len = 0; len < 200 && cb_calls() < 3; len++)
+    {
+      usleep(10000);
+    }
+
+  CHECK(cb_calls() == 3 && g_cb_generation == 3,
+        "the third save produces generation 3");
+  CHECK(velasight_provisioning_load_from(g_path, &cred) == 0 &&
+        strcmp(cred.ssid, "OpenNet") == 0 && cred.open_network &&
+        cred.password[0] == '\0',
+        "ticking the box is what clears the stored passphrase");
+  CHECK(strcmp(cred.api_key, "added-later") == 0,
+        "clearing the passphrase does not disturb the stored key");
 
   CHECK(velasight_provisioning_stop() == 0, "the service stops after saves");
 }
@@ -720,7 +796,7 @@ static void test_repeated_password_save_cycles(void)
       CHECK(start_on_free_port(&cfg) == 0,
             "the service restarts for a password save cycle");
       len = http_exchange(
-          "POST /save HTTP/1.1\r\n"
+          "POST / HTTP/1.1\r\n"
           "Content-Type: application/x-www-form-urlencoded\r\n"
           "Content-Length: 35\r\n\r\n"
           "ssid=CycleNet&password=cyclepass123", reply, sizeof(reply));
@@ -763,14 +839,55 @@ static void test_rejections(void)
   reset_callback();
   CHECK(start_on_free_port(&cfg) == 0, "the service starts for rejections");
 
-  len = http_exchange("POST /save HTTP/1.1\r\n"
+  len = http_exchange("POST / HTTP/1.1\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
                       "Content-Length: 22\r\n\r\n"
                       "ssid=AIPC&password=abc", reply, sizeof(reply));
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 400") != NULL,
         "a 3-byte passphrase is refused with 400");
 
-  len = http_exchange("POST /save HTTP/1.1\r\n"
+  /* A refusal that answered a bare status page cost the user everything they
+   * had typed, which for a 512-byte key means retyping all of it to fix one
+   * character.  The form comes back, the network name is still in it, and the
+   * notice says which field is wrong.
+   */
+
+  CHECK(strstr(reply, "name=\"password\"") != NULL &&
+        strstr(reply, "value=\"AIPC\"") != NULL,
+        "a refused submit returns the form with the stored name pre-filled");
+  CHECK(strstr(reply, "Wi-Fi 密码需要 8 到 63 个字符") != NULL,
+        "the refusal names the field that was wrong");
+  CHECK(strstr(reply, "abc") == NULL,
+        "the refusal does not echo what was typed into the password box");
+
+  /* When the name itself is what failed, echoing it back would leave the user
+   * hunting for a character they cannot see, so that one case falls back to
+   * the stored name instead.
+   */
+
+  len = http_exchange("POST / HTTP/1.1\r\n"
+                      "Content-Type: application/x-www-form-urlencoded\r\n"
+                      "Content-Length: 33\r\n\r\n"
+                      "ssid=bad%09name&password=goodpass",
+                      reply, sizeof(reply));
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 400") != NULL &&
+        strstr(reply, "value=\"OpenNet\"") != NULL,
+        "a bad network name falls back to the stored one, not itself");
+
+  /* An over-long value is a different remedy from an unacceptable one, so it
+   * gets a different sentence rather than the same catch-all.
+   */
+
+  len = http_exchange("POST / HTTP/1.1\r\n"
+                      "Content-Type: application/x-www-form-urlencoded\r\n"
+                      "Content-Length: 86\r\n\r\n"
+                      "ssid=AIPC&volc_appid=" LONG_APPID_65,
+                      reply, sizeof(reply));
+  CHECK(len > 0 && strstr(reply, "HTTP/1.1 400") != NULL &&
+        strstr(reply, "语音 App ID 太长了") != NULL,
+        "an over-long app id is refused by name and by reason");
+
+  len = http_exchange("POST / HTTP/1.1\r\n"
                       "Sec-Fetch-Site: cross-site\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
                       "Content-Length: 32\r\n\r\n"
@@ -780,7 +897,7 @@ static void test_rejections(void)
         strstr(reply, "HTTP/1.1 403 Forbidden") != NULL,
         "an explicit cross-site submit is refused with 403");
 
-  len = http_exchange("POST /save HTTP/1.1\r\n"
+  len = http_exchange("POST / HTTP/1.1\r\n"
                       "Content-Type: text/plain\r\n"
                       "Content-Length: 4\r\n\r\nssid", reply, sizeof(reply));
   CHECK(len > 0 && strstr(reply, "HTTP/1.1 415") != NULL,
@@ -823,7 +940,7 @@ static void test_one_shot(void)
   reset_callback();
   CHECK(start_on_free_port(&cfg) == 0, "the one-shot service starts");
 
-  len = http_exchange("POST /save HTTP/1.1\r\n"
+  len = http_exchange("POST / HTTP/1.1\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
                       "Content-Length: 32\r\n\r\n"
                       "ssid=OneShot&password=passphrase", reply,
@@ -861,7 +978,7 @@ static void test_store_failure_is_reported(void)
   CHECK(start_on_free_port(&cfg) == 0,
         "the service starts even with an unusable store");
 
-  len = http_exchange("POST /save HTTP/1.1\r\n"
+  len = http_exchange("POST / HTTP/1.1\r\n"
                       "Content-Type: application/x-www-form-urlencoded\r\n"
                       "Content-Length: 31\r\n\r\n"
                       "ssid=AIPC&password=passphrase12", reply,

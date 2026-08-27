@@ -23,6 +23,7 @@
 #include "include/vs_config.h"
 #include "include/vs_history.h"
 #include "include/vs_network.h"
+#include "include/vs_settings.h"
 #include "include/vs_voice.h"
 
 
@@ -51,6 +52,14 @@ struct vs_network_s
   bool ignore_sta_disconnect;
   bool ap_client_event;
   uint8_t ap_client_count;
+
+  /* A pending "draw a new SoftAP passphrase" request, outliving the config
+   * reload that request_mode() may perform.  See
+   * vs_network_reset_ap_password().  Only ever touched on the network worker
+   * thread.
+   */
+
+  bool ap_password_reset;
 };
 
 static void vs_network_wifi_event(enum bk7258_wifi_event_e event,
@@ -594,10 +603,48 @@ static int vs_network_apply_ap(struct vs_network_s *network)
     return vs_network_failed(network, "AP配置", -EINVAL);
 
 #ifdef CONFIG_VS_AP_RANDOM_PASSWORD
-  ret = vs_network_random_ap_password(network->config.ap_password,
-                                      sizeof(network->config.ap_password));
-  if (ret < 0)
-    return vs_network_failed(network, "AP随机密码", ret);
+
+  /* Only when there is nothing to reuse.  ap_password_random is set either by
+   * the boot-time load in vs_config_load_wifi() or by a previous pass through
+   * here, so the ordinary case -- a device that has shown this hotspot before
+   * -- takes neither the TRNG read nor the write below.  That matters because
+   * this card's writes are slow enough to be felt, and the user gains nothing
+   * from a password that changes behind their back while the one they typed
+   * into a phone stops working.
+   *
+   * vs_network_reset_ap_password() clears the flag; that is the whole
+   * mechanism behind the 按住重置 gesture.
+   */
+
+  if (!network->config.ap_password_random || network->ap_password_reset)
+    {
+      ret = vs_network_random_ap_password(network->config.ap_password,
+                                         sizeof(network->config.ap_password));
+      if (ret < 0)
+        return vs_network_failed(network, "AP随机密码", ret);
+
+      network->config.ap_password_random = true;
+
+      /* Cleared only once a passphrase actually exists, so a TRNG failure
+       * above leaves the request standing for the next attempt.
+       */
+
+      network->ap_password_reset = false;
+
+      /* Persisted before the radio work rather than after it, so the value on
+       * screen and the value on the card are the same thing even if
+       * association then fails and the user retries.
+       *
+       * A failed write does not fail the AP: the hotspot still comes up and
+       * the password is still readable on screen, it just will not survive a
+       * reboot.  Refusing to start provisioning over a storage fault would
+       * take away the one screen that can tell the user anything.
+       */
+
+      ret = vs_settings_save_ap_password(network->config.ap_password);
+      if (ret < 0)
+        printf("velasight: AP password not persisted (%d)\n", ret);
+    }
 #endif
 
    ret = wapi_set_ifdown(network->sock, "wlan0");
@@ -833,6 +880,43 @@ int vs_network_request_mode(struct vs_network_s *network,
     }
 
   return ret;
+}
+
+int vs_network_reset_ap_password(struct vs_network_s *network)
+{
+#ifndef CONFIG_VS_AP_RANDOM_PASSWORD
+  (void)network;
+
+  /* Reported rather than silently ignored: the caller advertised a reset key
+   * to the user, so a build where the passphrase is fixed has to say so.
+   */
+
+  return -ENOTSUP;
+#else
+  if (network == NULL)
+    return -EINVAL;
+
+  /* The passphrase only exists while wlan0 is a master.  Rejecting the STA
+   * case here keeps this from becoming an accidental way to switch modes.
+   */
+
+  if (network->mode != VS_NET_AP)
+    return -EPERM;
+
+  /* Raising the flag *is* the request; vs_network_apply_ap() does the work.
+   *
+   * It lives on the network state rather than in config because request_mode()
+   * may call reload_saved(), which replaces config wholesale from the store --
+   * and the stored record contains a valid passphrase, so a request expressed
+   * as config.ap_password_random = false would be quietly undone right after
+   * being made.  Both this function and apply_ap() run on the network worker
+   * thread, so the flag needs no lock.
+   */
+
+  printf("velasight: regenerating SoftAP password\n");
+  network->ap_password_reset = true;
+  return vs_network_request_mode(network, VS_NET_AP);
+#endif
 }
 
 int vs_network_process_events(struct vs_network_s *network)

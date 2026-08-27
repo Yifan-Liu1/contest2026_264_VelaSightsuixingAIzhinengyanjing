@@ -209,6 +209,17 @@ struct vs_runtime_s
   enum vs_page_e error_return_page;
   bool network_busy;
   enum vs_net_mode_e network_target_mode;
+
+  /* SoftAP passphrase reset, both halves of it.  ap_reset_holding is the 下一条
+   * hold still filling the ring; ap_reset_busy is the AP restart it started.
+   * They are separate because the first is cancellable and the second is not,
+   * and both are only meaningful on VS_PAGE_SOFTAP.  Kept out of
+   * network_busy's way: that one says a worker is running, these say which
+   * gesture the page should be describing while it does.
+   */
+
+  bool ap_reset_holding;
+  bool ap_reset_busy;
   uint32_t wifi_retry_at_ms;
   uint32_t next_request_id;
   uint32_t active_request_id;
@@ -226,6 +237,14 @@ struct vs_network_worker_s
 {
   struct vs_network_s *network;
   enum vs_net_mode_e mode;
+
+  /* Restart the AP with a new passphrase instead of applying mode.  The two
+   * share this worker because they are the same blocking sequence and the UI
+   * learns the outcome of both through NETWORK_READY/NETWORK_FAILED; giving
+   * the reset its own thread and events would duplicate all of that.
+   */
+
+  bool reset_ap_password;
 };
 
 int vs_app_post_event(const struct vs_app_event_s *event)
@@ -305,7 +324,9 @@ static void *vs_network_start_worker(void *arg)
   if (ret == 0 && network == NULL)
     ret = vs_network_open(&network);
   if (ret == 0)
-    ret = vs_network_request_mode(network, worker->mode);
+    ret = worker->reset_ap_password ?
+          vs_network_reset_ap_password(network) :
+          vs_network_request_mode(network, worker->mode);
 
   pthread_mutex_lock(&g_app_events.lock);
   g_network_result = network;
@@ -321,7 +342,8 @@ static void *vs_network_start_worker(void *arg)
 
 static int vs_start_network_worker(struct vs_runtime_s *runtime,
                                    struct vs_network_s *network,
-                                   enum vs_net_mode_e mode)
+                                   enum vs_net_mode_e mode,
+                                   bool reset_ap_password)
 {
   struct vs_network_worker_s *worker;
   pthread_t thread;
@@ -337,6 +359,7 @@ static int vs_start_network_worker(struct vs_runtime_s *runtime,
 
   worker->network = network;
   worker->mode = mode;
+  worker->reset_ap_password = reset_ap_password;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 8192);
   ret = pthread_create(&thread, &attr, vs_network_start_worker, worker);
@@ -1054,16 +1077,73 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
       case VS_PAGE_SOFTAP:
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
                  "设备热点");
+
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+
+        /* A reset restarts the AP, so the password and the client count on
+         * screen are both about to be wrong.  Showing the old password beside
+         * a spinner would invite someone to type it into a phone, so the
+         * whole page says what is happening instead.
+         *
+         * Compiled out with the option rather than left as unreachable code:
+         * nothing sets ap_reset_busy without it, and the strings would still
+         * take up flash in a build that can never show them.
+         */
+
+        if (runtime->ap_reset_busy)
+          {
+            snprintf(snapshot->content_body, sizeof(snapshot->content_body),
+                     "正在生成新密码\n热点会短暂断开");
+            snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                     "热点");
+            snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                     "重置中");
+            snprintf(snapshot->status_meta, sizeof(snapshot->status_meta),
+                     "请稍等");
+            snapshot->progress_kind = VS_PROGRESS_WAIT;
+            break;
+          }
+#endif
+
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
                  "密码: %s\n网页: %s", runtime->network.password,
                  runtime->network.address);
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "热点");
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+
+        /* The hotspot name first, then how to replace its password.  Both live
+         * in status_value because the right screen has one centred label; the
+         * newlines are what put the hint under the name rather than beside it.
+         *
+         * The hint's own break is written out instead of left to the label,
+         * because LV_TXT_BREAK_CHARS holds no CJK punctuation and this string
+         * has no spaces -- an unbroken 14-glyph run would be clipped at the
+         * box edge rather than wrapped.  Three lines of the font's 17 px fit
+         * the 61 px box; a fourth would not, which is why the hint is split
+         * once and not twice.
+         */
+
+        snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                 "%s\n长按重置按键\n可随机生成新密码", runtime->network.ssid);
+#else
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "%s",
                  runtime->network.ssid);
+#endif
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "%s",
                  runtime->network.ap_client_count != 0 ? "已连接" :
                                                           "待连接");
         vs_key_set(snapshot, VS_KEY_BACK, "按住返回");
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+        vs_key_set(snapshot, VS_KEY_NEXT, "按住重置");
+
+        /* Same ring every other hold uses.  Set from the flag rather than from
+         * a page of its own, because the hold does not leave this page and a
+         * release has to be able to put the key hints straight back.
+         */
+
+        if (runtime->ap_reset_holding)
+          snapshot->progress_kind = VS_PROGRESS_HOLD;
+#endif
         break;
 
       case VS_PAGE_ERROR:
@@ -1159,7 +1239,7 @@ static void vs_switch_network(struct vs_display_s *display,
 
   runtime->progress = 100;
   runtime->page = VS_PAGE_NET_SWITCHING;
-  ret = vs_start_network_worker(runtime, network, mode);
+  ret = vs_start_network_worker(runtime, network, mode, false);
   if (ret < 0)
     {
       runtime->error_target_mode = mode;
@@ -1172,6 +1252,44 @@ static void vs_switch_network(struct vs_display_s *display,
   else
     vs_render(display, runtime);
 }
+
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+
+/* Completed 下一条 hold on the SoftAP page.  The page stays put rather than
+ * borrowing VS_PAGE_NET_SWITCHING: the network is not changing mode, and that
+ * page would tell the user it is about to leave the hotspot.
+ */
+
+static void vs_reset_ap_password(struct vs_display_s *display,
+                                 struct vs_runtime_s *runtime,
+                                 struct vs_network_s *network)
+{
+  int ret;
+
+  runtime->ap_reset_holding = false;
+  ret = vs_start_network_worker(runtime, network, VS_NET_AP, true);
+  if (ret < 0)
+    {
+      /* Retrying from the error page means "bring the AP back", so the target
+       * mode has to say AP even though no mode change was requested.
+       */
+
+      runtime->error_target_mode = VS_NET_AP;
+      runtime->progress = 0;
+      vs_set_error_reason(runtime, ret, VS_PAGE_SOFTAP, true, "热点密码重置");
+      return;
+    }
+
+  /* The ring belonged to the hold, which is over.  What follows is a wait of
+   * unknown length, so the page switches to the dots instead of leaving a
+   * full ring on screen for several seconds.
+   */
+
+  runtime->ap_reset_busy = true;
+  runtime->progress = 0;
+  vs_render(display, runtime);
+}
+#endif
 
 static void vs_set_error(struct vs_runtime_s *runtime, int error,
                          enum vs_page_e return_page, bool retryable)
@@ -1365,6 +1483,14 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
 
       case VS_APP_EVENT_NETWORK_READY:
         runtime->network_busy = false;
+
+        /* Cleared for a mode switch too, not just for a reset: a switch that
+         * lands on the hotspot page has to arrive with the reset key offered
+         * and no stale ring, whatever the page was doing beforehand.
+         */
+
+        runtime->ap_reset_busy = false;
+        runtime->ap_reset_holding = false;
         if (network != NULL)
           (void)vs_network_get_status(network, &runtime->network);
         runtime->api_ready = bk7258_ai_config_ready();
@@ -1385,6 +1511,8 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
 
       case VS_APP_EVENT_NETWORK_FAILED:
         runtime->network_busy = false;
+        runtime->ap_reset_busy = false;
+        runtime->ap_reset_holding = false;
         if (network != NULL)
           (void)vs_network_get_status(network, &runtime->network);
         runtime->api_ready = bk7258_ai_config_ready();
@@ -1474,7 +1602,7 @@ static void vs_handle_event(struct vs_display_s *display,
     }
 
   if (event->type == VS_INPUT_PROGRESS && event->key == VS_KEY_BACK &&
-      (runtime->page == VS_PAGE_SOFTAP ||
+      ((runtime->page == VS_PAGE_SOFTAP && !runtime->network_busy) ||
        (runtime->page == VS_PAGE_NET_SWITCHING &&
         runtime->network.mode == VS_NET_AP && !runtime->network_busy)))
     {
@@ -1482,6 +1610,47 @@ static void vs_handle_event(struct vs_display_s *display,
       runtime->progress = event->progress;
       return;
     }
+
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+
+  /* Hold 下一条 on the hotspot page to draw a new password.  Unlike the other
+   * holds this one stays on its page, so the ring is driven by a flag instead
+   * of by arriving somewhere new -- see the VS_PAGE_SOFTAP snapshot.
+   *
+   * network_busy is checked because a reset already in flight owns wlan0; the
+   * worker would only answer a second request with -EBUSY and an error page.
+   */
+
+  if (event->type == VS_INPUT_PROGRESS && event->key == VS_KEY_NEXT &&
+      runtime->page == VS_PAGE_SOFTAP && !runtime->network_busy)
+    {
+      runtime->ap_reset_holding = true;
+      runtime->progress = event->progress;
+      return;
+    }
+
+  if (event->type == VS_INPUT_CANCEL && event->key == VS_KEY_NEXT &&
+      runtime->page == VS_PAGE_SOFTAP && runtime->ap_reset_holding)
+    {
+      runtime->ap_reset_holding = false;
+      runtime->progress = 0;
+      return;
+    }
+
+  /* Adding 返回 to a reset hold starts the two-key network toggle, and
+   * vs_input.c stops sending per-key progress once that begins.  Without this
+   * the ring would freeze part-filled and the page would keep claiming a hold
+   * that nothing is going to finish or cancel.
+   */
+
+  if (event->type == VS_INPUT_COMBO_PROGRESS &&
+      runtime->page == VS_PAGE_SOFTAP && runtime->ap_reset_holding)
+    {
+      runtime->ap_reset_holding = false;
+      runtime->progress = 0;
+      return;
+    }
+#endif
 
   if (event->type == VS_INPUT_CANCEL &&
       runtime->page == VS_PAGE_SOCIAL_ENTER)
@@ -1531,10 +1700,12 @@ static void vs_handle_event(struct vs_display_s *display,
       /* Taken before the key is acted on, which is what makes it correct: the
        * label that flashes is the one the user pressed.  On the volume page
        * that means 确认 flashes "调节" and then becomes "完成", which is the
-       * sequence that happened.  Only SOFTAP's back key opts out, because
-       * there the short press has no action to acknowledge. */
+       * sequence that happened.  SOFTAP's keys opt out, because both of them
+       * are hold-only there: flashing 按住返回 or 按住重置 for a tap would
+       * acknowledge an action that did not happen. */
 
-      if (!(runtime->page == VS_PAGE_SOFTAP && event->key == VS_KEY_BACK))
+      if (!(runtime->page == VS_PAGE_SOFTAP &&
+            (event->key == VS_KEY_BACK || event->key == VS_KEY_NEXT)))
         vs_acknowledge(runtime, event->key);
       switch (runtime->page)
         {
@@ -1815,7 +1986,15 @@ static void vs_handle_event(struct vs_display_s *display,
 
                 runtime->page = VS_PAGE_NET_SWITCHING;
                 runtime->progress = 100;
-                ret = vs_start_network_worker(runtime, network, mode);
+
+                /* Retried as a plain mode switch even when the failure came
+                 * from a password reset: bringing the AP back up is the
+                 * recovery either way, and apply_ap() draws a new passphrase
+                 * on the way through, so nothing is lost by not asking for
+                 * the reset explicitly here.
+                 */
+
+                ret = vs_start_network_worker(runtime, network, mode, false);
                 if (ret < 0)
                   {
                     runtime->error = ret;
@@ -1854,7 +2033,8 @@ static void vs_handle_event(struct vs_display_s *display,
           runtime->page = VS_PAGE_SOCIAL_FINALIZING;
           runtime->progress = 0;
         }
-      else if ((runtime->page == VS_PAGE_SOFTAP ||
+      else if (((runtime->page == VS_PAGE_SOFTAP &&
+                 !runtime->network_busy) ||
                 (runtime->page == VS_PAGE_NET_SWITCHING &&
                  runtime->network.mode == VS_NET_AP &&
                  !runtime->network_busy)) &&
@@ -1862,6 +2042,14 @@ static void vs_handle_event(struct vs_display_s *display,
         {
           vs_switch_network(display, runtime, network);
         }
+#ifdef CONFIG_VS_AP_RANDOM_PASSWORD
+      else if (runtime->page == VS_PAGE_SOFTAP &&
+               event->key == VS_KEY_NEXT && !runtime->network_busy &&
+               network != NULL)
+        {
+          vs_reset_ap_password(display, runtime, network);
+        }
+#endif
     }
 }
 
@@ -1918,7 +2106,7 @@ int vs_app_run(void)
       goto fail;
     }
 
-  ret = vs_start_network_worker(&runtime, NULL, VS_NET_STA);
+  ret = vs_start_network_worker(&runtime, NULL, VS_NET_STA, false);
   if (ret < 0)
     {
       runtime.error = ret;
@@ -2067,7 +2255,7 @@ int vs_app_run(void)
         {
           runtime.wifi_retry_at_ms = 0;
           printf("velasight: retrying STA connection\n");
-          ret = vs_start_network_worker(&runtime, network, VS_NET_STA);
+          ret = vs_start_network_worker(&runtime, network, VS_NET_STA, false);
           if (ret < 0)
             {
               runtime.wifi_retry_at_ms = vs_app_now_ms() + VS_WIFI_RETRY_MS;

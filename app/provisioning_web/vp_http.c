@@ -9,11 +9,22 @@
 #include <string.h>
 
 #include "velasight_provisioning.h"
+#include "vp_form.h"
 #include "vp_http.h"
 
-#define VP_HTTP_BODY_BUILD 2048
+/* Sized for the setup page, which is the largest body built in one piece.
+ * It lives on the listener stack rather than in .bss, so VP_THREAD_STACK in
+ * vp_server.c has to stay ahead of it.
+ */
+
+#define VP_HTTP_BODY_BUILD 4608
 
 static const char g_form_type[] = "application/x-www-form-urlencoded";
+
+/* The reason phrase belongs on the wire, where the numbers and the English
+ * are part of the protocol.  It is deliberately not what the page says: see
+ * vp_plain_title().
+ */
 
 static const char *vp_reason(int status)
 {
@@ -31,6 +42,32 @@ static const char *vp_reason(int status)
       case 500: return "Internal Server Error";
       case 503: return "Service Unavailable";
       default:  return "Error";
+    }
+}
+
+/* What the person holding the phone sees instead.
+ *
+ * "405 Method Not Allowed" tells someone reading a protocol trace exactly
+ * what happened and tells the owner of a pair of glasses nothing at all.  The
+ * status code stays in the response line for anything that inspects it; the
+ * heading is written for the reader.
+ */
+
+static const char *vp_plain_title(int status)
+{
+  switch (status)
+    {
+      case 400: return "填写的内容有问题";
+      case 403: return "这次提交被拒绝了";
+      case 404: return "找不到这个页面";
+      case 405: return "不支持这样的操作";
+      case 411: return "提交的内容不完整";
+      case 413: return "提交的内容太多了";
+      case 415: return "提交的格式不对";
+      case 431: return "浏览器发来的内容太长了";
+      case 500: return "设备内部出错了";
+      case 503: return "设备暂时忙不过来";
+      default:  return "出错了";
     }
 }
 
@@ -279,10 +316,23 @@ int vp_http_parse(const char *buf, size_t len,
         return vp_reject(req, 404);
       }
 
-    if (pathlen != 5 || memcmp(target, "/save", 5) != 0)
-      {
-        return vp_reject(req, 404);
-      }
+    /* The submit posts back to the page it came from rather than to a
+     * separate endpoint.  There is no /save: a form that posted elsewhere left
+     * the phone sitting on a URL that only existed as the answer to one
+     * submit, so the address bar no longer matched the page and the tab bar
+     * pointed away from where the user actually was.  Posting to "/" keeps the
+     * whole service at one address.
+     */
+
+    {
+      bool root = pathlen == 1 && target[0] == '/';
+      bool index = pathlen == 11 && memcmp(target, "/index.html", 11) == 0;
+
+      if (!root && !index)
+        {
+          return vp_reject(req, 404);
+        }
+    }
   }
 
   /* Headers.  Only three matter, and anything unexpected about them is a
@@ -490,30 +540,148 @@ static size_t vp_wrap(char *buf, size_t buflen, int status,
 #define VP_PAGE_HEAD                                                   \
   "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"  \
   "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" \
-  "<title>VelaSight 配网</title><style>"                                \
-  "body{font-family:system-ui;margin:0;padding:20px;background:#f5f5f7}" \
+  "<title>VelaSight 联网设置</title><style>"                            \
+  "body{font-family:system-ui;margin:0;padding:20px 20px 76px;"          \
+  "background:#f5f5f7}"                                                  \
   "main{max-width:22rem;margin:auto;background:#fff;padding:20px;"       \
   "border-radius:12px}h1{font-size:1.25rem;margin:0 0 12px}"            \
-  "label{display:block;margin:10px 0 4px}input,button{width:100%%;"       \
+  "label{display:block;margin:14px 0 4px;font-weight:600}"              \
+  "input,button{width:100%%;"                                            \
   "box-sizing:border-box;padding:10px;font-size:1rem;border-radius:8px}" \
-  "input{border:1px solid #bbb}button{margin-top:18px;border:0;"         \
-  "background:#0676df;color:#fff}.note{font-size:.85rem;color:#666}"    \
-  ".err{color:#b00020}.ok{color:#16833b;font-weight:600}"               \
+  "input{border:1px solid #bbb}button{margin-top:20px;border:0;"         \
+  "background:#0676df;color:#fff}.note{font-size:.85rem;color:#666;"    \
+  "margin:4px 0 0}.err{color:#b00020;font-weight:600}"                  \
+  ".ok{color:#16833b;font-weight:600}.warn{color:#a35200;font-weight:600}" \
+  ".box{background:#f1f3f5;border-radius:8px;padding:12px;margin:0}"    \
+  ".box p{margin:2px 0}"                                                 \
+  ".chk{display:flex;align-items:center;gap:8px;margin:12px 0 0;"        \
+  "font-weight:400}.chk input{width:auto;margin:0}"                      \
+  ".tabs{position:fixed;left:0;right:0;bottom:0;display:flex;"           \
+  "background:#fff;border-top:1px solid #d8d8dc}"                        \
+  ".tab{flex:1;text-align:center;padding:14px 0;font-size:.95rem;"       \
+  "color:#666;text-decoration:none}"                                     \
+  ".tab.on{color:#0676df;font-weight:600;box-shadow:inset 0 2px 0 #0676df}" \
   "</style></head><body><main>"
 
-#define VP_PAGE_TAIL "</main></body></html>"
+/* Split so the tab bar can sit between the card and the end of the document.
+ * It is positioned against the viewport, so it must not be a child of the
+ * card, whose own background and rounded corners would otherwise be the thing
+ * a fixed element is measured against on some engines.
+ */
 
-static size_t vp_http_form_page_notice(char *buf, size_t buflen,
-                                       const char *notice,
-                                       const char *current_ssid,
-                                       bool saved,
-                                       bool history_enabled)
+#define VP_PAGE_MAIN_END "</main>"
+#define VP_PAGE_END      "</body></html>"
+#define VP_PAGE_TAIL     VP_PAGE_MAIN_END VP_PAGE_END
+
+/* The bottom tab bar, and the only way between the two pages.
+ *
+ * It replaces a link that sat inside the setup page, which meant it was only
+ * reachable from one of the two places a user could be.  A bar pinned to the
+ * viewport is present on both pages at the same coordinates, so switching does
+ * not depend on having scrolled to the right part of the right page.
+ *
+ * Both tabs are rendered only when a history provider is configured; a
+ * one-item tab bar would be a control that does nothing.
+ */
+
+#define VP_PAGE_NAV(setup_on, history_on)                                \
+  "<nav class=\"tabs\">"                                                 \
+  "<a class=\"tab" setup_on "\" href=\"/\">联网设置</a>"                 \
+  "<a class=\"tab" history_on "\" href=\"/history\">聊天记录</a>"        \
+  "</nav>"
+
+#define VP_PAGE_NAV_SETUP   VP_PAGE_NAV(" on", "")
+#define VP_PAGE_NAV_HISTORY VP_PAGE_NAV("", " on")
+
+/* The one place the input names are written down.  Both the setup page and
+ * the confirmation page carry the same form, so a user who mistyped one field
+ * never has to navigate back to fix it.
+ */
+
+#define VP_PAGE_FORM                                                     \
+  "<form action=\"/\" method=\"post\">"                                  \
+  "<label for=\"ssid\">Wi-Fi 名称</label>"                               \
+  "<input id=\"ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" "     \
+  "%sautocapitalize=\"off\" autocomplete=\"off\" required>"              \
+  "<p class=\"note\">要和路由器上的名称完全一致，区分大小写。"           \
+  "设备只能连 2.4G 的 Wi-Fi。</p>"                                       \
+  "<label for=\"password\">Wi-Fi 密码</label>"                           \
+  "<input id=\"password\" name=\"password\" type=\"password\" "          \
+  "maxlength=\"63\" autocomplete=\"off\">"                               \
+  "<p class=\"note\">留空表示不改动原来的密码。</p>"                     \
+  "<label class=\"chk\"><input type=\"checkbox\" name=\"no_password\" "  \
+  "value=\"on\">这个 Wi-Fi 没有密码</label>"                             \
+  "<p class=\"note\">只有连不需要密码的 Wi-Fi 时才勾选，"                \
+  "勾选时请把上面的密码栏留空。</p>"                                     \
+  "<label for=\"mimo_apikey\">MiMo API key</label>"                      \
+  "<input id=\"mimo_apikey\" name=\"mimo_apikey\" type=\"password\" "    \
+  "maxlength=\"512\" autocomplete=\"off\">"                              \
+  "<p class=\"note\">留空表示不改动。少了这一项，设备无法回答问题。</p>" \
+  "<label for=\"volc_appid\">语音 App ID</label>"                        \
+  "<input id=\"volc_appid\" name=\"volc_appid\" type=\"text\" "          \
+  "maxlength=\"64\" autocomplete=\"off\" autocapitalize=\"off\">"        \
+  "<label for=\"volc_token\">语音 Token</label>"                         \
+  "<input id=\"volc_token\" name=\"volc_token\" type=\"password\" "      \
+  "maxlength=\"128\" autocomplete=\"off\">"                              \
+  "<p class=\"note\">这两项留空表示不改动，需要一起填写，"               \
+  "设备靠它们听懂和说话。</p>"                                           \
+  "<button type=\"submit\">保存</button>"                                \
+  "</form>"                                                              \
+  "<p class=\"note\">保存后在设备上长按返回键即可退出设置。</p>"
+
+static const char *vp_filled(bool set)
+{
+  return set ? "已填写" : "还没填写";
+}
+
+/* The stored-settings summary.  Secrets appear only as "已填写"; the record is
+ * never rendered, which is what makes echoing one impossible rather than
+ * merely unintended.
+ */
+
+static int vp_state_box(char *out, size_t outlen,
+                        const struct vp_http_state_s *state,
+                        const char *escaped_ssid)
+{
+  if (state == NULL || !state->have_record)
+    {
+      return snprintf(out, outlen,
+                      "<p class=\"note\">设备还没有记住任何 Wi-Fi，"
+                      "请在下面填写后保存。</p>");
+    }
+
+  return snprintf(out, outlen,
+                  "<div class=\"box\">"
+                  "<p class=\"note\"><strong>设备现在记住的设置</strong></p>"
+                  "<p class=\"note\">Wi-Fi 名称：%s</p>"
+                  "<p class=\"note\">Wi-Fi 密码：%s</p>"
+                  "<p class=\"note\">MiMo API key：%s</p>"
+                  "<p class=\"note\">语音 App ID：%s</p>"
+                  "<p class=\"note\">语音 Token：%s</p>"
+                  "<p class=\"note\">已经保存过 %u 次</p>"
+                  "</div>",
+                  escaped_ssid[0] != '\0' ? escaped_ssid : "（空）",
+                  state->open_network ? "这个 Wi-Fi 没有密码" : "已设置",
+                  vp_filled(state->have_api_key),
+                  vp_filled(state->have_volc_appid),
+                  vp_filled(state->have_volc_token),
+                  (unsigned int)state->generation);
+}
+
+static size_t vp_http_page(char *buf, size_t buflen,
+                           const struct vp_http_state_s *state,
+                           const char *notice, bool notice_ok,
+                           const char *extra)
 {
   char escaped[256];
   char escaped_ssid[VELASIGHT_PROV_SSID_MAX * 6 + 1];
+  char escaped_form[VELASIGHT_PROV_SSID_MAX * 6 + 1];
   char ssid_attr[VELASIGHT_PROV_SSID_MAX * 6 + 16];
+  char box[768];
   char body[VP_HTTP_BODY_BUILD];
+  const char *form_ssid;
   int bodylen;
+  int n;
 
   if (buf == NULL)
     {
@@ -522,93 +690,133 @@ static size_t vp_http_form_page_notice(char *buf, size_t buflen,
 
   escaped[0] = '\0';
   escaped_ssid[0] = '\0';
+  escaped_form[0] = '\0';
   ssid_attr[0] = '\0';
-  if (current_ssid != NULL)
+
+  if (state != NULL && state->ssid != NULL && state->ssid[0] != '\0')
     {
-      if (vp_html_escape(current_ssid, escaped_ssid, sizeof(escaped_ssid)) >= 0)
-        snprintf(ssid_attr, sizeof(ssid_attr), "value=\"%s\" ",
-                 escaped_ssid);
+      (void)vp_html_escape(state->ssid, escaped_ssid, sizeof(escaped_ssid));
     }
+
+  /* The box reports what is stored; the input carries what should be typed
+   * next.  They are the same thing on a plain GET and deliberately different
+   * on a refused submit.
+   */
+
+  form_ssid = state == NULL ? NULL :
+              state->form_ssid != NULL ? state->form_ssid : state->ssid;
+
+  if (form_ssid != NULL && form_ssid[0] != '\0' &&
+      vp_html_escape(form_ssid, escaped_form, sizeof(escaped_form)) >= 0)
+    {
+      snprintf(ssid_attr, sizeof(ssid_attr), "value=\"%s\" ", escaped_form);
+    }
+
   if (notice != NULL && vp_html_escape(notice, escaped, sizeof(escaped)) < 0)
     {
       escaped[0] = '\0';
     }
 
+  n = vp_state_box(box, sizeof(box), state, escaped_ssid);
+  if (n < 0 || (size_t)n >= sizeof(box))
+    {
+      return 0;
+    }
+
   bodylen = snprintf(body, sizeof(body),
                      VP_PAGE_HEAD
-                      "<h1>设备配网</h1>"
-                      "<p class=\"note\">当前存储的 Wi-Fi：<strong>%s</strong></p>"
-                      "%s%s%s"
-                     "<form action=\"/save\" method=\"post\">"
-                     "<label for=\"ssid\">网络名称（SSID）</label>"
-                      "<input id=\"ssid\" name=\"ssid\" type=\"text\" "
-                      "maxlength=\"32\" %sautocapitalize=\"off\" required>"
-                     "<label for=\"password\">密码（开放网络留空）</label>"
-                      "<input id=\"password\" name=\"password\" "
-                      "type=\"password\" maxlength=\"63\">"
-                       "<label for=\"mimo_apikey\">MiMo API key（可选）</label>"
-                      "<input id=\"mimo_apikey\" name=\"mimo_apikey\" "
-                      "type=\"password\" maxlength=\"512\" "
-                      "autocomplete=\"off\">"
-                       "<label for=\"volc_appid\">语音 App ID（可选）</label>"
-                      "<input id=\"volc_appid\" name=\"volc_appid\" "
-                      "type=\"text\" maxlength=\"64\" "
-                      "autocomplete=\"off\" autocapitalize=\"off\">"
-                       "<label for=\"volc_token\">语音 Token（可选）</label>"
-                      "<input id=\"volc_token\" name=\"volc_token\" "
-                      "type=\"password\" maxlength=\"128\" "
-                      "autocomplete=\"off\">"
-                     "<button type=\"submit\">保存</button>"
-                     "</form>"
-                      "<p class=\"note\">保存后可在设备上长按返回。</p>"
-                      "%s"
-                      VP_PAGE_TAIL,
-                      escaped_ssid[0] != '\0' ? escaped_ssid : "未配置",
-                      escaped[0] != '\0' ? saved ? "<p class=\"ok\">" :
-                                                   "<p class=\"err\">" : "",
-                      escaped,
-                      escaped[0] != '\0' ? "</p>" : "",
-                      ssid_attr,
-                      history_enabled ?
-                        "<p><a href=\"/history\">浏览社交历史记录</a></p>" :
-                        "");
+                     "<h1>联网设置</h1>"
+                     "%s%s%s%s%s"
+                     VP_PAGE_FORM
+                     VP_PAGE_MAIN_END
+                     "%s"
+                     VP_PAGE_END,
+                     box,
+                     escaped[0] != '\0' ? notice_ok ? "<p class=\"ok\">" :
+                                                      "<p class=\"err\">" : "",
+                     escaped,
+                     escaped[0] != '\0' ? "</p>" : "",
+                     extra != NULL ? extra : "",
+                     ssid_attr,
+                     state != NULL && state->history_enabled ?
+                       VP_PAGE_NAV_SETUP : "");
 
   if (bodylen < 0 || (size_t)bodylen >= sizeof(body))
     {
       return 0;
     }
 
-  return vp_wrap(buf, buflen, 200, body, (size_t)bodylen);
+  return vp_wrap(buf, buflen, notice_ok || notice == NULL ? 200 : 400,
+                 body, (size_t)bodylen);
 }
 
-size_t vp_http_form_page_with_ssid_history(char *buf, size_t buflen,
-                                           const char *notice,
-                                           const char *current_ssid,
-                                           bool history_enabled)
+size_t vp_http_setup_page(char *buf, size_t buflen,
+                          const struct vp_http_state_s *state,
+                          const char *notice)
 {
-  return vp_http_form_page_notice(buf, buflen, notice, current_ssid, false,
-                                  history_enabled);
+  return vp_http_page(buf, buflen, state, notice, false, NULL);
 }
 
-size_t vp_http_form_page_with_ssid(char *buf, size_t buflen,
-                                   const char *notice,
-                                   const char *current_ssid)
+size_t vp_http_saved_page(char *buf, size_t buflen,
+                          const struct vp_http_state_s *state,
+                          unsigned int changed)
 {
-  return vp_http_form_page_with_ssid_history(buf, buflen, notice,
-                                             current_ssid, false);
-}
+  static const struct
+  {
+    unsigned int bit;
+    const char *name;
+  }
+  g_names[] =
+  {
+    { VP_FORM_CHANGED_SSID,       "Wi-Fi 名称"   },
+    { VP_FORM_CHANGED_PASSWORD,   "Wi-Fi 密码"   },
+    { VP_FORM_CHANGED_API_KEY,    "MiMo API key" },
+    { VP_FORM_CHANGED_VOLC_APPID, "语音 App ID"  },
+    { VP_FORM_CHANGED_VOLC_TOKEN, "语音 Token"   },
+  };
 
-size_t vp_http_form_page(char *buf, size_t buflen, const char *notice)
-{
-  return vp_http_form_page_with_ssid(buf, buflen, notice, NULL);
-}
+  char names[128];
+  char extra[512];
+  size_t used = 0;
+  size_t i;
+  int n;
 
-size_t vp_http_saved_page(char *buf, size_t buflen, const char *ssid,
-                          uint32_t generation, bool open_network)
-{
-  (void)generation;
-  (void)open_network;
-  return vp_http_form_page_notice(buf, buflen, "已保存", ssid, true, false);
+  names[0] = '\0';
+  for (i = 0; i < sizeof(g_names) / sizeof(g_names[0]); i++)
+    {
+      if ((changed & g_names[i].bit) == 0)
+        {
+          continue;
+        }
+
+      n = snprintf(names + used, sizeof(names) - used, "%s%s",
+                   used > 0 ? "、" : "", g_names[i].name);
+      if (n < 0 || (size_t)n >= sizeof(names) - used)
+        {
+          break;
+        }
+
+      used += (size_t)n;
+    }
+
+  /* A network stored without a password is either exactly what was asked for
+   * or the one mistake that leaves the device unable to connect and gives no
+   * hint why, so it is called out rather than merely recorded.
+   */
+
+  n = snprintf(extra, sizeof(extra), "%s<p class=\"note\">%s%s%s</p>",
+               state != NULL && state->open_network ?
+                 "<p class=\"warn\">注意：这个 Wi-Fi 记成了没有密码。"
+                 "如果它其实需要密码，请在下面重新填写再保存一次。</p>" : "",
+               used > 0 ? "这次改动了：" : "这次没有改动任何设置。",
+               used > 0 ? names : "",
+               used > 0 ? "。" : "");
+  if (n < 0 || (size_t)n >= sizeof(extra))
+    {
+      extra[0] = '\0';
+    }
+
+  return vp_http_page(buf, buflen, state, "已保存", true, extra);
 }
 
 size_t vp_http_status_page(char *buf, size_t buflen, int status,
@@ -632,10 +840,10 @@ size_t vp_http_status_page(char *buf, size_t buflen, int status,
 
   bodylen = snprintf(body, sizeof(body),
                      VP_PAGE_HEAD
-                     "<h1>%d %s</h1><p>%s</p>"
-                     "<p class=\"note\"><a href=\"/\">返回配网页面</a></p>"
+                     "<h1>%s</h1><p>%s</p>"
+                     "<p class=\"note\"><a href=\"/\">返回设置页</a></p>"
                      VP_PAGE_TAIL,
-                     status, vp_reason(status), escaped);
+                     vp_plain_title(status), escaped);
 
   if (bodylen < 0 || (size_t)bodylen >= sizeof(body))
     {
@@ -705,11 +913,11 @@ size_t vp_http_history_head_fragment(char *buf, size_t buflen,
 
   n = snprintf(buf, buflen,
                VP_PAGE_HEAD
-               "<h1>社交历史记录</h1>"
+               "<h1>聊天记录</h1>"
                "<p class=\"note\">按时间从新到旧，共 %u 条。</p>"
                "%s",
                count,
-               count == 0 ? "<p>暂无可读取的社交历史记录。</p>" : "");
+               count == 0 ? "<p>设备上还没有聊天记录。</p>" : "");
   return n < 0 || (size_t)n >= buflen ? 0 : (size_t)n;
 }
 
@@ -748,10 +956,11 @@ size_t vp_http_history_entry_fragment(
                "<p class=\"note\">%s · %s%s</p>"
                "<p style=\"white-space:pre-wrap\">%s</p>"
                "<p class=\"note\">平静 %u%% · 开心 %u%% · 紧张 %u%%</p>"
-               "<p><a href=\"/history/%s\">预览 JSON</a> · "
-               "<a href=\"/history/%s/download\">下载</a></p>"
+               "<p><a href=\"/history/%s\">查看内容</a> · "
+               "<a href=\"/history/%s/download\">下载文件</a></p>"
                "</article>",
-               title, date, key, entry->incomplete ? " · 未完整" : "",
+               title, date, key,
+               entry->incomplete ? " · 这条记录不完整" : "",
                summary, (unsigned int)entry->calm,
                (unsigned int)entry->happy, (unsigned int)entry->tense,
                entry->record_key, entry->record_key);
@@ -767,8 +976,11 @@ size_t vp_http_history_tail_fragment(char *buf, size_t buflen)
       return 0;
     }
 
+  /* The tab bar is unconditional here: this page only exists when a provider
+   * is configured, so the history tab always has somewhere to point.
+   */
+
   n = snprintf(buf, buflen,
-               "<p class=\"note\"><a href=\"/\">返回配网页面</a></p>"
-               VP_PAGE_TAIL);
+               VP_PAGE_MAIN_END VP_PAGE_NAV_HISTORY VP_PAGE_END);
   return n < 0 || (size_t)n >= buflen ? 0 : (size_t)n;
 }
