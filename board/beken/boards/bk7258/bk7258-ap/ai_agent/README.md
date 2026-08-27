@@ -3,11 +3,9 @@
 What this board needs in order to run `packages/ai_agent`, and which parts of
 that belong here rather than upstream.
 
-Build config: `../configs/ai_agent/defconfig`. This is a product configuration,
-not the minimal `nsh` baseline. `nsh` is retained for AP bring-up and comparison;
-`ai_agent` adds the Wi-Fi/IPv4 dependencies, mbedTLS, cJSON, the agent itself,
-VelaSight and its LVGL display configuration. Building `nsh` instead produces a
-valid minimal AP image but cannot validate or display the VelaSight product UI.
+Build config: `../configs/ai_agent/defconfig` (the current `nsh` baseline --
+which already carries the Wi-Fi driver and the IPv4 stack -- plus mbedTLS,
+cJSON and the agent itself).
 
 Two things `nsh` has and this config deliberately does not: the V4L2 M2M JPEG
 codec (`CONFIG_BK7258_JPEG_ENC`, `/dev/video1`) and on-device libjpeg
@@ -42,8 +40,7 @@ a fresh `repo sync` produces them):
 | RAM | 122160 B (35.51%) | 186112 B (54.09%) | 336 KB (`RAM` 0x54000) |
 | PSRAM_SECTION | 0 B | 0 B | 6 MB |
 
-`ai_agent` leaves 413 KB of flash spare in the historical no-LVGL measurement.
-The gap to `nsh` is 201 KB, but it is
+`ai_agent` leaves 413 KB of flash spare. The gap to `nsh` is 201 KB, but it is
 not a clean "cost of the agent": this config adds mbedTLS, cJSON, the agent and
 `agent_camera`, and drops `jpeg_test`. The Wi-Fi driver and the IPv4 stack are
 in both, which is why the gap is much smaller than the 371 KB this file used to
@@ -499,18 +496,15 @@ work tree; patches here are archived copies, not a fork.
 | `src/llm/llm_proxy.c` (endpoint + diagnostics) | `AGENT_LLM_API_HOST` is an unconditional `#define`, so `agent_secrets.h` can supply a key and model but not a host -- a board configured entirely at build time has nowhere to send the request. Also, "Failed to parse API JSON" logged nothing about what arrived, which hid a captive-portal redirect page behind what looked like a model problem | patch 0002 |
 | agent response cache | An identical question replays the cached answer, including a cached *error* string: after a failed call, re-asking the same question prints the old failure with `Cache hit, skipping LLM call` and never retries. Cost us a wrong conclusion once | not patched -- vary the question when retesting |
 | `src/tools/skill_loader.c:448` | `%x` applied to `uint32_t` (wrong on this ABI, fatal under `-Werror=format`) | patch 0003 |
-| `include/agent_config.h` | `AGENT_LLM_TIMEOUT_SEC` was an unconditional `#define`, so `agent_secrets.h` could not raise it for a slow link. This change existed in the work tree but was **not archived as a patch**, so a fresh checkout plus `apply.sh` did not reproduce the tree that had been built and flashed | patch 0005 |
-| `include/agent_config.h` | WebSocket TTS hardcoded 24 kHz although BK7258 cannot produce that rate; make the rate overridable and default to 16 kHz | patch 0006 |
-| `CMakeLists.txt` | The Vela build omitted the local VelaClaw client implementation from its source list | patch 0007 |
-| LLM/config/vision paths | Oversized token budgets, discarded MiMo thinking, unconstrained structured replies and repeated config-file parsing inflated voice latency and made JSON replies unreliable | patch 0008 |
-| `src/voice/volc_asr.c`, `volc_tts.h`, `volc_tts_ws.c` | Handle WebSocket control frames and partial reads correctly; distinguish empty ASR input; add cancellable TTS, unique request IDs and invalidatable credential caching | patch 0009 |
 
-With patches 0003-0005 in place `configs/ai_agent` **builds clean under `-Werror`**;
+| `include/agent_config.h` | `AGENT_LLM_TIMEOUT_SEC` was an unconditional `#define`, so `agent_secrets.h` could not raise it for a slow link. This change existed in the work tree but was **not archived as a patch**, so a fresh checkout plus `apply.sh` did not reproduce the tree that had been built and flashed | patch 0005 |
+
+With 0003-0005 in place `configs/ai_agent` **builds clean under `-Werror`**;
 the note elsewhere that it cannot is obsolete. The remaining unpatched entry is
 the response cache, which is a design question rather than a defect: vary the
 question when retesting.
 
 `apply.sh --revert` now leaves `packages/ai_agent` pristine (verified: empty
-`git diff` over `CMakeLists.txt`, `src` and `include`), and re-applying restores
-all nine. That round trip is the check that the archive is complete -- patch
-0005 exists because it was not.
+`git diff` over `src` and `include`), and re-applying restores all five. That
+round trip is the check that the archive is complete -- patch 0005 exists
+because it was not.

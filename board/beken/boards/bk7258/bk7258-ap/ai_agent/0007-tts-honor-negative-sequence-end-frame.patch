@@ -1,0 +1,70 @@
+From 75b7f95c9d197dc06d4246c7833f79fb11582374 Mon Sep 17 00:00:00 2001
+From: 424635328 <424635328@qq.com>
+Date: Thu, 27 Aug 2026 10:33:08 +0800
+Subject: [PATCH 2/6] tts: honor the negative-sequence end frame without
+ dropping it
+
+The last ws_binary audio frame is signalled by a negative sequence
+number and may carry no payload at all.  The previous parser required
+flen > volc_hdr_len + 8 before reading the sequence, so that final
+frame was 'continue'-skipped and the stream only ended via the
+consecutive-timeout fallback (~1.5s of silence after the audio), which
+is how the device logs showed an idle-timeout end of stream and risked
+truncation.  Read seq for any frame that at least carries it, treat
+seq < 0 as the terminator (playing any trailing PCM it holds), and let
+the timeout path remain as a pure network-stall fallback.
+---
+ src/voice/volc_tts_ws.c | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/src/voice/volc_tts_ws.c b/src/voice/volc_tts_ws.c
+index 1e65670..381b9f2 100644
+--- a/src/voice/volc_tts_ws.c
++++ b/src/voice/volc_tts_ws.c
+@@ -644,20 +644,39 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
+             }
+ 
+             /* After volc header: 4-byte sequence (signed) + 4-byte payload_size */
+-            size_t audio_off = volc_hdr_len + 8;
+-
+-            if (flen <= audio_off) {
++            if (flen < volc_hdr_len + 4) {
+                 continue;
+             }
+ 
+             /* Extract sequence as signed 32-bit (big-endian).
+-             * Per Volcengine binary protocol: sequence < 0 means last frame. */
++             * Per Volcengine binary protocol: sequence < 0 means last frame,
++             * and that frame may carry no payload at all.  Read the sequence
++             * before looking at payload size so the end marker is never
++             * dropped as a "too short" frame. */
+             int32_t seq = (int32_t)(
+                 ((uint32_t)buf[volc_hdr_len] << 24) |
+                 ((uint32_t)buf[volc_hdr_len + 1] << 16) |
+                 ((uint32_t)buf[volc_hdr_len + 2] << 8) |
+                 (uint32_t)buf[volc_hdr_len + 3]);
+ 
++            /* sequence < 0 = last audio frame, may still hold final PCM */
++            if (seq < 0) {
++                size_t audio_off = volc_hdr_len + 8;
++
++                if (flen > audio_off) {
++                    cb(buf + audio_off, flen - audio_off, 0, user_data);
++                }
++
++                chunks++;
++                break;
++            }
++
++            size_t audio_off = volc_hdr_len + 8;
++
++            if (flen <= audio_off) {
++                continue;
++            }
++
+             unsigned char* pcm = buf + audio_off;
+             size_t pcm_len = flen - audio_off;
+ 
+-- 
+2.34.1
+

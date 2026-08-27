@@ -1,0 +1,36 @@
+From 9e3d139c20ff52247b728d89825f46b475613d27 Mon Sep 17 00:00:00 2001
+From: 424635328 <424635328@qq.com>
+Date: Thu, 27 Aug 2026 10:34:35 +0800
+Subject: [PATCH 4/6] voice: log real playback duration from bytes and actual
+ rate
+
+audio_playback_close() printed only the byte count, and callers had no
+way to tell how long that audio actually was.  Derive elapsed seconds
+from bytes written / (bytes_per_frame * AGENT_TTS_WS_SAMPLE_RATE) so
+the log reflects the rate actually in effect instead of an assumed
+16kHz constant.  Falls back to 2 bytes/frame (16-bit mono) if unset.
+---
+ src/voice/audio_playback.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/voice/audio_playback.c b/src/voice/audio_playback.c
+index 6a2089c..6e8361a 100644
+--- a/src/voice/audio_playback.c
++++ b/src/voice/audio_playback.c
+@@ -130,8 +130,11 @@ void audio_playback_close(audio_playback_t* pb)
+     }
+ 
+     if (pb->player) {
+-        syslog(LOG_INFO, "[%s] closing (%zu bytes written)\n",
+-            TAG, pb->total_written);
++        unsigned int bpf = pb->bytes_per_frame ? pb->bytes_per_frame : 2;
++        double secs = (double)pb->total_written /
++                      ((double)bpf * (double)AGENT_TTS_WS_SAMPLE_RATE);
++        syslog(LOG_INFO, "[%s] closing (%zu bytes, %.2fs @ %u Hz)\n",
++            TAG, pb->total_written, secs, AGENT_TTS_WS_SAMPLE_RATE);
+         media_player_stop(pb->player);
+         usleep(50 * 1000);
+         media_player_close(pb->player, 0);
+-- 
+2.34.1
+

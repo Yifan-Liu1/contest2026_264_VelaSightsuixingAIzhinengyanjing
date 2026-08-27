@@ -1,0 +1,42 @@
+From daeb4c025486a98b426d42fb5d966ed420671df5 Mon Sep 17 00:00:00 2001
+From: 424635328 <424635328@qq.com>
+Date: Thu, 27 Aug 2026 10:33:25 +0800
+Subject: [PATCH 3/6] voice: default TTS output to 16kHz, matching the playback
+ device
+
+The big-model TTS voices can speak at 24kHz, but on BK7258 the DAC only
+produces correct pitch at 8000/16000/32000 (24kHz routes through the
+48k family and comes out wrong-pitched), and 24k PCM would also add 50%
+more traffic to the same link, where the stream already underruns.
+With the gra-end rate field now honored by the service, request 16kHz
+so request, delivered PCM, playback and duration accounting all agree;
+still overridable via AGENT_TTS_WS_SAMPLE_RATE for capable hardware.
+---
+ include/agent_config.h | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/include/agent_config.h b/include/agent_config.h
+index b69a4d1..217bbb3 100644
+--- a/include/agent_config.h
++++ b/include/agent_config.h
+@@ -392,8 +392,15 @@
+ #define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
+ #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
+ 
+-/* WebSocket TTS output sample rate (big-model voices output 24kHz) */
+-#define AGENT_TTS_WS_SAMPLE_RATE 24000
++/* WebSocket TTS output sample rate.  Big-model voices can produce 24kHz,
++ * but the BK7258 DAC's only pitch-correct rates are 8k/16k/32k, and 24k
++ * would also carry 50% more PCM through the same link and buffers.  Use
++ * 16kHz so the request, the delivered PCM, the playback device and the
++ * duration accounting all agree.  Override for hardware that can do
++ * better. */
++#ifndef AGENT_TTS_WS_SAMPLE_RATE
++#define AGENT_TTS_WS_SAMPLE_RATE 16000
++#endif
+ 
+ /* ── Tool Guard (security) ──────────────────────────────────── */
+ #define AGENT_TOOL_MAX_INPUT_LEN (32 * 1024)
+-- 
+2.34.1
+

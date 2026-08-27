@@ -1,0 +1,35 @@
+From 464fed8b5b96ad98810dc81b9bf4a15799ff1cf1 Mon Sep 17 00:00:00 2001
+From: 424635328 <424635328@qq.com>
+Date: Thu, 27 Aug 2026 10:32:43 +0800
+Subject: [PATCH 1/6] tts: send the sample rate under the ws_binary field name
+ 'rate'
+
+The Volcengine big-model streaming TTS protocol (ws_binary) selects the
+output sample rate with the audio.rate key.  The previous 'sample_rate'
+key is ignored by the service, which then voices at its own default
+(24kHz for big-model voices) regardless of what the client asked for.
+Rename the key so the request actually controls the format, leaving the
+value driven by AGENT_TTS_WS_SAMPLE_RATE.
+---
+ src/voice/volc_tts_ws.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/voice/volc_tts_ws.c b/src/voice/volc_tts_ws.c
+index 4165929..1e65670 100644
+--- a/src/voice/volc_tts_ws.c
++++ b/src/voice/volc_tts_ws.c
+@@ -499,7 +499,10 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
+ 
+     cJSON_AddStringToObject(audio, "voice_type", s_speaker);
+     cJSON_AddStringToObject(audio, "encoding", "pcm");
+-    cJSON_AddNumberToObject(audio, "sample_rate", AGENT_TTS_WS_SAMPLE_RATE);
++    /* The ws_binary protocol names the receive sample rate "rate"; a
++     * "sample_rate" key is ignored, leaving the service's voice default
++     * (24kHz) in effect regardless of what this client asks for. */
++    cJSON_AddNumberToObject(audio, "rate", AGENT_TTS_WS_SAMPLE_RATE);
+     cJSON_AddNumberToObject(audio, "speed_ratio", 1.0);
+ 
+     /* request */
+-- 
+2.34.1
+
