@@ -40,7 +40,7 @@ The installer is intentionally conservative:
 
 - It strictly validates the four repository mappings, manifest schema and pinned image/archive identifiers; `build_and_flash.sh` checks the local image ID, while an offline archive is verified with the documented `sha256sum` command.
 - Each target HEAD must be the pinned commit or its descendant; an unrelated lineage is rejected even when all managed files happen to match.
-- The expected 1 + 1 + 14 + 39 files are locked by per-repository count and a digest of every relative path and file hash.
+- The expected 1 + 1 + 15 + 39 files are locked by per-repository count and a digest of every relative path and file hash.
 - It rejects overlay symlinks, special files, target symlink components and paths that escape a target repository.
 - It validates every repository and managed file, stages changed sources, then revalidates every destination before writing anything.
 - A target may already equal the overlay, equal its pinned baseline blob, or be a new file absent from that baseline.
@@ -50,7 +50,7 @@ The installer is intentionally conservative:
 - Only `projects/app_ab/partitions/bk7258/auto_partitions.csv` permits CRLF/LF-only equivalence; all other files are byte-exact.
 - The one known generated source mutation, `projects/app_ab/cp/config/bk7258/config`, may be restored only on a baseline-compatible checkout when it has Armino's generated-file marker and shape.
 
-`check` is always read-only. Each changed file is installed through a temporary file in its destination directory followed by atomic rename. The 55 replacements cannot form one filesystem transaction across four repositories: if the process is interrupted during replacement, rerun `install` to safely complete the already-preflighted prefix. `install` never runs `git reset`, `checkout`, `restore`, `clean` or `stash`.
+`check` is always read-only. Each changed file is installed through a temporary file in its destination directory followed by atomic rename. The 56 replacements cannot form one filesystem transaction across four repositories: if the process is interrupted during replacement, rerun `install` to safely complete the already-preflighted prefix. `install` never runs `git reset`, `checkout`, `restore`, `clean` or `stash`.
 
 ## Pinned inputs
 
