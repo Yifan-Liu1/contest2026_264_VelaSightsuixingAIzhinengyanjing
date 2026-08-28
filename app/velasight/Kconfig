@@ -450,3 +450,164 @@ config VS_AUDIO_CAPTURE_RING_BYTES
 		space instead of audio.  The default is four seconds of 16 kHz mono.
 		If the "capture level" log line ever reports dropped bytes, the
 		consumer fell further behind than this covers.
+
+# Social-session cloud (app/velasight/vs_cloud.c).
+#
+# These configure the team's own /contest/v1/* server, not the MiMo or
+# Volcengine services the idle assistant uses.  Only options vs_cloud.c
+# actually reads are listed; the capture cadence and alert debounce options
+# from the integration plan belong to vs_social.c and arrive with it.
+
+config VS_SOCIAL_CLOUD_HOST
+	string "VelaSight social cloud host"
+	default ""
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Hostname or IPv4 address of the social-session cloud, with no
+		scheme and no port -- both of those are separate options.
+
+		Empty is a meaningful value, not an oversight: it means nothing
+		has been provisioned, and every cloud operation then fails with
+		-ENODATA without opening a socket.  Social mode refuses to start
+		rather than timing out against a host that was never set.
+
+		A dotted quad skips DNS entirely, which is what makes bring-up
+		against the cloud document's own worked examples
+		(http://127.0.0.1:18080) work before any resolver is configured.
+
+config VS_SOCIAL_CLOUD_PORT
+	int "VelaSight social cloud port"
+	default 18080
+	range 1 65535
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Defaults to the port used throughout the cloud interface
+		document's curl examples.  Set 443 together with
+		VS_SOCIAL_CLOUD_TLS for a real deployment.
+
+config VS_SOCIAL_CLOUD_TLS
+	bool "Reach the social cloud over TLS"
+	default n
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Send /contest/v1/* over HTTPS through packages/ai_agent's
+		vela_tls.c instead of cleartext HTTP.
+
+		Off by default because the cloud is not there yet: the interface
+		document specifies cleartext for the device-facing endpoints and
+		its examples are plain HTTP, and no certificate chain has been
+		captured for a real host.
+
+		Understand what turning this on currently does and does not buy.
+		vela_tls.c negotiates with MBEDTLS_SSL_VERIFY_OPTIONAL and this
+		board has no CA bundle and no trusted time -- it forces the clock
+		to a fixed 2026 value when it finds the year unset -- so the
+		result is encryption without authentication.  That is strictly
+		better than cleartext against a passive observer and no defence
+		at all against an active one.  Do not describe a build with this
+		enabled as having verified certificates until SNTP, a CA bundle
+		and VERIFY_REQUIRED are all in place; see
+		docs/plans/BK7258_OPENVELA_MIMO_NETWORK_PORTING_PLAN.md for the
+		order those have to land in.
+
+		This setting is independent of the presigned upload URL, whose
+		scheme comes from the cloud's own response.
+
+config VS_SOCIAL_DEVICE_ID
+	string "VelaSight social cloud device id override"
+	default ""
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Normally left empty.  The identifier is derived from the wlan0
+		MAC address, which is unique and survives reboots without
+		needing to be stored anywhere.
+
+		This is the fallback for a board whose MAC cannot be read, and an
+		escape hatch for cloud-side testing that wants a fixed, readable
+		name.  Only letters, digits, '-', '_' and '.' are accepted;
+		anything else is rejected at startup with a log line.
+
+config VS_SOCIAL_UPLOAD_CONTENT_TYPE
+	bool "Send Content-Type when transferring to the presigned URL"
+	default y
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Whether the PUT that carries the JPEG or Ogg bytes to the
+		presigned URL declares image/jpeg or audio/ogg.
+
+		This exists as an option because it cannot be decided from this
+		side.  Object stores compute the presigned signature over a
+		specific set of headers, and Content-Type is sometimes one of
+		them: if it was signed, omitting it is rejected, and if it was
+		not, sending it is rejected.  Both failures come back as HTTP 403
+		with an XML body.
+
+		Default is to send it, which is the more common signing scheme.
+		If uploads fail with 403 while registration succeeds, turn this
+		off before looking anywhere else -- vs_cloud.c names this option
+		in that specific log line for exactly that reason.
+
+config VS_SOCIAL_REG_RESP_BYTES
+	int "VelaSight social cloud registration response buffer (bytes)"
+	default 4096
+	range 1024 32768
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Buffer for the small responses: session open, upload
+		registration, session close, and the object store's reply to a
+		transfer.  The largest thing that lands here is a presigned URL,
+		or an object store's XML error document.
+
+		Sized separately from the result buffer below because one of
+		these is allocated for every frame and every audio chunk, and
+		sizing them all for a full session's timelines would waste PSRAM
+		several times a second.
+
+config VS_SOCIAL_RESP_MAX_BYTES
+	int "VelaSight social cloud result response buffer (bytes)"
+	default 65536
+	range 8192 262144
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Buffer for getResult.  The end-of-session response is the large
+		one: it carries the text minutes plus a full emotion timeline and
+		a full audio timeline, one entry per sampled frame and per
+		recognised sentence, so it grows with session length.
+
+		A session whose minutes exceed this is reported as -E2BIG rather
+		than truncated, because a clipped JSON record would be persisted
+		and then fail to parse afterwards. If that happens, raise this.
+
+config VS_SOCIAL_DOWNLOAD_MAX_BYTES
+	int "VelaSight social cloud download budget (bytes)"
+	default 262144
+	range 16384 2097152
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Upper bound on a body fetched by vs_cloud_download(), which in
+		practice means the spoken minutes at ttsMinutes.  The default is
+		a few minutes of Ogg Opus at speech bitrates.
+
+config VS_SOCIAL_CONNECT_TIMEOUT_MS
+	int "VelaSight social cloud connect timeout (ms)"
+	default 3000
+	range 500 30000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long a cleartext connect may take before it is abandoned.
+		The connect is non-blocking with an explicit poll() so this is
+		the real bound, not the stack's own much longer one.
+
+		Keep it short.  A session uploads several times a second, and a
+		host that has gone away must not stall the upload thread for
+		longer than the queue behind it can absorb.
+
+config VS_SOCIAL_IO_TIMEOUT_MS
+	int "VelaSight social cloud send/receive timeout (ms)"
+	default 8000
+	range 1000 60000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Socket send and receive timeout for the cleartext path, once
+		connected.  Larger than the connect timeout because this also
+		covers the cloud thinking about a request, not just the link.

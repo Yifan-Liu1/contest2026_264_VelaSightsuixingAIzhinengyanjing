@@ -15,6 +15,7 @@
 
 #include "include/vs_app.h"
 #include "include/vs_audio.h"
+#include "include/vs_cloud.h"
 #include "include/vs_display.h"
 #include "include/vs_history.h"
 #include "include/vs_input.h"
@@ -2135,6 +2136,16 @@ int vs_app_run(void)
     else
       runtime.volume_level = VS_VOLUME_FALLBACK;
   }
+
+  /* Resolve the social cloud's endpoint and this device's identifier.  No
+   * network I/O, so it costs nothing here; it just has to happen before any
+   * cloud call, and it reads the wlan0 MAC, which needs the netdev to be
+   * registered -- which board bring-up has already done by the time the app
+   * runs.  An unconfigured host is not an error worth stopping for: social
+   * mode will refuse to start and say why.
+   */
+
+  (void)vs_cloud_init();
 
   bk7258_nand_seed_agent_config();
   runtime.api_ready = bk7258_ai_config_ready();
