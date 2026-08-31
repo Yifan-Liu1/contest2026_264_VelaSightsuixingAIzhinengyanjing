@@ -40,6 +40,11 @@ static void fill(struct velasight_prov_credentials_s *cred,
   snprintf(cred->api_key, sizeof(cred->api_key), "%s", "tp-test-key");
   snprintf(cred->volc_appid, sizeof(cred->volc_appid), "%s", "1234567890");
   snprintf(cred->volc_token, sizeof(cred->volc_token), "%s", "volc-test-token");
+  snprintf(cred->cloud_host, sizeof(cred->cloud_host), "%s",
+           "staging-hlth.xiaomiwear.com");
+  snprintf(cred->cloud_path, sizeof(cred->cloud_path), "%s",
+           "/hlthopen/public");
+  cred->cloud_port   = 18080;
   cred->generation   = generation;
   cred->open_network = cred->password[0] == '\0';
 }
@@ -76,8 +81,74 @@ static void test_record_roundtrip(void)
          strcmp(out.api_key, "tp-test-key") == 0 &&
          strcmp(out.volc_appid, "1234567890") == 0 &&
          strcmp(out.volc_token, "volc-test-token") == 0 &&
+         strcmp(out.cloud_host, "staging-hlth.xiaomiwear.com") == 0 &&
+         strcmp(out.cloud_path, "/hlthopen/public") == 0 &&
+         out.cloud_port == 18080 &&
         out.generation == 7 && !out.open_network,
         "decode returns what encode was given");
+
+  /* An endpoint left entirely unset has to survive as unset rather than as
+   * some zero-length-but-present value: empty host and zero port are how the
+   * record says "fall back to the compiled-in default", and a decoder that
+   * turned either into anything else would silently pin a device to whatever
+   * it invented.
+   */
+
+  fill(&in, "AIPC", "passphrase", 9);
+  in.cloud_host[0] = '\0';
+  in.cloud_path[0] = '\0';
+  in.cloud_port    = 0;
+  memset(&out, 0xff, sizeof(out));
+  CHECK(vp_record_encode(buf, sizeof(buf), &in) == VP_RECORD_SIZE &&
+        vp_record_decode(buf, sizeof(buf), &out) == 0 &&
+        out.cloud_host[0] == '\0' && out.cloud_path[0] == '\0' &&
+        out.cloud_port == 0,
+        "an unset endpoint round-trips as unset, not as a value");
+
+  /* Full-length host and path, to catch an off-by-one in the offsets that a
+   * short value would slide past: the host field butts directly against the
+   * path field, so one byte too many in the first silently corrupts the
+   * second rather than failing.
+   */
+
+  fill(&in, "AIPC", "passphrase", 10);
+  memset(in.cloud_host, 'h', VELASIGHT_PROV_CLOUD_HOST_MAX);
+  in.cloud_host[VELASIGHT_PROV_CLOUD_HOST_MAX] = '\0';
+  in.cloud_path[0] = '/';
+  memset(in.cloud_path + 1, 'p', VELASIGHT_PROV_CLOUD_PATH_MAX - 1);
+  in.cloud_path[VELASIGHT_PROV_CLOUD_PATH_MAX] = '\0';
+  in.cloud_port = 65535;
+  memset(&out, 0xff, sizeof(out));
+  CHECK(vp_record_encode(buf, sizeof(buf), &in) == VP_RECORD_SIZE &&
+        vp_record_decode(buf, sizeof(buf), &out) == 0 &&
+        strcmp(out.cloud_host, in.cloud_host) == 0 &&
+        strcmp(out.cloud_path, in.cloud_path) == 0 &&
+        out.cloud_port == 65535,
+        "a full-length endpoint neither truncates nor overruns its neighbour");
+
+  /* A stored endpoint the running validator would refuse is corrupt, not
+   * usable.  This is the same rule the credential fields already follow, and
+   * it matters more here: a host with a slash or a space in it would be
+   * pasted into a Host header.
+   */
+
+  fill(&in, "AIPC", "passphrase", 11);
+  CHECK(vp_record_encode(buf, sizeof(buf), &in) == VP_RECORD_SIZE,
+        "a valid endpoint encodes before the corruption is injected");
+  buf[813] = '/';
+  {
+    uint32_t crc = vp_crc32(buf, VP_RECORD_SIZE - 4);
+
+    buf[VP_RECORD_SIZE - 4] = (uint8_t)(crc & 0xff);
+    buf[VP_RECORD_SIZE - 3] = (uint8_t)((crc >> 8) & 0xff);
+    buf[VP_RECORD_SIZE - 2] = (uint8_t)((crc >> 16) & 0xff);
+    buf[VP_RECORD_SIZE - 1] = (uint8_t)((crc >> 24) & 0xff);
+  }
+
+  CHECK(vp_record_decode(buf, sizeof(buf), &out) == -EBADMSG,
+        "a host the validator rejects is reported corrupt, not handed back");
+
+  fill(&in, "AIPC", "passphrase", 12);
 
   fill(&in, "OpenNet", "", 1);
   CHECK(vp_record_encode(buf, sizeof(buf), &in) == VP_RECORD_SIZE &&

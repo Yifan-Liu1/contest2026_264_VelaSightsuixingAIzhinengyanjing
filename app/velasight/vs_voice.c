@@ -381,28 +381,66 @@ static int vs_voice_seed_volc_credentials(
 
 static int vs_voice_apply_credentials(bool allow_missing)
 {
-  struct velasight_prov_credentials_s credentials;
+  struct velasight_prov_credentials_s *credentials;
   int ret;
 
-  ret = velasight_provisioning_load(&credentials);
+  /* Heap rather than a 976-byte local: this runs on a pthread whose stack is
+   * CONFIG_PTHREAD_STACK_DEFAULT (4 KiB), the same class of budget a
+   * same-sized local of this struct overran elsewhere once the endpoint
+   * fields grew it from 812 bytes -- see vp_store.c's vp_record_decode()
+   * for the incident this mirrors.
+   */
+
+  credentials = malloc(sizeof(*credentials));
+  if (credentials == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  ret = velasight_provisioning_load(credentials);
   if (ret < 0)
     {
-      if (allow_missing && ret == -ENOENT)
+      free(credentials);
+
+      /* -EBADMSG joins -ENOENT here for the same reason it does in
+       * vs_config_load_wifi(): the record format is a breaking version
+       * bump away from what an older save produced, and vp_record_decode()
+       * refuses rather than guesses.  Treated as "no usable credentials
+       * yet", not as a fatal error -- the assistant answers with -ENOKEY
+       * until the setup page is used, same as a device that was never
+       * provisioned at all, rather than this call chain failing and being
+       * retried forever with the same result.
+       */
+
+      if (allow_missing && (ret == -ENOENT || ret == -EBADMSG))
         {
-          printf("vs_voice: no provisioning record yet\n");
+          if (ret == -EBADMSG)
+            {
+              printf("vs_voice: provisioning record unreadable (%d, "
+                     "format mismatch), no credentials until re-saved\n",
+                     ret);
+            }
+          else
+            {
+              printf("vs_voice: no provisioning record yet\n");
+            }
+
           return 0;
         }
 
       return ret;
     }
 
-  ret = vs_voice_seed_llm_credentials(&credentials);
+  ret = vs_voice_seed_llm_credentials(credentials);
   if (ret < 0)
     {
+      free(credentials);
       return ret;
     }
 
-  return vs_voice_seed_volc_credentials(&credentials);
+  ret = vs_voice_seed_volc_credentials(credentials);
+  free(credentials);
+  return ret;
 }
 
 /* Caller has set credentials_reloading and cleared the pending flag.  No

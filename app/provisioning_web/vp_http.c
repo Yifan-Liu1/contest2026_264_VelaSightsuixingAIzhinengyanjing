@@ -17,7 +17,7 @@
  * vp_server.c has to stay ahead of it.
  */
 
-#define VP_HTTP_BODY_BUILD 4608
+#define VP_HTTP_BODY_BUILD 5632
 
 static const char g_form_type[] = "application/x-www-form-urlencoded";
 
@@ -593,6 +593,20 @@ static size_t vp_wrap(char *buf, size_t buflen, int status,
 #define VP_PAGE_NAV_SETUP   VP_PAGE_NAV(" on", "")
 #define VP_PAGE_NAV_HISTORY VP_PAGE_NAV("", " on")
 
+/* Placeholder text for the three endpoint boxes: the factory default, shown
+ * greyed out so an empty box reads as "this is what you get" rather than as
+ * a missing setting.  Stringified from the shared defaults so the page cannot
+ * advertise an address vs_cloud_init() does not actually fall back to.
+ */
+
+#define VP_CLOUD_HOST_DEFAULT VELASIGHT_PROV_CLOUD_HOST_DEFAULT
+#define VP_CLOUD_PATH_DEFAULT VELASIGHT_PROV_CLOUD_PATH_DEFAULT
+
+#define VP_STRINGIFY_(x) #x
+#define VP_STRINGIFY(x)  VP_STRINGIFY_(x)
+#define VP_CLOUD_PORT_DEFAULT_TEXT \
+  VP_STRINGIFY(VELASIGHT_PROV_CLOUD_PORT_DEFAULT)
+
 /* The one place the input names are written down.  Both the setup page and
  * the confirmation page carry the same form, so a user who mistyped one field
  * never has to navigate back to fix it.
@@ -625,6 +639,21 @@ static size_t vp_wrap(char *buf, size_t buflen, int status,
   "maxlength=\"128\" autocomplete=\"off\">"                              \
   "<p class=\"note\">这两项留空表示不改动，需要一起填写，"               \
   "设备靠它们听懂和说话。</p>"                                           \
+  "<label for=\"cloud_host\">社交云地址</label>"                         \
+  "<input id=\"cloud_host\" name=\"cloud_host\" type=\"text\" "          \
+  "maxlength=\"96\" %sautocomplete=\"off\" autocapitalize=\"off\" "      \
+  "placeholder=\"" VP_CLOUD_HOST_DEFAULT "\">"                           \
+  "<label for=\"cloud_port\">端口</label>"                               \
+  "<input id=\"cloud_port\" name=\"cloud_port\" type=\"number\" "        \
+  "min=\"1\" max=\"65535\" %sautocomplete=\"off\" "                      \
+  "placeholder=\"" VP_CLOUD_PORT_DEFAULT_TEXT "\">"                      \
+  "<label for=\"cloud_path\">路径前缀</label>"                           \
+  "<input id=\"cloud_path\" name=\"cloud_path\" type=\"text\" "          \
+  "maxlength=\"64\" %sautocomplete=\"off\" autocapitalize=\"off\" "      \
+  "placeholder=\"" VP_CLOUD_PATH_DEFAULT "\">"                           \
+  "<p class=\"note\">社交模式用的服务器。留空即用灰字所示的默认值。"     \
+  "地址不带 http:// 和端口；前缀以「/」开头、末尾不加「/」，"            \
+  "/contest/v1 不用填。</p>"                                             \
   "<button type=\"submit\">保存</button>"                                \
   "</form>"                                                              \
   "<p class=\"note\">保存后在设备上长按返回键即可退出设置。</p>"
@@ -641,13 +670,32 @@ static const char *vp_filled(bool set)
 
 static int vp_state_box(char *out, size_t outlen,
                         const struct vp_http_state_s *state,
-                        const char *escaped_ssid)
+                        const char *escaped_ssid,
+                        const char *escaped_cloud_host,
+                        const char *escaped_cloud_path)
 {
+  char port[16];
+
   if (state == NULL || !state->have_record)
     {
       return snprintf(out, outlen,
                       "<p class=\"note\">设备还没有记住任何 Wi-Fi，"
                       "请在下面填写后保存。</p>");
+    }
+
+  /* "默认" rather than the number itself when nothing is stored, so the box
+   * distinguishes a port the user chose from the one the firmware falls back
+   * to.  The two can be the same number, which is exactly when telling them
+   * apart matters.
+   */
+
+  if (state->cloud_port != 0)
+    {
+      snprintf(port, sizeof(port), "%u", (unsigned int)state->cloud_port);
+    }
+  else
+    {
+      snprintf(port, sizeof(port), "默认 %s", VP_CLOUD_PORT_DEFAULT_TEXT);
     }
 
   return snprintf(out, outlen,
@@ -658,6 +706,9 @@ static int vp_state_box(char *out, size_t outlen,
                   "<p class=\"note\">MiMo API key：%s</p>"
                   "<p class=\"note\">语音 App ID：%s</p>"
                   "<p class=\"note\">语音 Token：%s</p>"
+                  "<p class=\"note\">社交云地址：%s</p>"
+                  "<p class=\"note\">端口：%s</p>"
+                  "<p class=\"note\">路径前缀：%s</p>"
                   "<p class=\"note\">已经保存过 %u 次</p>"
                   "</div>",
                   escaped_ssid[0] != '\0' ? escaped_ssid : "（空）",
@@ -665,6 +716,11 @@ static int vp_state_box(char *out, size_t outlen,
                   vp_filled(state->have_api_key),
                   vp_filled(state->have_volc_appid),
                   vp_filled(state->have_volc_token),
+                  escaped_cloud_host[0] != '\0' ? escaped_cloud_host :
+                    "默认 " VP_CLOUD_HOST_DEFAULT,
+                  port,
+                  escaped_cloud_path[0] != '\0' ? escaped_cloud_path :
+                    "默认 " VP_CLOUD_PATH_DEFAULT,
                   (unsigned int)state->generation);
 }
 
@@ -677,7 +733,25 @@ static size_t vp_http_page(char *buf, size_t buflen,
   char escaped_ssid[VELASIGHT_PROV_SSID_MAX * 6 + 1];
   char escaped_form[VELASIGHT_PROV_SSID_MAX * 6 + 1];
   char ssid_attr[VELASIGHT_PROV_SSID_MAX * 6 + 16];
-  char box[768];
+  /* Not sized for sixfold expansion, unlike the SSID buffers above, because
+   * these two cannot expand at all: vp_cloud_host_ok() and vp_cloud_path_ok()
+   * reject '&', '<', '>', '"' and '\'', which are the only characters
+   * vp_html_escape() lengthens, and vp_record_decode() runs that validation
+   * before a stored value ever reaches here.  Sizing them for an impossible
+   * case would cost about 1.6 KiB of the listener's stack.
+   *
+   * The escape call stays regardless.  If a value from somewhere else ever
+   * did contain one of those five, it would not fit and vp_html_escape()
+   * would answer -E2BIG, leaving the field blank -- the same degradation the
+   * SSID path already takes, and still no unescaped byte in the page.
+   */
+
+  char escaped_host[VELASIGHT_PROV_CLOUD_HOST_MAX + 1];
+  char escaped_path[VELASIGHT_PROV_CLOUD_PATH_MAX + 1];
+  char host_attr[VELASIGHT_PROV_CLOUD_HOST_MAX + 16];
+  char path_attr[VELASIGHT_PROV_CLOUD_PATH_MAX + 16];
+  char port_attr[32];
+  char box[1024];
   char body[VP_HTTP_BODY_BUILD];
   const char *form_ssid;
   int bodylen;
@@ -692,6 +766,11 @@ static size_t vp_http_page(char *buf, size_t buflen,
   escaped_ssid[0] = '\0';
   escaped_form[0] = '\0';
   ssid_attr[0] = '\0';
+  escaped_host[0] = '\0';
+  escaped_path[0] = '\0';
+  host_attr[0] = '\0';
+  path_attr[0] = '\0';
+  port_attr[0] = '\0';
 
   if (state != NULL && state->ssid != NULL && state->ssid[0] != '\0')
     {
@@ -712,12 +791,42 @@ static size_t vp_http_page(char *buf, size_t buflen,
       snprintf(ssid_attr, sizeof(ssid_attr), "value=\"%s\" ", escaped_form);
     }
 
+  /* The endpoint boxes are pre-filled with the stored value, so clearing one
+   * is a deliberate act the form can express.  Nothing stored leaves the box
+   * empty with the default showing as placeholder text -- which is also what
+   * the user sees after clearing it, so the two states look the same on
+   * purpose: both mean "the default applies".
+   */
+
+  if (state != NULL && state->cloud_host != NULL &&
+      state->cloud_host[0] != '\0' &&
+      vp_html_escape(state->cloud_host, escaped_host,
+                     sizeof(escaped_host)) >= 0)
+    {
+      snprintf(host_attr, sizeof(host_attr), "value=\"%s\" ", escaped_host);
+    }
+
+  if (state != NULL && state->cloud_path != NULL &&
+      state->cloud_path[0] != '\0' &&
+      vp_html_escape(state->cloud_path, escaped_path,
+                     sizeof(escaped_path)) >= 0)
+    {
+      snprintf(path_attr, sizeof(path_attr), "value=\"%s\" ", escaped_path);
+    }
+
+  if (state != NULL && state->cloud_port != 0)
+    {
+      snprintf(port_attr, sizeof(port_attr), "value=\"%u\" ",
+               (unsigned int)state->cloud_port);
+    }
+
   if (notice != NULL && vp_html_escape(notice, escaped, sizeof(escaped)) < 0)
     {
       escaped[0] = '\0';
     }
 
-  n = vp_state_box(box, sizeof(box), state, escaped_ssid);
+  n = vp_state_box(box, sizeof(box), state, escaped_ssid, escaped_host,
+                   escaped_path);
   if (n < 0 || (size_t)n >= sizeof(box))
     {
       return 0;
@@ -738,6 +847,9 @@ static size_t vp_http_page(char *buf, size_t buflen,
                      escaped[0] != '\0' ? "</p>" : "",
                      extra != NULL ? extra : "",
                      ssid_attr,
+                     host_attr,
+                     port_attr,
+                     path_attr,
                      state != NULL && state->history_enabled ?
                        VP_PAGE_NAV_SETUP : "");
 
@@ -773,9 +885,12 @@ size_t vp_http_saved_page(char *buf, size_t buflen,
     { VP_FORM_CHANGED_API_KEY,    "MiMo API key" },
     { VP_FORM_CHANGED_VOLC_APPID, "语音 App ID"  },
     { VP_FORM_CHANGED_VOLC_TOKEN, "语音 Token"   },
+    { VP_FORM_CHANGED_CLOUD_HOST, "社交云地址"   },
+    { VP_FORM_CHANGED_CLOUD_PORT, "端口"         },
+    { VP_FORM_CHANGED_CLOUD_PATH, "路径前缀"     },
   };
 
-  char names[128];
+  char names[192];
   char extra[512];
   size_t used = 0;
   size_t i;

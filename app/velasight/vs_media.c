@@ -392,3 +392,379 @@ void vs_media_frame_release(struct vs_media_frame_s *frame)
 
   memset(frame, 0, sizeof(*frame));
 }
+
+/****************************************************************************
+ * Resident capture
+ ****************************************************************************/
+
+struct vs_media_stream_s
+{
+  int      fd;
+  uint16_t width;
+  uint16_t height;
+  bool     streaming;
+
+  void  *addr[VS_MEDIA_NBUFFERS];
+  size_t buflen[VS_MEDIA_NBUFFERS];
+
+  /* Written by vs_media_stream_wake() from another thread and read by the
+   * grab loop.  volatile rather than locked: it is a one-way latch a single
+   * writer sets and never clears, so the only race is a grab that reads it
+   * one poll interval late, which is what the short poll slice below bounds.
+   */
+
+  volatile bool stopping;
+
+  uint32_t delivered;
+  uint32_t malformed;
+};
+
+/* How long one poll() inside a grab may block, regardless of the caller's
+ * timeout.  The caller's timeout is honoured by looping.
+ *
+ * This exists because there is nothing to interrupt a poll() on a V4L2
+ * descriptor: no eventfd, no pipe in the set.  Slicing the wait is what makes
+ * vs_media_stream_wake() take effect within a bounded time instead of at the
+ * end of a wait sized for a stalled sensor.  50 ms is well under the shortest
+ * gesture the UI reacts to, so a session ending never feels delayed by it, and
+ * at ~3 FPS it costs at most a handful of extra syscalls per frame.
+ */
+
+#define VS_MEDIA_POLL_SLICE_MS 50
+
+int vs_media_stream_open(struct vs_media_stream_s **stream,
+                         uint16_t width, uint16_t height)
+{
+  struct vs_media_stream_s *s;
+  struct v4l2_requestbuffers req;
+  struct v4l2_buffer buf;
+  struct v4l2_format fmt;
+  int ret;
+  int i;
+
+  if (stream == NULL)
+    {
+      return -EINVAL;
+    }
+
+  *stream = NULL;
+
+  if (!vs_media_geometry_supported(width, height))
+    {
+      printf("vs_media: unsupported stream geometry %ux%u\n", width, height);
+      return -EINVAL;
+    }
+
+  s = calloc(1, sizeof(*s));
+  if (s == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  s->fd     = -1;
+  s->width  = width;
+  s->height = height;
+
+  s->fd = open(VS_MEDIA_VIDEO_DEV, O_RDWR);
+  if (s->fd < 0)
+    {
+      /* EBUSY is worth separating from "no such device": the two mean
+       * "something else owns the camera" and "there is no camera", and only
+       * the first is something a user can resolve by leaving the other mode.
+       */
+
+      ret = errno == EBUSY ? -EBUSY : -ENODEV;
+      printf("vs_media: stream open %s failed, errno=%d\n",
+             VS_MEDIA_VIDEO_DEV, errno);
+      free(s);
+      return ret;
+    }
+
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.fmt.pix.width       = width;
+  fmt.fmt.pix.height      = height;
+  fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+  fmt.fmt.pix.field       = V4L2_FIELD_ANY;
+  fmt.fmt.pix.sizeimage   = VS_MEDIA_SIZEIMAGE;
+
+  if (ioctl(s->fd, VIDIOC_S_FMT, (unsigned long)&fmt) < 0)
+    {
+      ret = -errno;
+      printf("vs_media: stream S_FMT JPEG %ux%u failed, errno=%d\n",
+             width, height, errno);
+      goto errout;
+    }
+
+  memset(&req, 0, sizeof(req));
+  req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  req.memory = V4L2_MEMORY_MMAP;
+  req.count  = VS_MEDIA_NBUFFERS;
+
+  if (ioctl(s->fd, VIDIOC_REQBUFS, (unsigned long)&req) < 0)
+    {
+      ret = -errno;
+      printf("vs_media: stream REQBUFS failed, errno=%d\n", errno);
+      goto errout;
+    }
+
+  for (i = 0; i < VS_MEDIA_NBUFFERS; i++)
+    {
+      memset(&buf, 0, sizeof(buf));
+      buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index  = (uint32_t)i;
+
+      if (ioctl(s->fd, VIDIOC_QUERYBUF, (unsigned long)&buf) < 0)
+        {
+          ret = -errno;
+          printf("vs_media: stream QUERYBUF[%d] failed, errno=%d\n", i,
+                 errno);
+          goto errout;
+        }
+
+      s->addr[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        s->fd, (off_t)buf.m.offset);
+      if (s->addr[i] == MAP_FAILED)
+        {
+          s->addr[i] = NULL;
+          ret = -errno;
+          printf("vs_media: stream mmap[%d] failed, errno=%d\n", i, errno);
+          goto errout;
+        }
+
+      s->buflen[i] = buf.length;
+
+      if (ioctl(s->fd, VIDIOC_QBUF, (unsigned long)&buf) < 0)
+        {
+          ret = -errno;
+          printf("vs_media: stream QBUF[%d] failed, errno=%d\n", i, errno);
+          goto errout;
+        }
+    }
+
+  if (ioctl(s->fd, VIDIOC_STREAMON, (unsigned long)&req.type) < 0)
+    {
+      ret = -errno;
+      printf("vs_media: stream STREAMON failed, errno=%d\n", errno);
+      goto errout;
+    }
+
+  s->streaming = true;
+  *stream = s;
+  printf("vs_media: stream open %ux%u\n", width, height);
+  return 0;
+
+errout:
+  vs_media_stream_close(s);
+  return ret;
+}
+
+int vs_media_stream_grab(struct vs_media_stream_s *stream,
+                         struct vs_media_frame_s *frame,
+                         unsigned int timeout_ms)
+{
+  struct v4l2_buffer buf;
+  struct pollfd pfd;
+  unsigned char *copy;
+  bool from_psram = true;
+  unsigned int waited = 0;
+  int ret;
+
+  if (stream == NULL || frame == NULL || !stream->streaming)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, sizeof(*frame));
+
+  pfd.fd     = stream->fd;
+  pfd.events = POLLIN;
+
+  /* Poll in slices so wake() is observed promptly.  The <= lets a caller pass
+   * a timeout that is an exact multiple of the slice and still get that many
+   * milliseconds of waiting rather than one slice less.
+   */
+
+  for (; ; )
+    {
+      unsigned int slice;
+
+      if (stream->stopping)
+        {
+          return -ECANCELED;
+        }
+
+      if (waited >= timeout_ms)
+        {
+          return -ETIMEDOUT;
+        }
+
+      slice = timeout_ms - waited;
+      if (slice > VS_MEDIA_POLL_SLICE_MS)
+        {
+          slice = VS_MEDIA_POLL_SLICE_MS;
+        }
+
+      pfd.revents = 0;
+      ret = poll(&pfd, 1, (int)slice);
+      if (ret > 0)
+        {
+          break;
+        }
+
+      if (ret < 0 && errno != EINTR)
+        {
+          return -errno;
+        }
+
+      waited += slice;
+    }
+
+  memset(&buf, 0, sizeof(buf));
+  buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  buf.memory = V4L2_MEMORY_MMAP;
+
+  if (ioctl(stream->fd, VIDIOC_DQBUF, (unsigned long)&buf) < 0)
+    {
+      return -errno;
+    }
+
+  if (buf.index >= VS_MEDIA_NBUFFERS || buf.bytesused == 0)
+    {
+      /* Requeue before returning.  A buffer dequeued and not given back is
+       * gone for the life of the stream, and with only two of them a couple of
+       * these would stall the sensor permanently.
+       */
+
+      ioctl(stream->fd, VIDIOC_QBUF, (unsigned long)&buf);
+      return -EIO;
+    }
+
+  if (!vs_media_check_jpeg(stream->addr[buf.index], buf.bytesused))
+    {
+      stream->malformed++;
+      ioctl(stream->fd, VIDIOC_QBUF, (unsigned long)&buf);
+      return -EBADMSG;
+    }
+
+  /* PSRAM first, same reasoning as the one-shot path: a session holds one of
+   * these across a network round trip, and tens of KB in the SRAM heap would
+   * compete with the pthread stacks that can only come from there.
+   */
+
+  copy = bk7258_psram_malloc(buf.bytesused);
+  if (copy == NULL)
+    {
+      from_psram = false;
+      copy = malloc(buf.bytesused);
+    }
+
+  if (copy == NULL)
+    {
+      ioctl(stream->fd, VIDIOC_QBUF, (unsigned long)&buf);
+      return -ENOMEM;
+    }
+
+  memcpy(copy, stream->addr[buf.index], buf.bytesused);
+
+  /* Back to the driver immediately, before the caller does anything with the
+   * frame.  This is the whole point of copying: the sensor keeps filling while
+   * the upload blocks.
+   */
+
+  ioctl(stream->fd, VIDIOC_QBUF, (unsigned long)&buf);
+
+  frame->data       = copy;
+  frame->len        = buf.bytesused;
+  frame->width      = stream->width;
+  frame->height     = stream->height;
+  frame->from_psram = from_psram;
+  stream->delivered++;
+  return 0;
+}
+
+void vs_media_stream_wake(struct vs_media_stream_s *stream, bool stop)
+{
+  if (stream == NULL)
+    {
+      return;
+    }
+
+  if (stop)
+    {
+      stream->stopping = true;
+    }
+}
+
+void vs_media_stream_stats(struct vs_media_stream_s *stream,
+                           uint32_t *delivered, uint32_t *malformed)
+{
+  if (delivered != NULL)
+    {
+      *delivered = stream != NULL ? stream->delivered : 0;
+    }
+
+  if (malformed != NULL)
+    {
+      *malformed = stream != NULL ? stream->malformed : 0;
+    }
+}
+
+void vs_media_stream_close(struct vs_media_stream_s *stream)
+{
+  int i;
+
+  if (stream == NULL)
+    {
+      return;
+    }
+
+  if (stream->fd >= 0)
+    {
+      if (stream->streaming)
+        {
+          int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+          ioctl(stream->fd, VIDIOC_STREAMOFF, (unsigned long)&type);
+          stream->streaming = false;
+        }
+
+      for (i = 0; i < VS_MEDIA_NBUFFERS; i++)
+        {
+          if (stream->addr[i] != NULL)
+            {
+              munmap(stream->addr[i], stream->buflen[i]);
+              stream->addr[i] = NULL;
+            }
+        }
+
+      /* Hand the driver's allocation back explicitly rather than relying on
+       * close(), for the same reason the one-shot path does: an internal
+       * buffer count that drifts across open/close cycles only shows up after
+       * many sessions.
+       */
+
+      {
+        struct v4l2_requestbuffers req;
+
+        memset(&req, 0, sizeof(req));
+        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        req.count  = 0;
+        ioctl(stream->fd, VIDIOC_REQBUFS, (unsigned long)&req);
+      }
+
+      close(stream->fd);
+      stream->fd = -1;
+    }
+
+  if (stream->delivered != 0 || stream->malformed != 0)
+    {
+      printf("vs_media: stream closed, %lu frames, %lu malformed\n",
+             (unsigned long)stream->delivered,
+             (unsigned long)stream->malformed);
+    }
+
+  free(stream);
+}

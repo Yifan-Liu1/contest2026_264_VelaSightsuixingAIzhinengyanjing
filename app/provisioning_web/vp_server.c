@@ -44,9 +44,21 @@
  * .bss is worth the reservation: the stack is claimed once at start and
  * released on stop, while a static buffer would hold the same memory for the
  * whole uptime of a device that is provisioned once.
+ *
+ * Raised from 12288 with the social cloud endpoint boxes, which grew three
+ * things at once: VP_HTTP_BODY_BUILD by 1 KiB, the two credential records by
+ * about 170 bytes each, and vp_http_page()'s escape scratch by a few hundred
+ * bytes.  vp_http_page()'s locals now total roughly 8 KiB.
+ *
+ * The number is set by the host tests rather than by the target.  They build
+ * the same page under AddressSanitizer, which wraps every local array in a
+ * redzone and so needs close to twice the frame; a value that fits the target
+ * comfortably but not that would turn `make -C tests` into a stack-overflow
+ * report instead of a result.  Sizing for the stricter of the two consumers
+ * costs a reservation that only exists while the listener does.
  */
 
-#define VP_THREAD_STACK    12288
+#define VP_THREAD_STACK    24576
 
 struct vp_server_s
 {
@@ -668,6 +680,9 @@ static void vp_state_from(struct vp_http_state_s *state,
   state->have_api_key    = cred->api_key[0] != '\0';
   state->have_volc_appid = cred->volc_appid[0] != '\0';
   state->have_volc_token = cred->volc_token[0] != '\0';
+  state->cloud_host      = cred->cloud_host;
+  state->cloud_path      = cred->cloud_path;
+  state->cloud_port      = cred->cloud_port;
   state->generation      = cred->generation;
 }
 
@@ -697,6 +712,10 @@ static const char *vp_fix_hint(int err, enum vp_form_field_e which,
             return "语音 App ID 太长了，最多 64 个字符。";
           case VP_FORM_FIELD_VOLC_TOKEN:
             return "语音 Token 太长了，最多 128 个字符。";
+          case VP_FORM_FIELD_CLOUD_HOST:
+            return "社交云地址太长了，最多 96 个字符。";
+          case VP_FORM_FIELD_CLOUD_PATH:
+            return "路径前缀太长了，最多 64 个字符。";
           default:
             return "提交的内容太多了，请检查是否粘贴了多余的内容。";
         }
@@ -722,6 +741,18 @@ static const char *vp_fix_hint(int err, enum vp_form_field_e which,
 
       case VP_FORM_FIELD_VOLC_TOKEN:
         return "语音 Token 里有无法识别的字符，请重新复制粘贴。";
+
+      case VP_FORM_FIELD_CLOUD_HOST:
+        return "社交云地址只能填域名或 IP，不要带 http://、端口和路径；"
+               "想用出厂默认值请把这一栏留空。";
+
+      case VP_FORM_FIELD_CLOUD_PORT:
+        return "端口要填 1 到 65535 之间的整数；"
+               "想用出厂默认值请把这一栏留空。";
+
+      case VP_FORM_FIELD_CLOUD_PATH:
+        return "路径前缀要以「/」开头、结尾不加「/」，且不能带 ? 或 #；"
+               "想用出厂默认值请把这一栏留空。";
 
       default:
         return "提交的内容没能读懂，请重新填写后再保存。";

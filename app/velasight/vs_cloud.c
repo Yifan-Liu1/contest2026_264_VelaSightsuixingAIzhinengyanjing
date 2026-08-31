@@ -78,6 +78,8 @@
 
 #include <infra/vela_tls.h>
 
+#include "velasight_provisioning.h"
+
 #include "include/vs_cloud.h"
 
 /****************************************************************************
@@ -153,6 +155,13 @@
 #define CLOUD_HOST_MAX           128
 #define CLOUD_PORT_MAX           8
 
+/* The prefix in front of the paths above.  One byte wider than the
+ * provisioning field so a full-length stored value still terminates here
+ * rather than being reported as too long by a check the user cannot act on.
+ */
+
+#define CLOUD_BASE_PATH_MAX      (VELASIGHT_PROV_CLOUD_PATH_MAX + 1)
+
 /* There is deliberately no single identifier length limit here.  An earlier
  * version had one, wider than the structures that receive identifiers, so a
  * msgId longer than VS_CLOUD_MSG_ID_MAX passed validation and was then
@@ -164,9 +173,13 @@
 
 /* How many identifiers one getResult may carry.  The interface takes an
  * array with no stated limit; this bounds the query string.
+ *
+ * The value itself is in the header, because a caller has to size its own
+ * arrays from it.  The local alias stays so the buffer arithmetic below reads
+ * as arithmetic on a local constant.
  */
 
-#define CLOUD_POLL_MAX_IDS 16
+#define CLOUD_POLL_MAX_IDS VS_CLOUD_POLL_MAX_IDS
 
 /* Staging sizes for the getResult query, derived from the limits above rather
  * than picked, so the advertised batch size is one the buffers can carry.
@@ -198,12 +211,17 @@
  * batch of identifiers then failed -E2BIG inside cloud_api_call(), one layer
  * below where the batch limit is checked and stated -- so the batch size the
  * API advertised was not one it could actually send.
+ *
+ * The base path prefix is added to both candidates rather than only to the
+ * larger.  A presigned URL never carries it -- that URL is absolute and comes
+ * from the cloud -- but writing the bound that way would make the two arms
+ * differ for a reason a reader has to reconstruct, and the few bytes buy
+ * nothing.
  */
-
 #if CLOUD_QUERY_MAX > CLOUD_PRESIGNED_PATH_MAX
-#  define CLOUD_PATH_MAX CLOUD_QUERY_MAX
+#  define CLOUD_PATH_MAX (CLOUD_QUERY_MAX + CLOUD_BASE_PATH_MAX)
 #else
-#  define CLOUD_PATH_MAX CLOUD_PRESIGNED_PATH_MAX
+#  define CLOUD_PATH_MAX (CLOUD_PRESIGNED_PATH_MAX + CLOUD_BASE_PATH_MAX)
 #endif
 
 #define CLOUD_TAG "vs_cloud"
@@ -225,9 +243,46 @@ struct cloud_state_s
   char device_id[VS_CLOUD_DEVICE_ID_MAX];
   char host[CLOUD_HOST_MAX];
   char port[CLOUD_PORT_MAX];
+
+  /* What sits in front of /contest/v1, empty when the interface is at the
+   * document root.  Stored with a leading slash and no trailing one, which
+   * cloud_api_call() relies on to concatenate without testing.
+   */
+
+  char base_path[CLOUD_BASE_PATH_MAX];
+
+  /* The port as a number as well as a string.  The string is what goes in the
+   * Host header and into cloud_connect(); the number is what
+   * vs_cloud_endpoint() hands back and what a comparison against the record
+   * uses, and deriving one from the other at each use invited an atoi() of an
+   * empty buffer.
+   */
+
+  uint16_t port_value;
+
+  enum vs_cloud_origin_e origin;
+
   bool tls;
   bool configured;
   bool initialized;
+
+  /* A session is open and its identifiers only mean anything on the host that
+   * issued them, so the endpoint must not move underneath it.  Set by a
+   * successful open, cleared when a close reaches a terminal answer or when a
+   * later open supersedes it.
+   *
+   * Not a lock.  It only gates vs_cloud_reload_endpoint(), which answers
+   * -EBUSY rather than waiting, so the worst case is that a re-provisioned
+   * endpoint takes effect at the next session instead of immediately.
+   */
+
+  bool session_live;
+
+  /* A reload arrived while a session was open.  Applied at the next open,
+   * which is the first moment it is safe.
+   */
+
+  bool reload_pending;
 
   /* False while device_id is still the per-boot fallback, which means a later
    * call should retry the MAC.  See cloud_resolve_device_id().
@@ -1303,8 +1358,19 @@ static int cloud_api_call(const char *method, const char *path_and_query,
   snprintf(url->host, sizeof(url->host), "%s", g_cloud.host);
   snprintf(url->port, sizeof(url->port), "%s", g_cloud.port);
 
-  if (snprintf(url->path, sizeof(url->path), "%s", path_and_query) >=
-      (int)sizeof(url->path))
+  /* The base path goes on here rather than into the four CLOUD_PATH_*
+   * literals, so those keep the document's own spelling and a grep for a path
+   * still finds it.  This is also the only place all four endpoints pass
+   * through, which is what makes one concatenation enough.
+   *
+   * No slash is inserted: the prefix is stored with a leading slash and
+   * without a trailing one (vp_cloud_path_ok() enforces both), and every
+   * path_and_query starts with one.  An empty prefix therefore also works
+   * without a special case.
+   */
+
+  if (snprintf(url->path, sizeof(url->path), "%s%s", g_cloud.base_path,
+               path_and_query) >= (int)sizeof(url->path))
     {
       free(url);
       return -E2BIG;
@@ -1817,6 +1883,181 @@ static void cloud_resolve_device_id(void)
     }
 }
 
+/****************************************************************************
+ * Name: cloud_apply_endpoint
+ *
+ * Description:
+ *   Write one resolved endpoint into module state.  host may be NULL or
+ *   empty, which leaves the module unconfigured.  base_path may be NULL or
+ *   empty, meaning the interface is at the document root.
+ *
+ *   Returns true when anything actually changed, so a reload can report "no
+ *   change" instead of claiming a swap that did not happen.
+ *
+ ****************************************************************************/
+
+static bool cloud_apply_endpoint(const char *host, uint16_t port,
+                                 const char *base_path, bool tls,
+                                 enum vs_cloud_origin_e origin)
+{
+  char next_host[CLOUD_HOST_MAX];
+  char next_path[CLOUD_BASE_PATH_MAX];
+  char next_port[CLOUD_PORT_MAX];
+  bool changed;
+
+  snprintf(next_host, sizeof(next_host), "%s", host != NULL ? host : "");
+  snprintf(next_path, sizeof(next_path), "%s",
+           base_path != NULL ? base_path : "");
+  snprintf(next_port, sizeof(next_port), "%u", (unsigned int)port);
+
+  changed = strcmp(next_host, g_cloud.host) != 0 ||
+            strcmp(next_path, g_cloud.base_path) != 0 ||
+            strcmp(next_port, g_cloud.port) != 0 ||
+            tls != g_cloud.tls;
+
+  memcpy(g_cloud.host, next_host, sizeof(g_cloud.host));
+  memcpy(g_cloud.base_path, next_path, sizeof(g_cloud.base_path));
+  memcpy(g_cloud.port, next_port, sizeof(g_cloud.port));
+  g_cloud.port_value = port;
+  g_cloud.tls        = tls;
+  g_cloud.configured = g_cloud.host[0] != '\0';
+  g_cloud.origin     = g_cloud.configured ? origin : VS_CLOUD_ORIGIN_NONE;
+  return changed;
+}
+
+/****************************************************************************
+ * Name: cloud_resolve_endpoint
+ *
+ * Description:
+ *   Decide which endpoint to use and install it.
+ *
+ *   The provisioning record wins field by field rather than as a whole.  A
+ *   user who fills in only the host on the setup page means "that host, with
+ *   the usual port and prefix", and requiring all three together would make
+ *   the common case -- pointing a board at a local mock on the documented
+ *   prefix -- impossible to express.
+ *
+ *   The origin reported is PROVISIONED when any of the three came from the
+ *   record.  That is the honest answer for a log line whose job is to say
+ *   whether the stored record had any say in the address being used.
+ *
+ * Returned Value:
+ *   true when the live endpoint changed.
+ *
+ ****************************************************************************/
+
+static bool cloud_resolve_endpoint(void)
+{
+  struct velasight_prov_credentials_s *cred;
+  const char *host = VELASIGHT_PROV_CLOUD_HOST_DEFAULT;
+  const char *path = VELASIGHT_PROV_CLOUD_PATH_DEFAULT;
+  uint16_t port    = VELASIGHT_PROV_CLOUD_PORT_DEFAULT;
+  enum vs_cloud_origin_e origin = VS_CLOUD_ORIGIN_DEFAULT;
+  bool changed;
+  bool tls;
+  int ret;
+
+  /* Heap rather than a 976-byte local.  This runs on the network worker
+   * pthread (CONFIG_PTHREAD_STACK_DEFAULT, 4 KiB) via vs_network_open(); see
+   * vp_store.c's vp_record_decode() for the incident that made this struct's
+   * stack footprint worth caring about on every thread that touches it.
+   *
+   * host/path below may end up pointing into *cred, so cred stays alive
+   * until after cloud_apply_endpoint() has copied them out.
+   */
+
+  cred = malloc(sizeof(*cred));
+  if (cred == NULL)
+    {
+      return cloud_apply_endpoint(host, port, path, false, origin);
+    }
+
+  /* Kconfig still decides the scheme.  It is not in the record because it is
+   * not a field a user can get right from a phone: turning TLS on against a
+   * cloud that only speaks cleartext fails in the handshake, with nothing on
+   * the page to explain it, and this board has no CA bundle to make the
+   * encrypted case actually authenticated.  See CONFIG_VS_SOCIAL_CLOUD_TLS.
+   */
+
+#ifdef CONFIG_VS_SOCIAL_CLOUD_TLS
+  tls = true;
+#else
+  tls = false;
+#endif
+
+  /* A Kconfig host, when set, overrides the shared factory default.  This is
+   * what makes a build aimed at a local mock work without provisioning: the
+   * option existed before the record did, and a build that sets it is asking
+   * for that endpoint deliberately.
+   */
+
+  if (CONFIG_VS_SOCIAL_CLOUD_HOST[0] != '\0')
+    {
+      host = CONFIG_VS_SOCIAL_CLOUD_HOST;
+      port = (uint16_t)CONFIG_VS_SOCIAL_CLOUD_PORT;
+    }
+
+  ret = velasight_provisioning_load(cred);
+  if (ret == 0)
+    {
+      if (cred->cloud_host[0] != '\0')
+        {
+          host   = cred->cloud_host;
+          origin = VS_CLOUD_ORIGIN_PROVISIONED;
+        }
+
+      if (cred->cloud_port != 0)
+        {
+          port   = cred->cloud_port;
+          origin = VS_CLOUD_ORIGIN_PROVISIONED;
+        }
+
+      /* An empty stored prefix cannot be told from "not set" here, and the
+       * two want opposite things: a device deliberately talking to a server
+       * that hosts the interface at its root needs the empty value to win.
+       *
+       * Resolved in favour of the record whenever the record supplied any
+       * endpoint field at all.  A user who typed a host and cleared the
+       * prefix box asked for exactly that combination; a record that carries
+       * no endpoint at all falls through to the default prefix.
+       */
+
+      if (origin == VS_CLOUD_ORIGIN_PROVISIONED ||
+          cred->cloud_path[0] != '\0')
+        {
+          path = cred->cloud_path;
+          origin = VS_CLOUD_ORIGIN_PROVISIONED;
+        }
+    }
+  else if (ret != -ENOENT)
+    {
+      /* A corrupt record is not a reason to refuse to run: the default
+       * endpoint is a working address.  It is a reason to say so, because the
+       * device is now using a different host than the page would show.
+       */
+
+      printf("%s: provisioning record unreadable (%d), using default "
+             "endpoint\n", CLOUD_TAG, ret);
+    }
+
+  changed = cloud_apply_endpoint(host, port, path, tls, origin);
+  free(cred);
+  return changed;
+}
+
+static const char *cloud_origin_text(void)
+{
+  switch (g_cloud.origin)
+    {
+      case VS_CLOUD_ORIGIN_PROVISIONED:
+        return "provisioned";
+      case VS_CLOUD_ORIGIN_DEFAULT:
+        return "default";
+      default:
+        return "unset";
+    }
+}
+
 int vs_cloud_init(void)
 {
   if (g_cloud.initialized)
@@ -1827,23 +2068,46 @@ int vs_cloud_init(void)
   memset(&g_cloud, 0, sizeof(g_cloud));
   g_cloud.initialized = true;
 
-  /* Endpoint.  An empty host is a deliberate state, not a mistake: it means
-   * nothing has been provisioned and the six operations must fail without
-   * touching the network.
+  /* Deliberately no vp_store read here.  This runs on vs_app_run()'s startup
+   * path, which the SD-NAND rule (docs/SD-NAND使用说明.md) forbids for
+   * exactly the reason a real board demonstrated: the AP's IPC heartbeat
+   * thread has a fixed 3 s budget from the CP side, that path already spends
+   * most of it on bk7258_nand_seed_agent_config() and vs_history_open(), and
+   * one more synchronous VFAT read -- 1-bit PIO, single-block, "near-second"
+   * per the same doc -- was enough to push the total past the deadline.  The
+   * CP's mb_ipc_task then asserts and the board reboots in a tight loop, the
+   * heartbeat thread never having had a chance to run.
+   *
+   * The compiled-in default is applied here instead, which touches nothing
+   * but memory.  The provisioned endpoint, if any, is picked up by
+   * vs_cloud_reload_endpoint() the first time the network worker thread runs
+   * -- off the startup path, same as every other SD-NAND-backed config this
+   * module's neighbours load (vs_config_load_wifi(), vs_voice's credential
+   * seed).
    */
 
-  snprintf(g_cloud.host, sizeof(g_cloud.host), "%s",
-           CONFIG_VS_SOCIAL_CLOUD_HOST);
-  snprintf(g_cloud.port, sizeof(g_cloud.port), "%d",
-           CONFIG_VS_SOCIAL_CLOUD_PORT);
-
+  cloud_apply_endpoint(VELASIGHT_PROV_CLOUD_HOST_DEFAULT,
+                       VELASIGHT_PROV_CLOUD_PORT_DEFAULT,
+                       VELASIGHT_PROV_CLOUD_PATH_DEFAULT,
 #ifdef CONFIG_VS_SOCIAL_CLOUD_TLS
-  g_cloud.tls = true;
+                       true,
 #else
-  g_cloud.tls = false;
+                       false,
 #endif
+                       VS_CLOUD_ORIGIN_DEFAULT);
 
-  g_cloud.configured = g_cloud.host[0] != '\0';
+  if (CONFIG_VS_SOCIAL_CLOUD_HOST[0] != '\0')
+    {
+      cloud_apply_endpoint(CONFIG_VS_SOCIAL_CLOUD_HOST,
+                           (uint16_t)CONFIG_VS_SOCIAL_CLOUD_PORT,
+                           VELASIGHT_PROV_CLOUD_PATH_DEFAULT,
+#ifdef CONFIG_VS_SOCIAL_CLOUD_TLS
+                           true,
+#else
+                           false,
+#endif
+                           VS_CLOUD_ORIGIN_DEFAULT);
+    }
 
   /* Device identifier.  The MAC is the only value available that is both
    * unique and stable without storage.
@@ -1858,10 +2122,75 @@ int vs_cloud_init(void)
       return -ENODATA;
     }
 
-  printf("%s: endpoint %s://%s:%s device %s\n", CLOUD_TAG,
-         g_cloud.tls ? "https" : "http", g_cloud.host, g_cloud.port,
-         g_cloud.device_id);
+  printf("%s: endpoint %s://%s:%s%s (%s, provisioning read deferred) "
+         "device %s\n", CLOUD_TAG, g_cloud.tls ? "https" : "http",
+         g_cloud.host, g_cloud.port, g_cloud.base_path,
+         cloud_origin_text(), g_cloud.device_id);
   return 0;
+}
+
+int vs_cloud_reload_endpoint(void)
+{
+  bool changed;
+
+  if (!g_cloud.initialized)
+    {
+      return vs_cloud_init();
+    }
+
+  if (g_cloud.session_live)
+    {
+      /* Deferred rather than dropped.  The identifiers of a live session only
+       * exist on the host that issued them, so moving the endpoint now would
+       * make the poll loop ask a stranger about msgIds it never saw and read
+       * the resulting failures as the session going wrong.
+       */
+
+      g_cloud.reload_pending = true;
+      printf("%s: endpoint reload deferred, a session is open\n", CLOUD_TAG);
+      return -EBUSY;
+    }
+
+  changed = cloud_resolve_endpoint();
+  g_cloud.reload_pending = false;
+
+  if (changed)
+    {
+      printf("%s: endpoint now %s://%s:%s%s (%s)\n", CLOUD_TAG,
+             g_cloud.tls ? "https" : "http", g_cloud.host, g_cloud.port,
+             g_cloud.base_path, cloud_origin_text());
+    }
+
+  return changed ? 1 : 0;
+}
+
+enum vs_cloud_origin_e vs_cloud_origin(void)
+{
+  return g_cloud.origin;
+}
+
+void vs_cloud_endpoint(const char **host, uint16_t *port,
+                       const char **base_path, bool *tls)
+{
+  if (host != NULL)
+    {
+      *host = g_cloud.host;
+    }
+
+  if (port != NULL)
+    {
+      *port = g_cloud.port_value;
+    }
+
+  if (base_path != NULL)
+    {
+      *base_path = g_cloud.base_path;
+    }
+
+  if (tls != NULL)
+    {
+      *tls = g_cloud.tls;
+    }
 }
 
 bool vs_cloud_configured(void)
@@ -1930,6 +2259,28 @@ int vs_cloud_social_open(struct vs_cloud_session_s *session)
   if (session == NULL)
     {
       return -EINVAL;
+    }
+
+  /* A reload that arrived during the previous session is applied here, before
+   * anything is sent.  This is the first moment it is safe: the old session's
+   * identifiers are no longer going to be asked about, and the new session's
+   * do not exist yet.
+   *
+   * Deliberately before the configured check below, because the reload is
+   * what may make an unconfigured module configured.
+   */
+
+  if (g_cloud.reload_pending)
+    {
+      g_cloud.session_live   = false;
+      g_cloud.reload_pending = false;
+
+      if (cloud_resolve_endpoint())
+        {
+          printf("%s: endpoint now %s://%s:%s%s (%s)\n", CLOUD_TAG,
+                 g_cloud.tls ? "https" : "http", g_cloud.host, g_cloud.port,
+                 g_cloud.base_path, cloud_origin_text());
+        }
     }
 
   if (!g_cloud.configured)
@@ -2022,6 +2373,12 @@ int vs_cloud_social_open(struct vs_cloud_session_s *session)
     }
 
   printf("%s: session %s open\n", CLOUD_TAG, session->session_id);
+
+  /* From here the endpoint is pinned until the close reaches a terminal
+   * answer.  See cloud_state_s::session_live.
+   */
+
+  g_cloud.session_live = true;
   ret = 0;
 
 out:
@@ -3046,6 +3403,21 @@ out:
       cJSON_free(printed);
     }
 
+  /* Anything but -EAGAIN is the close having reached a terminal answer, so the
+   * endpoint is free to move again.  -EAGAIN keeps it pinned: the caller is
+   * going to poll this same msgId, which only exists on the current host.
+   *
+   * A session abandoned without ever polling to a terminal answer leaves this
+   * set.  That is survivable rather than a leak: vs_cloud_reload_endpoint()
+   * then defers to the next vs_cloud_social_open(), which clears it and
+   * applies the pending endpoint before sending anything.
+   */
+
+  if (ret != -EAGAIN)
+    {
+      g_cloud.session_live = false;
+    }
+
   cJSON_Delete(root);
   cloud_free(resp, from_psram);
   return ret;
@@ -3223,8 +3595,15 @@ int vs_cloud_probe(void)
 
   if (vs_cloud_init() < 0)
     {
-      printf("%s: probe needs CONFIG_VS_SOCIAL_CLOUD_HOST to be set\n",
-             CLOUD_TAG);
+      /* Reaching here takes an empty host in the provisioning record, an
+       * empty CONFIG_VS_SOCIAL_CLOUD_HOST and an empty
+       * CONFIG_VELASIGHT_PROVISION_CLOUD_HOST, so naming only the middle one
+       * would send someone to the wrong file two times out of three.
+       */
+
+      printf("%s: probe needs an endpoint -- set one on the setup page, or "
+             "CONFIG_VS_SOCIAL_CLOUD_HOST, or "
+             "CONFIG_VELASIGHT_PROVISION_CLOUD_HOST\n", CLOUD_TAG);
       return -ENODATA;
     }
 
@@ -3242,8 +3621,9 @@ int vs_cloud_probe(void)
 
   memset(&session, 0, sizeof(session));
 
-  printf("%s: probe starting against %s://%s:%s\n", CLOUD_TAG,
-         g_cloud.tls ? "https" : "http", g_cloud.host, g_cloud.port);
+  printf("%s: probe starting against %s://%s:%s%s/contest/v1 (%s)\n",
+         CLOUD_TAG, g_cloud.tls ? "https" : "http", g_cloud.host,
+         g_cloud.port, g_cloud.base_path, cloud_origin_text());
 
   ret = vs_cloud_social_open(&session);
   if (ret < 0)

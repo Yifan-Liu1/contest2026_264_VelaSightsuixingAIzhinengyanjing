@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -97,7 +98,7 @@ static void escape_json_string(const char *in, char *out, size_t outlen)
 
 void bk7258_nand_seed_agent_config(void)
 {
-  struct velasight_prov_credentials_s credentials;
+  struct velasight_prov_credentials_s *credentials;
   char host[128];
   char model[64];
   char volc_appid[VELASIGHT_PROV_VOLC_APPID_MAX * 2 + 1];
@@ -106,26 +107,52 @@ void bk7258_nand_seed_agent_config(void)
   bool have_volc;
   FILE *f;
 
-  if (velasight_provisioning_load(&credentials) < 0)
+  /* credentials is heap rather than a local: at 976 bytes it was most of
+   * this function's stack frame, and this function runs on the LPWORK
+   * thread (queued from bk7258_mmcsd_worker() once SD-NAND finishes
+   * mounting) whose stack is CONFIG_SCHED_LPWORKSTACKSIZE -- 4 KiB by
+   * default, sized before this struct grew to hold the social cloud
+   * endpoint fields.  The frame here plus velasight_provisioning_load()'s
+   * own 976-byte local (see vp_store.c) came within a few bytes of that
+   * whole budget; on a real board it overran it, corrupting whatever the
+   * heap placed next on that stack.  What that turned out to be was the
+   * AP-side IPC heartbeat state, so the failure was a boot loop with an
+   * assertion in an unrelated mailbox thread, not anything that named this
+   * function.  Moving the struct here is most of the fix; the other half
+   * is vp_store.c's own locals, and CONFIG_SCHED_LPWORKSTACKSIZE is raised
+   * as a second, independent margin.
+   */
+
+  credentials = malloc(sizeof(*credentials));
+  if (credentials == NULL)
     {
       return;
     }
 
-  have_mimo = credentials.api_key[0] != '\0';
-  have_volc = credentials.volc_appid[0] != '\0' &&
-              credentials.volc_token[0] != '\0';
+  if (velasight_provisioning_load(credentials) < 0)
+    {
+      free(credentials);
+      return;
+    }
+
+  have_mimo = credentials->api_key[0] != '\0';
+  have_volc = credentials->volc_appid[0] != '\0' &&
+              credentials->volc_token[0] != '\0';
 
   if (!have_mimo && !have_volc)
     {
+      free(credentials);
       return;
     }
 
   snprintf(host, sizeof(host), "%s",
-           strncmp(credentials.api_key, "tp-", 3) == 0 ?
+           strncmp(credentials->api_key, "tp-", 3) == 0 ?
            "token-plan-cn.xiaomimimo.com" : "api.xiaomimimo.com");
   snprintf(model, sizeof(model), "%s", AGENT_DEFAULT_MODEL);
-  escape_json_string(credentials.volc_appid, volc_appid, sizeof(volc_appid));
-  escape_json_string(credentials.volc_token, volc_token, sizeof(volc_token));
+  escape_json_string(credentials->volc_appid, volc_appid,
+                     sizeof(volc_appid));
+  escape_json_string(credentials->volc_token, volc_token,
+                     sizeof(volc_token));
 
   /* mkdir the tree.  The agent does this itself as well, but it does it when
    * it starts, which is after this runs.
@@ -141,6 +168,7 @@ void bk7258_nand_seed_agent_config(void)
        * the nsh configuration.  Not worth a line on every boot.
        */
 
+      free(credentials);
       return;
     }
 
@@ -167,7 +195,7 @@ void bk7258_nand_seed_agent_config(void)
               "\\\"priority\\\":0,"
               "\\\"cost_tier\\\":1}\"%s",
               host, AGENT_DEFAULT_PATH, AGENT_DEFAULT_PORT,
-              credentials.api_key, model, have_volc ? "," : "");
+              credentials->api_key, model, have_volc ? "," : "");
     }
 
   if (have_volc)
@@ -184,14 +212,31 @@ void bk7258_nand_seed_agent_config(void)
   printf("nand: ai_agent configured from %s (mimo host=%s model=%s key "
          "%zu bytes, volc app_id %zu bytes token %zu bytes)\n",
          CONFIG_VELASIGHT_PROVISION_STORE, have_mimo ? host : "(none)",
-         have_mimo ? model : "(none)", strlen(credentials.api_key),
-         strlen(credentials.volc_appid), strlen(credentials.volc_token));
+         have_mimo ? model : "(none)", strlen(credentials->api_key),
+         strlen(credentials->volc_appid), strlen(credentials->volc_token));
+
+  free(credentials);
 }
 
 bool bk7258_ai_config_ready(void)
 {
-  struct velasight_prov_credentials_s credentials;
+  struct velasight_prov_credentials_s *credentials;
+  bool ready;
 
-  return velasight_provisioning_load(&credentials) == 0 &&
-         credentials.api_key[0] != '\0';
+  /* Heap for the same reason as bk7258_nand_seed_agent_config() above: this
+   * struct is 976 bytes, and this function is called from vs_app.c's UI
+   * thread on every network status change as well as once at boot, so its
+   * stack footprint matters on more than one thread's budget.
+   */
+
+  credentials = malloc(sizeof(*credentials));
+  if (credentials == NULL)
+    {
+      return false;
+    }
+
+  ready = velasight_provisioning_load(credentials) == 0 &&
+          credentials->api_key[0] != '\0';
+  free(credentials);
+  return ready;
 }

@@ -42,7 +42,10 @@ enum vp_form_field_e
   VP_FORM_FIELD_PASSWORD,
   VP_FORM_FIELD_API_KEY,
   VP_FORM_FIELD_VOLC_APPID,
-  VP_FORM_FIELD_VOLC_TOKEN
+  VP_FORM_FIELD_VOLC_TOKEN,
+  VP_FORM_FIELD_CLOUD_HOST,
+  VP_FORM_FIELD_CLOUD_PORT,
+  VP_FORM_FIELD_CLOUD_PATH
 };
 
 /* What one submit actually changed, for the confirmation page.  Only field
@@ -54,6 +57,9 @@ enum vp_form_field_e
 #define VP_FORM_CHANGED_API_KEY    (1u << 2)
 #define VP_FORM_CHANGED_VOLC_APPID (1u << 3)
 #define VP_FORM_CHANGED_VOLC_TOKEN (1u << 4)
+#define VP_FORM_CHANGED_CLOUD_HOST (1u << 5)
+#define VP_FORM_CHANGED_CLOUD_PORT (1u << 6)
+#define VP_FORM_CHANGED_CLOUD_PATH (1u << 7)
 
 /* The decoded submit plus which fields were present in it.
  *
@@ -70,6 +76,21 @@ struct vp_form_submit_s
   bool have_api_key;
   bool have_volc_appid;
   bool have_volc_token;
+  /* The three endpoint fields behave like the SSID rather than like the
+   * keys: the form pre-fills them, so an empty box is a deliberate clear.
+   * Clearing them means "go back to the compiled-in default", which is the
+   * only way to undo a custom endpoint from the phone.  A field absent from
+   * the body entirely still carries the stored value over, so a client
+   * posting an older form cannot silently reset the endpoint.
+   *
+   * They are addresses, not secrets, which is what makes pre-filling them
+   * acceptable when pre-filling a passphrase would not be.
+   */
+
+  bool have_cloud_host;
+  bool have_cloud_port;
+  bool have_cloud_path;
+
   bool open_requested;   /* the "this Wi-Fi has no password" box was ticked */
 };
 

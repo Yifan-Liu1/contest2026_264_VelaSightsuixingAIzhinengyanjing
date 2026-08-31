@@ -187,6 +187,18 @@ CONFIG_RAW_BINARY=y
 CONFIG_RR_INTERVAL=200
 CONFIG_SCHED_HPWORK=y
 CONFIG_SCHED_LPWORK=y
+# Default is 4096.  bk7258_mmcsd_worker() tail-calls
+# bk7258_nand_seed_agent_config() on this thread once SD-NAND finishes
+# mounting, and that call chain (velasight_provisioning_load() ->
+# vp_store_load() -> vp_record_decode()) came within bytes of the default
+# budget on real hardware once the social cloud endpoint fields grew
+# struct velasight_prov_credentials_s from 812 to 976 bytes -- overrunning
+# it corrupted unrelated heap state (observed as the AP-side IPC heartbeat
+# asserting, a boot loop with no diagnostic pointing back here).  The
+# structs on this path have since moved off the stack (see vp_store.c and
+# bk7258_agent_config.c), which is the primary fix; this is the second,
+# independent margin, not a replacement for that fix.
+CONFIG_SCHED_LPWORKSTACKSIZE=8192
 CONFIG_SCHED_WAITPID=y
 CONFIG_SERIAL_IFLOWCONTROL=y
 CONFIG_SERIAL_IFLOWCONTROL_LOWER_WATERMARK=25

@@ -13,6 +13,7 @@
 #   make store    the record format and the atomic replacement
 #   make http     the request surface, escaping and the pages
 #   make server   the listener over loopback, end to end
+#   make endpoint the social cloud endpoint precedence table
 #   make clean
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -29,7 +30,7 @@ LDFLAGS += -fsanitize=address,undefined -pthread
 HDRS    := ../vp_form.h ../vp_store.h ../vp_http.h \
            ../include/velasight_provisioning.h
 
-.PHONY: all run form store http server clean
+.PHONY: all run form store http server endpoint clean
 
 all: run
 
@@ -47,6 +48,9 @@ test_vp_server: test_vp_server.c ../vp_server.c ../vp_http.c ../vp_form.c \
 	../vp_store.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ test_vp_server.c ../vp_server.c ../vp_http.c \
 	      ../vp_form.c ../vp_store.c $(LDFLAGS)
+test_vp_endpoint: test_vp_endpoint.c ../vp_store.c ../vp_form.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ test_vp_endpoint.c ../vp_store.c ../vp_form.c \
+	      $(LDFLAGS)
 
 form: test_vp_form
 	./test_vp_form
@@ -60,8 +64,12 @@ http: test_vp_http
 server: test_vp_server
 	./test_vp_server
 
-run: form store http server
+endpoint: test_vp_endpoint
+	./test_vp_endpoint
+
+run: form store http server endpoint
 
 clean:
-	rm -f test_vp_form test_vp_store test_vp_http test_vp_server
+	rm -f test_vp_form test_vp_store test_vp_http test_vp_server \
+	      test_vp_endpoint
 	rm -rf *.dSYM

@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -24,8 +25,11 @@
 #define VP_OFF_API        109
 #define VP_OFF_VOLC_APPID 621
 #define VP_OFF_VOLC_TOKEN 685
-#define VP_OFF_RESERVED   813
-#define VP_OFF_CRC        814
+#define VP_OFF_CLOUD_HOST 813
+#define VP_OFF_CLOUD_PATH 909
+#define VP_OFF_CLOUD_PORT 973
+#define VP_OFF_RESERVED   975
+#define VP_OFF_CRC        976
 
 #define VP_STORE_PATH_MAX 192
 
@@ -98,6 +102,8 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
   size_t api_len;
   size_t volc_appid_len;
   size_t volc_token_len;
+  size_t cloud_host_len;
+  size_t cloud_path_len;
   int ret;
 
   if (buf == NULL || cred == NULL)
@@ -121,6 +127,8 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
   api_len        = vp_len(cred->api_key, sizeof(cred->api_key));
   volc_appid_len = vp_len(cred->volc_appid, sizeof(cred->volc_appid));
   volc_token_len = vp_len(cred->volc_token, sizeof(cred->volc_token));
+  cloud_host_len = vp_len(cred->cloud_host, sizeof(cred->cloud_host));
+  cloud_path_len = vp_len(cred->cloud_path, sizeof(cred->cloud_path));
 
   memset(buf, 0, VP_RECORD_SIZE);
   memcpy(buf + VP_OFF_MAGIC, VP_RECORD_MAGIC, 4);
@@ -135,6 +143,9 @@ int vp_record_encode(uint8_t *buf, size_t buflen,
   memcpy(buf + VP_OFF_API, cred->api_key, api_len);
   memcpy(buf + VP_OFF_VOLC_APPID, cred->volc_appid, volc_appid_len);
   memcpy(buf + VP_OFF_VOLC_TOKEN, cred->volc_token, volc_token_len);
+  memcpy(buf + VP_OFF_CLOUD_HOST, cred->cloud_host, cloud_host_len);
+  memcpy(buf + VP_OFF_CLOUD_PATH, cred->cloud_path, cloud_path_len);
+  vp_put16(buf + VP_OFF_CLOUD_PORT, cred->cloud_port);
   vp_put32(buf + VP_OFF_CRC, vp_crc32(buf, VP_RECORD_SIZE - 4));
   return VP_RECORD_SIZE;
 }
@@ -158,13 +169,16 @@ static bool vp_padding_is_zero(const uint8_t *buf, size_t offset,
 int vp_record_decode(const uint8_t *buf, size_t len,
                      struct velasight_prov_credentials_s *cred)
 {
-  struct velasight_prov_credentials_s parsed;
+  struct velasight_prov_credentials_s *parsed;
   size_t ssid_len;
   size_t psk_len;
   size_t api_len;
   size_t volc_appid_len;
   size_t volc_token_len;
+  size_t cloud_host_len;
+  size_t cloud_path_len;
   uint16_t flags;
+  int ret;
 
   if (buf == NULL || cred == NULL)
     {
@@ -201,6 +215,10 @@ int vp_record_decode(const uint8_t *buf, size_t len,
                           VELASIGHT_PROV_VOLC_APPID_MAX);
   volc_token_len = vp_len((const char *)(buf + VP_OFF_VOLC_TOKEN),
                           VELASIGHT_PROV_VOLC_TOKEN_MAX);
+  cloud_host_len = vp_len((const char *)(buf + VP_OFF_CLOUD_HOST),
+                          VELASIGHT_PROV_CLOUD_HOST_MAX);
+  cloud_path_len = vp_len((const char *)(buf + VP_OFF_CLOUD_PATH),
+                          VELASIGHT_PROV_CLOUD_PATH_MAX);
 
   if ((flags & ~(uint16_t)VP_RECORD_FLAG_OPEN) != 0)
     {
@@ -252,27 +270,66 @@ int vp_record_decode(const uint8_t *buf, size_t len,
       return -EBADMSG;
     }
 
-  memset(&parsed, 0, sizeof(parsed));
-  memcpy(parsed.ssid, buf + VP_OFF_SSID, ssid_len);
-  memcpy(parsed.password, buf + VP_OFF_PSK, psk_len);
-  memcpy(parsed.api_key, buf + VP_OFF_API, api_len);
-  memcpy(parsed.volc_appid, buf + VP_OFF_VOLC_APPID, volc_appid_len);
-  memcpy(parsed.volc_token, buf + VP_OFF_VOLC_TOKEN, volc_token_len);
-  parsed.generation   = vp_get32(buf + VP_OFF_GEN);
-  parsed.open_network = psk_len == 0;
+  if (cloud_host_len > VELASIGHT_PROV_CLOUD_HOST_MAX ||
+      !vp_padding_is_zero(buf, VP_OFF_CLOUD_HOST, cloud_host_len,
+                          VELASIGHT_PROV_CLOUD_HOST_MAX))
+    {
+      return -EBADMSG;
+    }
+
+  if (cloud_path_len > VELASIGHT_PROV_CLOUD_PATH_MAX ||
+      !vp_padding_is_zero(buf, VP_OFF_CLOUD_PATH, cloud_path_len,
+                          VELASIGHT_PROV_CLOUD_PATH_MAX))
+    {
+      return -EBADMSG;
+    }
+
+  /* Heap rather than a local: this struct is 976 bytes, and this function
+   * runs on threads whose stacks were sized before it existed -- notably
+   * LPWORK's, whose default 4 KiB this file plus the callers on top of it
+   * (bk7258_nand_seed_agent_config() -> velasight_provisioning_load() ->
+   * vp_store_load()) came within bytes of exhausting when the endpoint
+   * fields pushed this struct from 812 to 976.  A silent stack overflow
+   * there corrupts whatever the heap put next to that stack, which on this
+   * board turned into the AP's IPC heartbeat state -- a boot loop with no
+   * assertion pointing back here.  See CONFIG_SCHED_LPWORKSTACKSIZE in
+   * Kconfig, raised as a second, independent margin.
+   *
+   * Allocated here rather than at function entry, so a request this ends up
+   * rejecting before this point costs nothing.
+   */
+
+  parsed = malloc(sizeof(*parsed));
+  if (parsed == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(parsed, 0, sizeof(*parsed));
+  memcpy(parsed->ssid, buf + VP_OFF_SSID, ssid_len);
+  memcpy(parsed->password, buf + VP_OFF_PSK, psk_len);
+  memcpy(parsed->api_key, buf + VP_OFF_API, api_len);
+  memcpy(parsed->volc_appid, buf + VP_OFF_VOLC_APPID, volc_appid_len);
+  memcpy(parsed->volc_token, buf + VP_OFF_VOLC_TOKEN, volc_token_len);
+  memcpy(parsed->cloud_host, buf + VP_OFF_CLOUD_HOST, cloud_host_len);
+  memcpy(parsed->cloud_path, buf + VP_OFF_CLOUD_PATH, cloud_path_len);
+  parsed->cloud_port   = vp_get16(buf + VP_OFF_CLOUD_PORT);
+  parsed->generation   = vp_get32(buf + VP_OFF_GEN);
+  parsed->open_network = psk_len == 0;
 
   /* The record can be structurally perfect and still describe credentials the
    * running code would refuse, for instance after a limit changes.  Treat that
    * as corrupt rather than handing the caller something it cannot use.
    */
 
-  if (vp_credentials_validate(&parsed) < 0)
+  ret = vp_credentials_validate(parsed) < 0 ? -EBADMSG : 0;
+  if (ret == 0)
     {
-      return -EBADMSG;
+      *cred = *parsed;
     }
 
-  *cred = parsed;
-  return 0;
+  free(parsed);
+  return ret;
 }
 
 static int vp_make_parent(const char *path)
@@ -331,9 +388,9 @@ int vp_store_temp_path(const char *path, char *buf, size_t buflen)
 int vp_store_save(const char *path,
                   const struct velasight_prov_credentials_s *cred)
 {
-  uint8_t record[VP_RECORD_SIZE];
+  uint8_t *record;
   char tmp[VP_STORE_PATH_MAX + 16];
-  FILE *stream;
+  FILE *stream = NULL;
   int ret;
 
   if (path == NULL || cred == NULL)
@@ -346,28 +403,42 @@ int vp_store_save(const char *path,
       return -ENAMETOOLONG;
     }
 
-  ret = vp_record_encode(record, sizeof(record), cred);
+  /* Heap for the same reason as vp_store_load()'s record and
+   * vp_record_decode()'s parsed: this is VP_RECORD_SIZE (980) bytes, and
+   * this call is reachable from the provisioning listener thread's own
+   * stack budget, not just the ones that provoked the incident this
+   * mirrors.  Consistency here is cheap; a save is not a hot path.
+   */
+
+  record = malloc(VP_RECORD_SIZE);
+  if (record == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  ret = vp_record_encode(record, VP_RECORD_SIZE, cred);
   if (ret < 0)
     {
-      return ret;
+      goto errout;
     }
 
   ret = vp_make_parent(path);
   if (ret < 0)
     {
-      return ret;
+      goto errout;
     }
 
   ret = vp_store_temp_path(path, tmp, sizeof(tmp));
   if (ret < 0)
     {
-      return ret;
+      goto errout;
     }
 
   stream = fopen(tmp, "wb");
   if (stream == NULL)
     {
-      return -errno;
+      ret = -errno;
+      goto errout;
     }
 
   /* Write, flush, fsync, close, rename.  Without the fsync the rename can be
@@ -376,20 +447,20 @@ int vp_store_save(const char *path,
    * reason the next boot can explain.
    */
 
-  if (fwrite(record, 1, sizeof(record), stream) != sizeof(record) ||
+  if (fwrite(record, 1, VP_RECORD_SIZE, stream) != (size_t)VP_RECORD_SIZE ||
       fflush(stream) != 0 || fsync(fileno(stream)) != 0)
     {
       ret = errno != 0 ? -errno : -EIO;
       fclose(stream);
       unlink(tmp);
-      return ret;
+      goto errout;
     }
 
   if (fclose(stream) != 0)
     {
       ret = errno != 0 ? -errno : -EIO;
       unlink(tmp);
-      return ret;
+      goto errout;
     }
 
   if (rename(tmp, path) < 0)
@@ -400,25 +471,43 @@ int vp_store_save(const char *path,
        * copy left after an interrupted replacement.  load() recovers it when
        * the final path is absent.
        */
-      return ret;
+      goto errout;
     }
 
   sync();
-  return 0;
+  ret = 0;
+
+errout:
+  free(record);
+  return ret;
 }
 
 int vp_store_load(const char *path,
                   struct velasight_prov_credentials_s *cred)
 {
-  uint8_t record[VP_RECORD_SIZE + 1];
+  uint8_t *record;
   char tmp[VP_STORE_PATH_MAX + 16];
   FILE *stream;
   size_t nread;
+  int ret;
   bool recover = false;
 
   if (path == NULL || cred == NULL)
     {
       return -EINVAL;
+    }
+
+  /* Heap rather than a stack array of VP_RECORD_SIZE + 1 (981) bytes, for the
+   * same reason vp_record_decode()'s own local struct moved: this function
+   * is one frame below that one on every call path, on threads (LPWORK in
+   * particular) whose stacks were not sized with either allocation in mind.
+   * See the comment there for the incident this fixes.
+   */
+
+  record = malloc(VP_RECORD_SIZE + 1);
+  if (record == NULL)
+    {
+      return -ENOMEM;
     }
 
   stream = fopen(path, "rb");
@@ -437,42 +526,51 @@ int vp_store_load(const char *path,
         {
           if (vp_store_temp_path(path, tmp, sizeof(tmp)) < 0)
             {
-              return -ENOENT;
+              ret = -ENOENT;
+              goto errout;
             }
 
           stream = fopen(tmp, "rb");
           if (stream == NULL)
             {
-              return errno == ENOENT || errno == ENOTDIR ? -ENOENT : -errno;
+              ret = errno == ENOENT || errno == ENOTDIR ? -ENOENT : -errno;
+              goto errout;
             }
 
           recover = true;
         }
       else
         {
-          return -errno;
+          ret = -errno;
+          goto errout;
         }
     }
 
-  nread = fread(record, 1, sizeof(record), stream);
+  nread = fread(record, 1, VP_RECORD_SIZE + 1, stream);
   fclose(stream);
 
   if (vp_record_decode(record, nread, cred) < 0)
     {
-      return -EBADMSG;
+      ret = -EBADMSG;
+      goto errout;
     }
 
   if (recover)
     {
       if (rename(tmp, path) < 0)
         {
-          return -errno;
+          ret = -errno;
+          goto errout;
         }
 
       sync();
     }
 
-  return 0;
+  ret = 0;
+
+errout:
+  free(record);
+  return ret;
 }
 
 uint32_t vp_store_next_generation(const char *path)

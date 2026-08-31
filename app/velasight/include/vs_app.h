@@ -51,6 +51,24 @@ struct vs_app_event_s
 
 int vs_app_run(void);
 int vs_app_post_event(const struct vs_app_event_s *event);
+
+/****************************************************************************
+ * Name: vs_app_take_event
+ *
+ * Description:
+ *   Take one queued event.  Returns 0 with *out filled, or -EAGAIN when the
+ *   queue is empty.
+ *
+ *   vs_app_run() drains the queue itself and does not need this.  It exists
+ *   for the headless subcommands, which drive a worker without a UI: workers
+ *   retry vs_app_post_event() indefinitely when the queue is full, so a
+ *   command that started one and never drained would wedge it on the eighth
+ *   event rather than merely losing the ninth.
+ *
+ ****************************************************************************/
+
+int vs_app_take_event(struct vs_app_event_s *out);
+
 uint32_t vs_app_current_request_id(void);
 int velasight_autostart(void);
 

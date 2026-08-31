@@ -20,6 +20,7 @@
 #include <arch/chip/bk7258_wifi.h>
 
 #include "velasight_provisioning.h"
+#include "include/vs_cloud.h"
 #include "include/vs_config.h"
 #include "include/vs_history.h"
 #include "include/vs_network.h"
@@ -438,6 +439,24 @@ static int vs_network_reload_saved(struct vs_network_s *network)
       return ret;
     }
 
+  /* The social cloud endpoint is in the same record, so a save that moved it
+   * has to reach vs_cloud the way a save that moved a credential reaches
+   * vs_voice.
+   *
+   * -EBUSY is not a failure to propagate.  It means a social session is open
+   * and vs_cloud has deferred the swap to the next session, which is the only
+   * point where changing hosts cannot strand in-flight msgIds.  Returning it
+   * here would leave the generation pending and make this whole reload run
+   * again on the next pass, re-seeding the agent config and the voice
+   * credentials each time for a change that is already recorded.
+   */
+
+  ret = vs_cloud_reload_endpoint();
+  if (ret < 0 && ret != -EBUSY)
+    {
+      return ret;
+    }
+
   pthread_mutex_lock(&network->event_lock);
   network->provision_applied_generation = loaded_generation;
   if (network->provision_pending_generation == loaded_generation)
@@ -780,6 +799,27 @@ int vs_network_open(struct vs_network_s **network)
       pthread_mutex_destroy(&n->event_lock);
       free(n);
       return ret;
+    }
+
+  /* The social cloud endpoint's first read off SD-NAND, deliberately here
+   * rather than in vs_cloud_init() on the startup path.  This function runs
+   * on the network worker thread, the same place vs_config_load_wifi() just
+   * did its own VFAT read -- not on vs_app_run()'s thread, which the
+   * SD-NAND rule (docs/SD-NAND使用说明.md) forbids for reads with
+   * near-second worst cases on this board's 1-bit PIO controller.
+   *
+   * A failure here is not fatal to bring-up: vs_cloud_init() already
+   * installed the compiled-in default, so the module is usable either way.
+   * It is worth one log line because it is the one case where the running
+   * endpoint and whatever the setup page shows can disagree until the next
+   * reload.
+   */
+
+  ret = vs_cloud_reload_endpoint();
+  if (ret < 0 && ret != -EBUSY)
+    {
+      printf("velasight: social cloud endpoint not loaded (%d), keeping "
+             "the factory default\n", ret);
     }
 
   n->mode = VS_NET_STA;

@@ -23,6 +23,35 @@
  * "value" member: an object for session/upload/close, an array of per-message
  * results for getResult.
  *
+ * The paths above are what the interface document writes, and they are not the
+ * whole path on the wire.  A configurable prefix goes in front of all four --
+ * "/hlthopen/public" for the staging deployment, empty for the document's own
+ * 127.0.0.1:18080 examples -- because the deployment does not host the
+ * interface at the root the examples assume, and answers the unprefixed path
+ * with an empty 204.  The prefix is applied in one place, cloud_api_call(), so
+ * the literals here keep the document's spelling.
+ *
+ * Where the endpoint comes from
+ * -----------------------------
+ * Host, port and prefix are resolved once by vs_cloud_init() and re-resolved
+ * by vs_cloud_reload_endpoint() after a successful Web save.  Three sources,
+ * highest priority first:
+ *
+ *   1. the Web provisioning record, field by field
+ *   2. CONFIG_VS_SOCIAL_CLOUD_HOST/PORT, when the host is not empty
+ *   3. CONFIG_VELASIGHT_PROVISION_CLOUD_HOST/_PATH/_PORT, the factory default
+ *
+ * Two consequences worth stating.  A device that has never been provisioned
+ * still has a working address, so "unconfigured" is a build that deliberately
+ * blanked the factory default rather than the normal state of a new board.
+ * And the record is never read on a request path: a session registers an
+ * upload several times a second, and a file read there would put VFAT I/O
+ * between a captured frame and the socket.
+ *
+ * The scheme is not in the record.  It stays a build option because it is not
+ * something a user can get right from a phone -- see
+ * CONFIG_VS_SOCIAL_CLOUD_TLS.
+ *
  * Deltas from VELASIGHT_SOCIAL_MODE_INTEGRATION_PLAN.md V1
  * -------------------------------------------------------
  * That plan was written against an earlier revision of the cloud document and
@@ -114,6 +143,20 @@
 #define VS_CLOUD_SESSION_ID_MAX 24
 #define VS_CLOUD_MSG_ID_MAX     40
 
+/* Where the endpoint comes from, for a log line and for vs_social.c's
+ * "cannot start" message.  Which one is in force is not obvious from the
+ * outside and is the first thing worth knowing when the cloud is unreachable:
+ * a device pointed at a stale provisioned host looks exactly like a device
+ * with a broken network until you can see that the record won.
+ */
+
+enum vs_cloud_origin_e
+{
+  VS_CLOUD_ORIGIN_NONE = 0,    /* nothing usable; every call is -ENODATA */
+  VS_CLOUD_ORIGIN_DEFAULT,     /* the compiled-in factory endpoint */
+  VS_CLOUD_ORIGIN_PROVISIONED  /* the Web provisioning record */
+};
+
 /* Enough for the document's own ttsMinutes shape
  * ("xxx/contest/api/session/20261001/xxx") with room for a real host and a
  * short query.  Presigned upload URLs can be much longer than this, but they
@@ -129,6 +172,18 @@
  */
 
 #define VS_CLOUD_EVENT_EMOTION 0
+
+/* How many identifiers one vs_cloud_social_poll_event() may carry.
+ *
+ * Public because a caller has to size its own arrays from it: the request is
+ * built from msg_count identifiers and the response can hold more entries than
+ * that -- an extreme frame yields both an image result and, later, the advice
+ * derived from it, under the same msgId.  A caller that guessed this number
+ * would either waste stack or get -E2BIG from a layer below the one that
+ * documents the limit.
+ */
+
+#define VS_CLOUD_POLL_MAX_IDS 16
 
 /****************************************************************************
  * Public Types
@@ -369,9 +424,22 @@ struct vs_cloud_minutes_s
  * Name: vs_cloud_init
  *
  * Description:
- *   Resolve this device's identifier and validate the configured endpoint.
- *   Performs no network I/O, so it is safe on the startup path and cheap
- *   before Wi-Fi is up.
+ *   Resolve this device's identifier and the endpoint to use.  Performs no
+ *   network I/O, so it is safe on the startup path and cheap before Wi-Fi is
+ *   up.
+ *
+ *   The endpoint is read from the Web provisioning record, falling back to
+ *   the compiled-in default when the record carries none.  It does not read
+ *   the record on every request: the resolved endpoint is cached in module
+ *   state, and vs_cloud_reload_endpoint() is the only other thing that reads
+ *   SD-NAND.  That is deliberate -- a session registers an upload several
+ *   times a second, and a file read on that path would put VFAT I/O between
+ *   a captured frame and the socket.
+ *
+ *   Reading the record here does mean this call touches SD-NAND once, so it
+ *   belongs after the card is mounted.  It does not wait for the mount
+ *   itself; a call made too early resolves to the default endpoint and logs
+ *   which one it picked, and vs_cloud_reload_endpoint() corrects it later.
  *
  *   The identifier is "bk7258-" plus the wlan0 MAC in lower-case hex, so it
  *   is stable across reboots without needing to be stored.  If the interface
@@ -391,9 +459,13 @@ struct vs_cloud_minutes_s
 
 int vs_cloud_init(void);
 
-/* True when a host is configured and the six operations may be attempted.
- * With no host they all fail with -ENODATA without touching the network,
- * which is what CONFIG_VS_SOCIAL_CLOUD_HOST being empty is supposed to mean.
+/* True when a host is resolved and the six operations may be attempted.
+ * With no host they all fail with -ENODATA without touching the network.
+ *
+ * Normally true, because the factory default is a real address: it takes both
+ * an empty provisioned host and an empty CONFIG_VELASIGHT_PROVISION_CLOUD_HOST
+ * to end up unconfigured, which is a build that deliberately ships without an
+ * endpoint rather than an accident.
  */
 
 bool vs_cloud_configured(void);
@@ -401,6 +473,42 @@ bool vs_cloud_configured(void);
 /* This device's identifier, valid after vs_cloud_init().  Never NULL. */
 
 const char *vs_cloud_device_id(void);
+
+/****************************************************************************
+ * Name: vs_cloud_reload_endpoint
+ *
+ * Description:
+ *   Re-read the endpoint from the provisioning record.  Called from the same
+ *   place vs_voice_reload_credentials() is, after a successful Web save.
+ *
+ *   Refuses to change anything while a session is open, and says so with
+ *   -EBUSY.  Swapping the host under a live session would strand it: the
+ *   in-flight msgIds only exist on the old host, so the poll loop would ask
+ *   the new one about identifiers it never issued and read the answers as
+ *   failures.  The caller does not need to retry -- the next
+ *   vs_cloud_social_open() picks up whatever is stored then.
+ *
+ * Returned Value:
+ *   1 when the endpoint changed, 0 when it is the same as before, -EBUSY
+ *   while a session is open, or a negative errno from the record.
+ *
+ ****************************************************************************/
+
+int vs_cloud_reload_endpoint(void);
+
+/* Which source the live endpoint came from.  For logs and for the message
+ * social mode shows when it cannot start.
+ */
+
+enum vs_cloud_origin_e vs_cloud_origin(void);
+
+/* The live endpoint, for a log line or a status page.  host is never NULL but
+ * may be empty when nothing is configured; base_path may be empty, which
+ * means the interface sits at the document root.
+ */
+
+void vs_cloud_endpoint(const char **host, uint16_t *port,
+                       const char **base_path, bool *tls);
 
 /****************************************************************************
  * Name: vs_cloud_new_session_id

@@ -228,8 +228,11 @@ static unsigned int count_occurrences(const char *haystack,
 }
 
 /* A device that has been set up once: a network with a password, a key and
- * both voice fields.  Everything the page may say about it is a boolean, so
- * the record itself never reaches the renderer.
+ * both voice fields.  Every credential the page may say something about is a
+ * boolean, so no secret reaches the renderer.  The endpoint is the deliberate
+ * exception -- an address is not a secret and the page renders it in full --
+ * so it is left empty here, which is what "the factory default applies" looks
+ * like, and set explicitly by the tests that care.
  */
 
 static void configured_state(struct vp_http_state_s *state)
@@ -260,9 +263,14 @@ static void test_pages(void)
    * so a future addition that meaningfully bloats the page -- a stray debug
    * dump, an accidentally duplicated block -- is caught instead of silently
    * growing until it no longer fits the response buffer at all.
+   *
+   * Raised from 3600 with the endpoint boxes.  Worth knowing which way the
+   * cost fell: a device with *nothing* stored is the larger page, not the
+   * smaller one, because the box then spells out the factory default host and
+   * path instead of a short stored value.
    */
 
-  CHECK(len < 3600, "the setup response stays inside its buffer with room");
+  CHECK(len < 4608, "the setup response stays inside its buffer with room");
   CHECK(strncmp(buf, "HTTP/1.1 200 OK\r\n", 17) == 0,
         "the setup page carries a 200 status line");
   CHECK(strstr(buf, "Content-Length: ") != NULL,
@@ -367,7 +375,7 @@ static void test_pages(void)
   CHECK(strstr(buf, "name=\"password\"") != NULL &&
         strstr(buf, "href=\"/\"") == NULL,
         "saving stays on the input form without a return link");
-  CHECK(len < 3600, "the saved response stays inside its buffer with room");
+  CHECK(len < 4608, "the saved response stays inside its buffer with room");
 
   len = vp_http_saved_page(buf, sizeof(buf), &state, 0);
   CHECK(len > 0 && strstr(buf, "这次没有改动任何设置。") != NULL,
@@ -397,13 +405,59 @@ static void test_pages(void)
         strstr(buf, "&lt;script&gt;") != NULL,
         "a network name cannot inject markup into the success page");
 
+  /* The endpoint is the one stored value rendered in full rather than as a
+   * boolean, so both places it appears have to be checked: the
+   * stored-settings box and the input's pre-filled value attribute.  Without
+   * the second one, clearing a custom endpoint from the phone would be
+   * impossible -- an empty box would look the same as an unsubmitted one.
+   */
+
+  configured_state(&state);
+  state.cloud_host = "10.192.225.223";
+  state.cloud_path = "/mock";
+  state.cloud_port = 18080;
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(len > 0 && strstr(buf, "社交云地址：10.192.225.223") != NULL &&
+        strstr(buf, "端口：18080") != NULL &&
+        strstr(buf, "路径前缀：/mock") != NULL,
+        "the stored endpoint is shown in full, not as a boolean");
+  CHECK(strstr(buf, "value=\"10.192.225.223\"") != NULL &&
+        strstr(buf, "value=\"18080\"") != NULL &&
+        strstr(buf, "value=\"/mock\"") != NULL,
+        "the endpoint boxes are pre-filled so clearing them is possible");
+  CHECK(strstr(buf, "name=\"cloud_host\"") != NULL &&
+        strstr(buf, "name=\"cloud_port\"") != NULL &&
+        strstr(buf, "name=\"cloud_path\"") != NULL,
+        "the form carries the three endpoint inputs");
+
+  /* Nothing stored has to read as "the default applies" rather than as a
+   * missing setting, and the placeholder has to name the default the firmware
+   * would actually use -- the page and vs_cloud_init() share one macro for
+   * exactly this reason.
+   */
+
+  configured_state(&state);
+  len = vp_http_setup_page(buf, sizeof(buf), &state, NULL);
+  CHECK(len > 0 &&
+        strstr(buf, "社交云地址：默认 "
+                    VELASIGHT_PROV_CLOUD_HOST_DEFAULT) != NULL &&
+        strstr(buf, "路径前缀：默认 "
+                    VELASIGHT_PROV_CLOUD_PATH_DEFAULT) != NULL,
+        "an unset endpoint is reported as the factory default, named");
+  CHECK(strstr(buf, "placeholder=\"" VELASIGHT_PROV_CLOUD_HOST_DEFAULT "\"")
+        != NULL,
+        "the address box offers the factory default as placeholder text");
+  CHECK(strstr(buf, "value=\"10.192.225.223\"") == NULL,
+        "an unset endpoint leaves the boxes empty rather than pre-filled");
+
   /* The largest page the builders can be asked for.  Every variable part is
    * at its maximum at once: a 32-byte network name made entirely of markup
-   * characters, which sextuples when escaped, the longest problem notice, all
-   * five field names listed as changed, the no-password warning and the
-   * history link.  Getting the buffer wrong makes a builder return zero and
-   * the phone receive an empty response, so the bound is tested rather than
-   * measured once and trusted.
+   * characters, which sextuples when escaped, the longest problem notice,
+   * every field name listed as changed, a full-length endpoint host and path
+   * rendered twice each, the no-password warning and the history link.
+   * Getting the buffer wrong makes a builder return zero and the phone
+   * receive an empty response, so the bound is tested rather than measured
+   * once and trusted.
    */
 
   {
@@ -412,8 +466,22 @@ static void test_pages(void)
     static const char worst_notice[] =
         "Wi-Fi 密码需要 8 到 63 个字符；想保留原来的密码请把这一栏留空；"
         "这个 Wi-Fi 确实没有密码请勾选下面那一项。";
+    char worst_host[VELASIGHT_PROV_CLOUD_HOST_MAX + 1];
+    char worst_path[VELASIGHT_PROV_CLOUD_PATH_MAX + 1];
     size_t worst_setup;
     size_t worst_saved;
+
+    /* Legal at full length: vp_cloud_host_ok() allows only letters, digits,
+     * '-' and '.', so this is the longest host that can actually be stored.
+     * Using markup characters here instead would test a value the validator
+     * rejects, and would size the buffer for a page that cannot exist.
+     */
+
+    memset(worst_host, 'a', sizeof(worst_host) - 1);
+    worst_host[sizeof(worst_host) - 1] = '\0';
+    worst_path[0] = '/';
+    memset(worst_path + 1, 'b', sizeof(worst_path) - 2);
+    worst_path[sizeof(worst_path) - 1] = '\0';
 
     configured_state(&state);
     state.ssid            = worst_ssid;
@@ -421,6 +489,9 @@ static void test_pages(void)
     state.open_network    = true;
     state.generation      = 4294967295u;
     state.history_enabled = true;
+    state.cloud_host      = worst_host;
+    state.cloud_path      = worst_path;
+    state.cloud_port      = 65535;
 
     worst_setup = vp_http_setup_page(buf, sizeof(buf), &state, worst_notice);
     CHECK(worst_setup > 0 && strstr(buf, "&quot;&#39;&lt;&amp;&gt;") != NULL,

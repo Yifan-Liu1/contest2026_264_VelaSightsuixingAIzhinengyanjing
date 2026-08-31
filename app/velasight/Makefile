@@ -7,8 +7,12 @@ MODULE    = $(CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT)
 
 CSRCS   = vs_app.c vs_display.c vs_input.c vs_config.c vs_network.c \
           vs_voice.c vs_audio.c vs_media.c vs_history.c vs_settings.c \
-          vs_cloud.c \
+          vs_cloud.c vs_social.c \
           velasight_font_16_ui.c
+# The session's Ogg Opus encoder, shared with audio_test rather than copied.
+# See CMakeLists.txt for why.
+CSRCS  += $(APPDIR)/packages/demos/contest2026_264_audio_test/audio_test_ogg.c
+CFLAGS += -I$(APPDIR)/packages/demos/contest2026_264_audio_test
 CFLAGS += -I$(APPDIR)/packages/demos/contest2026_264_provision_web/include
 CFLAGS += -I$(APPDIR)/packages/ai_agent/include
 CFLAGS += -I$(APPDIR)/packages/ai_agent/src

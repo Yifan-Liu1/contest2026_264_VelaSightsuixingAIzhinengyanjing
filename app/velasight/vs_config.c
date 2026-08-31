@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -74,29 +75,74 @@ int vs_config_load_wifi(struct vs_wifi_config_s *config,
    * but successful configuration.
    */
   {
-    struct velasight_prov_credentials_s credentials;
-    int ret = velasight_provisioning_load(&credentials);
+    struct velasight_prov_credentials_s *credentials;
+    int ret;
+
+    /* Heap rather than a 976-byte local.  This function runs on the network
+     * worker pthread (CONFIG_PTHREAD_STACK_DEFAULT, 4 KiB) and on vs_app_run()
+     * itself early in bring-up; see vp_store.c's vp_record_decode() for the
+     * incident that made this struct's stack footprint worth caring about.
+     */
+
+    credentials = malloc(sizeof(*credentials));
+    if (credentials == NULL)
+      {
+        return -ENOMEM;
+      }
+
+    ret = velasight_provisioning_load(credentials);
 
     if (ret == 0)
       {
         snprintf(config->sta_ssid, sizeof(config->sta_ssid), "%s",
-                 credentials.ssid);
+                 credentials->ssid);
         snprintf(config->sta_password, sizeof(config->sta_password), "%s",
-                 credentials.password);
-        config->sta_open_network = credentials.open_network;
+                 credentials->password);
+        config->sta_open_network = credentials->open_network;
         if (generation != NULL)
           {
-            *generation = credentials.generation;
+            *generation = credentials->generation;
           }
       }
-    else if (ret == -ENOENT)
+    else if (ret == -ENOENT || ret == -EBADMSG)
       {
+        /* -ENOENT is "never provisioned"; -EBADMSG is "provisioned, but not
+         * in a shape this build can read" -- the record format has changed
+         * three times now (v2->v3 added the Volcengine fields, v3->v4 added
+         * the social cloud endpoint) and each change is deliberately
+         * breaking: vp_record_decode() refuses rather than guesses at a
+         * layout it does not recognise.  A device that was provisioned
+         * under an older version therefore reads back exactly like one that
+         * was never provisioned at all.
+         *
+         * Both fall back to the Kconfig default rather than failing
+         * vs_config_load_wifi() outright.  The one thing that must not
+         * happen on a version mismatch is what an early return here used to
+         * do: fail before ap_ssid/ap_password/ap_channel below are ever
+         * filled in, which left the AP hotspot with an empty SSID and no
+         * way to reach the setup page to fix it -- the one recovery path a
+         * device in this state actually needs.  A user who sees "connecting
+         * to the same network as before" fail and has to re-enter Wi-Fi
+         * credentials is a solved problem; a device that cannot be
+         * provisioned at all is not.
+         */
+
+        if (ret == -EBADMSG)
+          {
+            printf("velasight: provisioning record unreadable (%d, "
+                   "format mismatch), falling back to Kconfig Wi-Fi "
+                   "defaults\n", ret);
+          }
+
         use_defaults = true;
       }
     else
       {
+        free(credentials);
         return ret;
       }
+
+    free(credentials);
   }
 
   if (use_defaults)

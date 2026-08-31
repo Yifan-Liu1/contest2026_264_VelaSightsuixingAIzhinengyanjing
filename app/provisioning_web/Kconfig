@@ -59,4 +59,50 @@ config VELASIGHT_PROVISION_PORT
 		The port used when the caller passes 0.  80 means a phone can
 		open http://<board-ip>/ with no port in the URL.
 
+comment "Social-session cloud factory default"
+
+config VELASIGHT_PROVISION_CLOUD_HOST
+	string "Default social cloud host"
+	default "staging-hlth.xiaomiwear.com"
+	---help---
+		The endpoint a device with nothing provisioned talks to, and the
+		grey placeholder the setup page shows in the address box.  A
+		hostname or dotted quad, with no scheme, no port and no path --
+		all three of those are separate.
+
+		The default is the deployment named in the cloud interface
+		document.  Note what reaching it requires: the name resolves only
+		on the internal network, so a board using the default also needs
+		a resolver that can see it.  A dotted quad is not a workaround --
+		the deployment routes on the Host header and answers a request
+		carrying a bare address with 403.
+
+		Change this to point a build at a local mock instead.  The stored
+		record overrides it either way, so this is the fallback, not the
+		policy.
+
+config VELASIGHT_PROVISION_CLOUD_PATH
+	string "Default social cloud path prefix"
+	default "/hlthopen/public"
+	---help---
+		What sits in front of /contest/v1 on the default host.  Must
+		start with '/' and must not end with one; empty means the
+		interface is at the document root.
+
+		This is not cosmetic.  The interface document's worked examples
+		are written against 127.0.0.1:18080/contest/v1, while the
+		deployment answers at /hlthopen/public/contest/v1 and returns an
+		empty 204 for the unprefixed path -- which the device would then
+		report as a protocol error, sending whoever reads the log after a
+		JSON parser bug that does not exist.
+
+config VELASIGHT_PROVISION_CLOUD_PORT
+	int "Default social cloud port"
+	default 80
+	range 1 65535
+	---help---
+		The port used when the stored record carries none.  80 matches
+		the cleartext scheme the interface document specifies for the
+		device-facing endpoints.
+
 endif

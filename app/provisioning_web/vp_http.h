@@ -38,13 +38,22 @@
  *
  * The worst case is measured, not estimated: a 32-byte network name of pure
  * markup characters expands sixfold when escaped, and the confirmation page
- * adds a warning plus all five field names on top of that.  The host tests
- * build exactly that page and assert it still fits, because the failure mode
- * of getting this wrong is a builder returning zero and the phone receiving
- * an empty response with nothing to explain it.
+ * adds a warning plus every field name on top of that.  The host tests build
+ * exactly that page and assert it still fits, because the failure mode of
+ * getting this wrong is a builder returning zero and the phone receiving an
+ * empty response with nothing to explain it.
+ *
+ * Raised from 5120 when the three social cloud endpoint boxes arrived.  They
+ * cost more than their own length because each is rendered twice -- once in
+ * the stored-settings box and once as the input's value attribute -- so a
+ * 96-byte host and a 64-byte path add roughly 320 bytes between them, and the
+ * two new labels, placeholders and the note add a fixed few hundred more.
+ * Neither the host nor the path can contain a character HTML escaping
+ * expands: vp_cloud_host_ok() and vp_cloud_path_ok() reject all five, which
+ * is what keeps this a linear cost rather than a sixfold one.
  */
 
-#define VP_HTTP_RESPONSE_MAX 5120
+#define VP_HTTP_RESPONSE_MAX 6144
 
 enum vp_http_action_e
 {
@@ -116,6 +125,22 @@ struct vp_http_state_s
   bool        have_api_key;
   bool        have_volc_appid;
   bool        have_volc_token;
+
+  /* The social cloud endpoint, rendered in full rather than as a boolean.
+   *
+   * That is the one deliberate exception to the rule above, and it is not an
+   * inconsistency: an address is not a secret.  Showing it is also the only
+   * way the page can be useful -- a user debugging why social mode cannot
+   * reach the cloud needs to see which host the device is actually using,
+   * and "已填写" would tell them nothing.
+   *
+   * NULL or empty means nothing is stored and the built-in default applies;
+   * cloud_port 0 means the same for the port.
+   */
+
+  const char *cloud_host;
+  const char *cloud_path;
+  uint16_t    cloud_port;
   uint32_t    generation;       /* Times saved; 0 when unknown */
   bool        history_enabled;
 

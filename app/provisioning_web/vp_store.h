@@ -26,7 +26,7 @@
 /* Layout, little-endian:
  *
  *   0   4   magic "VSWP"
- *   4   2   version, currently 3
+ *   4   2   version, currently 4
  *   6   2   flags, bit0 = open network
  *   8   4   generation
  *   12  1   ssid_len, 1..32
@@ -36,20 +36,29 @@
  *   109 512 MiMo API key, zero padded
  *   621 64  Volcengine app_id, zero padded
  *   685 128 Volcengine token, zero padded
- *   813 1   reserved, must be zero
- *   814 4   CRC32 of bytes 0..813
+ *   813 96  social cloud host, zero padded
+ *   909 64  social cloud path prefix, zero padded
+ *   973 2   social cloud port, 0 meaning "use the default"
+ *   975 1   reserved, must be zero
+ *   976 4   CRC32 of bytes 0..975
  *
  * Version 3 added the two Volcengine fields (offsets 621 and 685) between
- * the MiMo key and the reserved byte, which pushed the reserved byte and
- * the CRC further out.  This is a breaking change: a v2 record from before
- * this field existed does not decode, by design (see vp_record_decode()'s
- * header comment) -- there is no partial-record recovery here, only intact
- * or corrupt.  A device upgrading from v2 loses its stored Wi-Fi and MiMo
- * key and must be provisioned again.
+ * the MiMo key and the reserved byte.  Version 4 added the three social
+ * cloud endpoint fields (813, 909, 973) in the same place, again pushing
+ * the reserved byte and the CRC further out.  Each of those is a breaking
+ * change: a record from an older version does not decode, by design (see
+ * vp_record_decode()'s header comment) -- there is no partial-record
+ * recovery here, only intact or corrupt.  A device upgrading across a
+ * version loses its stored Wi-Fi and keys and must be provisioned again.
+ *
+ * The endpoint fields going in *after* the credentials is not arbitrary.
+ * Everything before offset 813 keeps the offset it had in v3, so a hex dump
+ * of a v3 record and a v4 record line up for the fields they share, which is
+ * what makes a field-level diff readable while debugging a migration.
  */
 
-#define VP_RECORD_SIZE    818
-#define VP_RECORD_VERSION 3
+#define VP_RECORD_SIZE    980
+#define VP_RECORD_VERSION 4
 #define VP_RECORD_MAGIC   "VSWP"
 
 #define VP_RECORD_FLAG_OPEN 0x0001u

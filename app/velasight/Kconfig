@@ -458,32 +458,58 @@ config VS_AUDIO_CAPTURE_RING_BYTES
 # actually reads are listed; the capture cadence and alert debounce options
 # from the integration plan belong to vs_social.c and arrive with it.
 
+# Where the endpoint comes from, since there are now three places it could:
+#
+#   1. the Web provisioning record, per field, highest priority
+#   2. VS_SOCIAL_CLOUD_HOST/PORT below, when the host is not empty
+#   3. CONFIG_VELASIGHT_PROVISION_CLOUD_HOST/_PATH/_PORT, the factory default
+#      the setup page also shows as its placeholder text
+#
+# The record is read once by vs_cloud_init() and again by
+# vs_cloud_reload_endpoint() after a successful Web save.  It is never read on
+# a request path -- a session registers an upload several times a second, and
+# a file read there would put VFAT I/O between a captured frame and the socket.
+
 config VS_SOCIAL_CLOUD_HOST
-	string "VelaSight social cloud host"
+	string "VelaSight social cloud host override"
 	default ""
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		Hostname or IPv4 address of the social-session cloud, with no
-		scheme and no port -- both of those are separate options.
+		scheme and no port -- both of those are separate.
 
-		Empty is a meaningful value, not an oversight: it means nothing
-		has been provisioned, and every cloud operation then fails with
-		-ENODATA without opening a socket.  Social mode refuses to start
-		rather than timing out against a host that was never set.
+		Leave this empty for a normal build.  Empty no longer means
+		"unconfigured": it means "use the factory default", which is
+		CONFIG_VELASIGHT_PROVISION_CLOUD_HOST and is a real address.
+		The Web provisioning record overrides both.
 
-		A dotted quad skips DNS entirely, which is what makes bring-up
-		against the cloud document's own worked examples
-		(http://127.0.0.1:18080) work before any resolver is configured.
+		Set it only to aim a whole build somewhere else -- a local mock
+		during bring-up being the case it exists for, since a dotted quad
+		here skips DNS and works before any resolver is configured.  A
+		build that sets it is asking for that endpoint deliberately, so
+		it wins over the factory default; it does not win over a
+		provisioned record, because a device someone has actually
+		provisioned should go where they said.
+
+		If this and the factory default are both empty, the module is
+		genuinely unconfigured: every operation fails with -ENODATA
+		without opening a socket, and social mode refuses to start rather
+		than timing out against a host that was never set.
 
 config VS_SOCIAL_CLOUD_PORT
-	int "VelaSight social cloud port"
+	int "VelaSight social cloud port override"
 	default 18080
 	range 1 65535
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		Defaults to the port used throughout the cloud interface
-		document's curl examples.  Set 443 together with
-		VS_SOCIAL_CLOUD_TLS for a real deployment.
+		Used only when VS_SOCIAL_CLOUD_HOST above is non-empty; the two
+		travel together, because a port belongs to the host it was chosen
+		for.  With the host left empty this value is ignored and
+		CONFIG_VELASIGHT_PROVISION_CLOUD_PORT applies.
+
+		The default is the port used throughout the cloud interface
+		document's curl examples, which is the local-mock case this
+		override targets.
 
 config VS_SOCIAL_CLOUD_TLS
 	bool "Reach the social cloud over TLS"
@@ -611,3 +637,175 @@ config VS_SOCIAL_IO_TIMEOUT_MS
 		Socket send and receive timeout for the cleartext path, once
 		connected.  Larger than the connect timeout because this also
 		covers the cloud thinking about a request, not just the link.
+
+# Session orchestration (app/velasight/vs_social.c).
+#
+# The schedule, not the protocol: how often to sample, how much to keep when
+# the network stalls, and how sure the cloud has to be before an emotion is
+# worth interrupting the user for.
+
+config VS_SOCIAL_IMAGE_INTERVAL_MS
+	int "VelaSight social image sampling interval (ms)"
+	default 340
+	range 200 2000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Target gap between captured frames.
+
+		The cloud interface document asks for 200 ms.  This board cannot
+		hold that: a JPEG frame measures about 316 ms end to end, so the
+		default is set just above the measured cost rather than at the
+		documented rate.  Asking for 200 ms would not produce 5 FPS, it
+		would produce the same ~3 FPS with the interval permanently
+		overrun and no slack for a frame that takes longer than usual.
+
+		Lower this only after the hardware JPEG path is enabled and
+		re-measured.  The number to watch is the "sampled N frames" line
+		at the end of a session against the session's duration.
+
+config VS_SOCIAL_IMAGE_WIDTH
+	int "VelaSight social frame width"
+	default 480
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Must pair with VS_SOCIAL_IMAGE_HEIGHT to form one of the sensor's
+		three exact modes: 480x480, 640x480 or 864x480.  The driver does
+		an exact match, not a nearest fit, so anything else fails at
+		stream open.
+
+		480x480 by default, the smallest of the three: this is the
+		emotion path, where the face fills the frame and the encode time
+		is what limits the sampling rate.
+
+config VS_SOCIAL_IMAGE_HEIGHT
+	int "VelaSight social frame height"
+	default 480
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+
+config VS_SOCIAL_AUDIO_CHUNK_MS
+	int "VelaSight social audio chunk duration (ms)"
+	default 2000
+	range 500 5000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How much speech goes into one upload.  2000 ms is what the cloud
+		interface document specifies.
+
+		Each chunk is a complete, self-contained Ogg Opus stream, so a
+		chunk that fails to upload costs only itself.  Larger chunks mean
+		fewer round trips and coarser timeline resolution; smaller ones
+		mean the advice for an extreme moment arrives sooner.
+
+config VS_SOCIAL_AUDIO_BITRATE
+	int "VelaSight social audio bitrate (bits/s)"
+	default 24000
+	range 8000 64000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Opus target bitrate for the uploaded chunks.  24 kbps is
+		comfortable for 16 kHz mono speech and keeps a 2 s chunk near
+		6 KB, which matters because the chunk shares the uplink with a
+		frame every third of a second.
+
+config VS_SOCIAL_POLL_INTERVAL_MS
+	int "VelaSight social result poll interval (ms)"
+	default 1500
+	range 500 5000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How often the session asks about the messages it has in flight.
+
+		Independent of the sampling rate on purpose.  One getResult can
+		carry many msgIds, so polling does not have to keep pace with
+		uploading, and a shorter interval mostly buys extra round trips
+		on a link that is already carrying the uploads.
+
+config VS_SOCIAL_FINALIZE_TIMEOUT_MS
+	int "VelaSight social finalize timeout (ms)"
+	default 30000
+	range 5000 120000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long to poll for the minutes after asking the cloud to close
+		the session.
+
+		The close is asynchronous by design: the cloud answers with a
+		msgId and status 40, and the minutes -- text summary, TTS URL and
+		both timelines -- have to be polled for.  Generous by default
+		because that work grows with the length of the conversation, and
+		the alternative to waiting is showing the user a session that
+		produced nothing.
+
+config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
+	int "VelaSight social alert confirmation windows"
+	default 3
+	range 1 10
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many consecutive extreme frames raise an alert, and how many
+		consecutive calm ones clear it.
+
+		Without this the screen changes colour on single-frame noise.
+		With it, an alert means the cloud said the same thing about three
+		frames in a row -- about a second at the default sampling rate,
+		which is short enough to still be about the moment it describes.
+
+config VS_SOCIAL_ALERT_COOLDOWN_MS
+	int "VelaSight social alert cooldown (ms)"
+	default 8000
+	range 2000 60000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Minimum time an alert stays on screen before the calm streak is
+		allowed to clear it.
+
+		This is a readability floor, not a filter: the debounce above
+		already decides whether the emotion is real.  An alert that
+		appeared and vanished before it could be read would be worse than
+		none, because the user would know something happened and not what.
+
+config VS_SOCIAL_QUEUE_SLOTS
+	int "VelaSight social upload queue depth"
+	default 4
+	range 2 8
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many captured items may wait for the uploader.  Full means
+		the oldest is dropped.
+
+		This is the slack between a fixed capture cadence and a network
+		that is not.  It is small on purpose: each image slot can hold up
+		to 160 KB of PSRAM, and a deep queue would mostly serve to upload
+		frames that are no longer about anything -- the session wants the
+		most recent face, not a backlog.
+
+		The "dropped" count in the end-of-session log is how to tell
+		whether this was ever reached.
+
+config VS_SOCIAL_INFLIGHT_MAX
+	int "VelaSight social in-flight message tracking"
+	default 16
+	range 4 32
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many uploaded msgIds are tracked while waiting for results.
+
+		Sized from the uploads that can be outstanding within one poll
+		interval, with room to spare.  When it is full the oldest entry is
+		retired unanswered, which loses one frame's emotion result and
+		nothing else -- the cloud still has the data and still counts it
+		in the end-of-session timeline.
+
+config VS_SOCIAL_STACKSIZE
+	int "VelaSight social thread stack size"
+	default 8192
+	range 4096 32768
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Stack for each of the four session threads.
+
+		The session thread is the one that needs it: cJSON parsing of a
+		full end-of-session response, with both timelines, recurses.
+		These are pthread stacks, so they come from the SRAM heap -- four
+		of them at this size is real memory, and it is only claimed while
+		a session is running.

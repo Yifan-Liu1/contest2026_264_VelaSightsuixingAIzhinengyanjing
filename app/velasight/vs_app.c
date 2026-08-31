@@ -21,6 +21,7 @@
 #include "include/vs_input.h"
 #include "include/vs_network.h"
 #include "include/vs_settings.h"
+#include "include/vs_social.h"
 #include "include/vs_voice.h"
 
 /* Shown on the listening page, so it has to agree with the value vs_voice.c
@@ -293,6 +294,16 @@ static bool vs_app_pop_event(struct vs_app_event_s *event)
     }
   pthread_mutex_unlock(&g_app_events.lock);
   return available;
+}
+
+int vs_app_take_event(struct vs_app_event_s *out)
+{
+  if (out == NULL)
+    {
+      return -EINVAL;
+    }
+
+  return vs_app_pop_event(out) ? 0 : -EAGAIN;
 }
 
 static struct vs_network_s *vs_take_network_result(void)
@@ -1218,6 +1229,33 @@ static void vs_acknowledge(struct vs_runtime_s *runtime, enum vs_key_e key)
   vs_set_response(runtime, key, snapshot.softkey[key].text);
 }
 
+/* Paint and push, instead of leaving the frame for vs_display_tick().
+ *
+ * vs_handle_event() otherwise only mutates runtime, and that is the right
+ * default: the loop paints once per pass, so a burst of queued presses
+ * collapses into one frame.  It breaks down when the action a press starts can
+ * hold this thread off for longer than a frame, because then the frame
+ * acknowledging the press is still queued when the block begins.  Two things
+ * on the browse pages do exactly that.  vs_voice_start() can load provisioning
+ * from SD-NAND before it spawns anything, and the worker it spawns runs at
+ * VS_PRIORITY_VOICE -- above this thread -- so it can own the CPU from the
+ * moment pthread_create() returns until it first blocks on the camera or the
+ * network.  Either way the loop does not reach vs_display_tick() until it is
+ * over, and a highlight the user never sees is not feedback.
+ *
+ * Call this to put such a frame on the glass before starting the work.  One
+ * extra push per key press does not touch the 10 FPS budget: that budget is
+ * about repeated refreshes leaving no time slice for Camera, Audio and Wi-Fi,
+ * not about a single push the user asked for.
+ */
+
+static void vs_render_now(struct vs_display_s *display,
+                          struct vs_runtime_s *runtime)
+{
+  vs_render(display, runtime);
+  vs_display_flush(display);
+}
+
 static void vs_set_error(struct vs_runtime_s *runtime, int error,
                          enum vs_page_e return_page, bool retryable);
 
@@ -1743,13 +1781,43 @@ static void vs_handle_event(struct vs_display_s *display,
                 runtime->voice_ending = false;
                 runtime->result_text[0] = '\0';
                 request.request_id = vs_begin_request(runtime);
-                if (vs_voice_start(&request) == 0)
+
+                /* Destination page and key highlight first, then the start.
+                 * The state written here is what the round is about to be in,
+                 * so the frame is honest before vs_voice_start() runs rather
+                 * than after: arming reports "正在准备" until the microphone
+                 * is actually open, which is the same thing it reported when
+                 * this was set on the way out of a successful start.
+                 *
+                 * Safe to publish the request id ahead of the worker: nothing
+                 * can post against it until the worker exists, and a late
+                 * event from the previous round no longer matches.
+                 */
+
+                runtime->voice_arming = true;
+                runtime->page = VS_PAGE_VOICE_LISTENING;
+                vs_render_now(display, runtime);
+
+                if (vs_voice_start(&request) != 0)
                   {
-                    runtime->voice_arming = true;
-                    runtime->page = VS_PAGE_VOICE_LISTENING;
+                    /* Same outcome as before: the press is dropped and the
+                     * page returns, with no error shown.  It has to stay that
+                     * quiet because the reachable failure is -EBUSY, from the
+                     * window where the previous round's worker has posted its
+                     * terminal event but has not cleared busy yet -- not
+                     * something to put an error page in front of the user for.
+                     *
+                     * Painted here rather than left to the loop so the frame
+                     * above does not linger for a refresh period.  The two
+                     * failures that can be hit are mutex-only paths, so the
+                     * page the user actually sees does not change.
+                     */
+
+                    runtime->voice_arming = false;
+                    runtime->page = VS_PAGE_HISTORY;
+                    vs_cancel_request(runtime);
+                    vs_render_now(display, runtime);
                   }
-                else
-                  vs_cancel_request(runtime);
               }
             else if (event->key == VS_KEY_NEXT)
               {
@@ -1806,10 +1874,22 @@ static void vs_handle_event(struct vs_display_s *display,
                 runtime->voice_ending = false;
                 runtime->result_text[0] = '\0';
                 request.request_id = vs_begin_request(runtime);
-                if (vs_voice_start(&request) == 0)
-                  runtime->page = VS_PAGE_PHOTO_CAPTURE;
-                else
-                  vs_cancel_request(runtime);
+
+                /* "立即显示正在拍照" is a display rule, and the only way to
+                 * honour it is to paint before the capture is asked for: the
+                 * worker that opens /dev/video0 outranks this thread, so once
+                 * it is running this frame would wait for it.
+                 */
+
+                runtime->page = VS_PAGE_PHOTO_CAPTURE;
+                vs_render_now(display, runtime);
+
+                if (vs_voice_start(&request) != 0)
+                  {
+                    runtime->page = VS_PAGE_HISTORY_BLANK;
+                    vs_cancel_request(runtime);
+                    vs_render_now(display, runtime);
+                  }
               }
             else if (event->key == VS_KEY_NEXT)
               {
@@ -1885,13 +1965,29 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_SOCIAL_ALERT:
             if (event->key == VS_KEY_CONFIRM)
               {
-                runtime->page = VS_PAGE_SOCIAL_PAUSING;
+                /* The page moves first and the request follows, because the
+                 * request is non-blocking and its outcome arrives as an event.
+                 * A -EINVAL here means the session ended on its own between
+                 * the press and this line -- the pausing page then has nothing
+                 * to leave it, so it is not entered.
+                 */
+
+                if (vs_social_pause() == 0)
+                  runtime->page = VS_PAGE_SOCIAL_PAUSING;
               }
             break;
 
           case VS_PAGE_SOCIAL_STARTING:
             if (event->key == VS_KEY_BACK)
               {
+                /* Abandon rather than merely forget.  vs_social_abort() still
+                 * closes the cloud session on a detached thread: one deviceId
+                 * may hold one live session, so walking away would make the
+                 * next attempt fail with -EBUSY and report a problem that has
+                 * nothing to do with what happened here.
+                 */
+
+                vs_social_abort();
                 vs_cancel_request(runtime);
                 runtime->page = runtime->social_entry_return_page;
               }
@@ -1900,7 +1996,8 @@ static void vs_handle_event(struct vs_display_s *display,
           case VS_PAGE_SOCIAL_PAUSED:
             if (event->key == VS_KEY_CONFIRM)
               {
-                runtime->page = VS_PAGE_SOCIAL_RESUMING;
+                if (vs_social_resume() == 0)
+                  runtime->page = VS_PAGE_SOCIAL_RESUMING;
               }
             break;
 
@@ -2017,13 +2114,59 @@ static void vs_handle_event(struct vs_display_s *display,
     {
       if (runtime->page == VS_PAGE_SOCIAL_ENTER && event->key == VS_KEY_CONFIRM)
         {
+          uint32_t request_id;
+          int ret;
+
           runtime->progress = 100;
           runtime->emotion = VS_EMOTION_NONE;
           runtime->emotion_color = 0;
           runtime->alert_text[0] = '\0';
           runtime->result_text[0] = '\0';
-          (void)vs_begin_request(runtime);
-          runtime->page = VS_PAGE_SOCIAL_STARTING;
+          request_id = vs_begin_request(runtime);
+
+          ret = vs_social_start(request_id);
+          if (ret < 0)
+            {
+              const char *reason;
+
+              /* A refusal here is not the same as a session that failed to
+               * start: nothing was launched, so no event is coming and the
+               * starting page would sit there forever.  Report it directly
+               * instead, with the reason the user can act on.
+               */
+
+              switch (ret)
+                {
+                  case -ENODATA:
+                    reason = "还没有配置社交云地址";
+                    break;
+
+                  case -EBUSY:
+                    /* The likely cause is the previous session still closing
+                     * itself with the cloud after a back-press, which takes a
+                     * round trip.  "Try again" is the correct advice and
+                     * "startup failed" is not, so the two are worth telling
+                     * apart even though both are -EBUSY to the caller.
+                     */
+
+                    reason = vs_social_active() ? "上一次交流还在收尾，稍等" :
+                                                  "社交会话启动失败";
+                    break;
+
+                  default:
+                    reason = "社交会话启动失败";
+                    break;
+                }
+
+              vs_cancel_request(runtime);
+              vs_set_error_reason(runtime, ret,
+                                  runtime->social_entry_return_page, false,
+                                  reason);
+            }
+          else
+            {
+              runtime->page = VS_PAGE_SOCIAL_STARTING;
+            }
         }
       else if ((runtime->page == VS_PAGE_SOCIAL_RUNNING ||
                 runtime->page == VS_PAGE_SOCIAL_PAUSED ||
@@ -2031,8 +2174,29 @@ static void vs_handle_event(struct vs_display_s *display,
                 runtime->page == VS_PAGE_SOCIAL_EXITING) &&
                event->key == VS_KEY_BACK)
         {
-          runtime->page = VS_PAGE_SOCIAL_FINALIZING;
-          runtime->progress = 0;
+          /* Keep the request id the session already carries rather than
+           * drawing a new one: the events still in flight from the poll loop
+           * are stamped with the old one, and a new id would make the UI
+           * discard them during the seconds finalize takes.
+           */
+
+          if (vs_social_finalize(runtime->active_request_id) == 0)
+            {
+              runtime->page = VS_PAGE_SOCIAL_FINALIZING;
+              runtime->progress = 0;
+            }
+          else
+            {
+              /* The session is already gone -- it ended on its own, or this is
+               * a second long-press landing after the first was accepted.
+               * There are no minutes coming, so go back to history rather than
+               * waiting on the finalizing page.
+               */
+
+              vs_cancel_request(runtime);
+              runtime->page = VS_PAGE_HISTORY;
+              runtime->progress = 0;
+            }
         }
       else if (((runtime->page == VS_PAGE_SOFTAP &&
                  !runtime->network_busy) ||
@@ -2107,6 +2271,26 @@ int vs_app_run(void)
       goto fail;
     }
 
+  /* Before the network worker starts, not after: vs_cloud_init() writes
+   * g_cloud's device id and default endpoint with no lock protecting them
+   * (see vs_cloud.c's header comment on why that was judged safe), on the
+   * assumption that only one thread ever touches them before a session
+   * exists.  The network worker's first pass now also touches them, through
+   * vs_cloud_reload_endpoint() inside vs_network_open() -- deliberately, so
+   * the provisioned endpoint's one SD-NAND read happens on that thread
+   * instead of this one.  Running vs_cloud_init() here first is what keeps
+   * that a hand-off instead of a race: by the time the worker thread reaches
+   * vs_network_open(), g_cloud.initialized is already true, so
+   * vs_cloud_reload_endpoint() does not fall through to vs_cloud_init()
+   * itself and no two threads write the same fields at once.
+   *
+   * vs_cloud_init() itself performs no SD-NAND I/O -- see its own comment --
+   * so this is safe before SD-NAND is known to be mounted, unlike almost
+   * everything below it in this function.
+   */
+
+  (void)vs_cloud_init();
+
   ret = vs_start_network_worker(&runtime, NULL, VS_NET_STA, false);
   if (ret < 0)
     {
@@ -2137,16 +2321,6 @@ int vs_app_run(void)
       runtime.volume_level = VS_VOLUME_FALLBACK;
   }
 
-  /* Resolve the social cloud's endpoint and this device's identifier.  No
-   * network I/O, so it costs nothing here; it just has to happen before any
-   * cloud call, and it reads the wlan0 MAC, which needs the netdev to be
-   * registered -- which board bring-up has already done by the time the app
-   * runs.  An unconfigured host is not an error worth stopping for: social
-   * mode will refuse to start and say why.
-   */
-
-  (void)vs_cloud_init();
-
   bk7258_nand_seed_agent_config();
   runtime.api_ready = bk7258_ai_config_ready();
   vs_history_open();
@@ -2155,6 +2329,11 @@ int vs_app_run(void)
    * work item and vs_history_open() is what blocks for it.  Reading the volume
    * any earlier -- next to the driver query above, where it would read more
    * naturally -- gets ENOENT on every boot.
+   *
+   * vs_cloud_init() is not called here.  It already ran, above
+   * vs_start_network_worker(), before this thread had any SD-NAND-backed
+   * work of its own to do -- see the comment there for why moving it earlier
+   * was the fix, not an incidental reordering.
    */
 
   {
@@ -2295,6 +2474,13 @@ int vs_app_run(void)
     }
 
 fail:
+  /* Before vs_history_close(): a session that is mid-finalize is about to call
+   * vs_history_append(), and closing the store under it would turn a completed
+   * conversation into a write to a closed handle.  vs_social_close() blocks
+   * until the session thread has finished, which is the point.
+   */
+
+  vs_social_close();
   vs_voice_close();
   vs_network_close(network);
   vs_history_close();

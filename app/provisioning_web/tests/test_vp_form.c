@@ -290,7 +290,147 @@ static void stored_record(struct velasight_prov_credentials_s *out)
   strcpy(out->api_key, "old-mimo-key");
   strcpy(out->volc_appid, "old-appid");
   strcpy(out->volc_token, "old-token");
+  strcpy(out->cloud_host, "old.example.com");
+  strcpy(out->cloud_path, "/old/prefix");
+  out->cloud_port = 8443;
   out->generation = 7;
+}
+
+/* The endpoint boxes do not behave like the key boxes, and the difference is
+ * the whole point of these checks: the form pre-fills them, so an empty box is
+ * the user clearing a custom endpoint back to the factory default, while a
+ * field missing from the body altogether is a client that never offered the
+ * box and must not have its endpoint reset.
+ */
+
+static void test_cloud_endpoint(void)
+{
+  struct velasight_prov_credentials_s prev;
+  struct vp_form_submit_s s;
+  enum vp_form_field_e which;
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=&cloud_host=10.0.0.7&"
+                  "cloud_port=18080&cloud_path=/mock", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        strcmp(s.cred.cloud_host, "10.0.0.7") == 0 &&
+        s.cred.cloud_port == 18080 &&
+        strcmp(s.cred.cloud_path, "/mock") == 0,
+        "a submitted endpoint replaces the stored one");
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=&cloud_host=&cloud_port=&"
+                  "cloud_path=", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        s.cred.cloud_host[0] == '\0' && s.cred.cloud_port == 0 &&
+        s.cred.cloud_path[0] == '\0',
+        "clearing the boxes clears the endpoint back to the default");
+
+  stored_record(&prev);
+  CHECK(parse_str("ssid=HomeNet&password=&mimo_apikey=k", &s, &which) == 0 &&
+        vp_form_resolve(&s, &prev, true, &which) == 0 &&
+        strcmp(s.cred.cloud_host, "old.example.com") == 0 &&
+        s.cred.cloud_port == 8443 &&
+        strcmp(s.cred.cloud_path, "/old/prefix") == 0,
+        "a body without the endpoint fields leaves the stored endpoint alone");
+
+  /* An empty endpoint is legal on a device with nothing stored: it means the
+   * default applies.  That is the opposite of the SSID, where blank is an
+   * error, and the opposite of the password, where blank with no previous
+   * record is an error too.
+   */
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&cloud_host=&"
+                  "cloud_path=", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == 0 &&
+        s.cred.cloud_host[0] == '\0' && s.cred.cloud_port == 0,
+        "first-time setup may leave the endpoint at its default");
+
+  /* A host is pasted into a Host header and handed to connect(), so the
+   * characters that would split either are refused rather than sanitised.
+   */
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&"
+                  "cloud_host=host.example.com/path", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_HOST,
+        "a host carrying a path is refused and named");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&"
+                  "cloud_host=host.example.com:8080", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_HOST,
+        "a host carrying a port is refused rather than split");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&"
+                  "cloud_host=http%3A%2F%2Fhost.example.com", &s,
+                  &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_HOST,
+        "a host carrying a scheme is refused");
+
+  /* The prefix shape is enforced rather than normalised, so the value stored
+   * is the value shown.  The consumer concatenates prefix + "/contest/v1/..."
+   * and relies on exactly one slash at the join.
+   */
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&cloud_path=hlthopen", &s,
+                  &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_PATH,
+        "a prefix without a leading slash is refused");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&"
+                  "cloud_path=%2Fhlthopen%2F", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_PATH,
+        "a prefix with a trailing slash is refused, not trimmed");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&"
+                  "cloud_path=%2Fa%3Fb%3Dc", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_PATH,
+        "a prefix carrying a query is refused");
+
+  /* The five characters HTML escaping expands are rejected here, which is
+   * what lets vp_http_page() size its escape scratch at the raw length
+   * instead of sixfold.  If this check ever loosens, that buffer overflows.
+   */
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&"
+                  "cloud_path=%2F%3Cscript%3E", &s, &which) == 0 &&
+        vp_form_resolve(&s, NULL, false, &which) == -EINVAL &&
+        which == VP_FORM_FIELD_CLOUD_PATH,
+        "a prefix carrying markup is refused, keeping escaping length-neutral");
+
+  /* The port is parsed strictly: strtol would take "80abc" and "0x50", and a
+   * port the user did not type is worse than a refusal they can see.
+   */
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&cloud_port=80abc", &s,
+                  &which) == -EINVAL && which == VP_FORM_FIELD_CLOUD_PORT,
+        "trailing junk in the port is refused, not ignored");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&cloud_port=0", &s,
+                  &which) == -EINVAL && which == VP_FORM_FIELD_CLOUD_PORT,
+        "port zero is refused rather than read as the default");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&cloud_port=65536", &s,
+                  &which) == -EINVAL && which == VP_FORM_FIELD_CLOUD_PORT,
+        "a port past the 16-bit range is refused rather than wrapped");
+
+  CHECK(parse_str("ssid=HomeNet&password=goodpass1&cloud_port=%2080%20", &s,
+                  &which) == 0 && s.cred.cloud_port == 80,
+        "a pasted port with surrounding spaces is trimmed and accepted");
+
+  /* Duplicates are refused rather than resolved, the same rule the other
+   * fields follow: two values means the request cannot be read with
+   * confidence, whichever one is picked.
+   */
+
+  CHECK(parse_str("ssid=HomeNet&cloud_host=a.com&cloud_host=b.com", &s,
+                  &which) == -EINVAL && which == VP_FORM_FIELD_CLOUD_HOST,
+        "a duplicated host is refused instead of last-one-wins");
 }
 
 static void test_form_resolve(void)
@@ -438,6 +578,7 @@ int main(void)
   test_validate();
   test_form_parse();
   test_form_resolve();
+  test_cloud_endpoint();
   test_changed();
 
   printf("%s: %d checks, %d failures\n",

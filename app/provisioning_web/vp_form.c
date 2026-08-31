@@ -167,6 +167,124 @@ static int vp_printable_field_validate(const char *field, size_t cap,
   return 0;
 }
 
+/* A DNS name or a dotted quad, with no scheme, no port and no path.
+ *
+ * Deliberately stricter than the printable-ASCII check the key fields use.
+ * This value is interpolated into a Host header and into the target of a
+ * connect(), so a space, a slash or a colon in it would either split the
+ * header or silently change which host is reached.  Rejecting the character
+ * outright is the only version of that check with no second interpretation.
+ *
+ * Empty is legal and means "use the compiled-in default".
+ */
+
+static bool vp_cloud_host_ok(const char *host)
+{
+  size_t len = vp_strnlen(host, VELASIGHT_PROV_CLOUD_HOST_MAX + 1);
+  size_t i;
+
+  if (len > VELASIGHT_PROV_CLOUD_HOST_MAX)
+    {
+      return false;
+    }
+
+  if (len == 0)
+    {
+      return true;
+    }
+
+  /* A leading or trailing dot is not a name any resolver accepts as written,
+   * and is what a half-typed value looks like.
+   */
+
+  if (host[0] == '.' || host[0] == '-' || host[len - 1] == '.' ||
+      host[len - 1] == '-')
+    {
+      return false;
+    }
+
+  for (i = 0; i < len; i++)
+    {
+      char c = host[i];
+
+      if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '.')
+        {
+          continue;
+        }
+
+      return false;
+    }
+
+  return true;
+}
+
+/* The prefix that sits in front of /contest/v1.
+ *
+ * Empty is legal and means the endpoints are at the document root, which is
+ * what the interface document's own examples assume.  A non-empty value must
+ * start with '/' and must not end with one, so the consumer can concatenate
+ * prefix + "/contest/v1/session" and get exactly one slash at the join
+ * without testing for it.  Enforcing the shape here rather than normalising
+ * it means the value stored is the value shown, and a user who typed a
+ * trailing slash is told so instead of having it silently removed.
+ */
+
+static bool vp_cloud_path_ok(const char *path)
+{
+  size_t len = vp_strnlen(path, VELASIGHT_PROV_CLOUD_PATH_MAX + 1);
+  size_t i;
+
+  if (len > VELASIGHT_PROV_CLOUD_PATH_MAX)
+    {
+      return false;
+    }
+
+  if (len == 0)
+    {
+      return true;
+    }
+
+  if (path[0] != '/' || path[len - 1] == '/')
+    {
+      return false;
+    }
+
+  for (i = 0; i < len; i++)
+    {
+      unsigned char c = (unsigned char)path[i];
+
+      /* Unreserved URI characters plus '/' and '%', and nothing else.
+       *
+       * Two separate reasons to be this narrow.  '?', '#' and '\' would turn
+       * a prefix into a query, a fragment or a Windows path.  '<', '>', '&',
+       * '"' and '\'' are the five characters HTML escaping expands, and this
+       * value is rendered twice per page -- once in the stored-settings box
+       * and once as the input's value attribute -- so allowing them would
+       * multiply the page's worst case by six for a character no path prefix
+       * needs.  Percent-encoding covers anything genuinely required.
+       */
+
+      if (c == '/' || c == '%' || c == '-' || c == '_' || c == '.' ||
+          c == '~' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9'))
+        {
+          /* Accepted. */
+        }
+      else
+        {
+          return false;
+        }
+
+      if (i > 0 && path[i] == '/' && path[i - 1] == '/')
+        {
+          return false;
+        }
+    }
+
+  return true;
+}
+
 /* Strip ASCII whitespace from both ends, in place.
  *
  * Applied to the three key fields only.  Phone keyboards and clipboard
@@ -255,6 +373,22 @@ int vp_credentials_validate_detail(
     {
       return vp_fail(which, VP_FORM_FIELD_VOLC_TOKEN, -EINVAL);
     }
+
+  if (!vp_cloud_host_ok(cred->cloud_host))
+    {
+      return vp_fail(which, VP_FORM_FIELD_CLOUD_HOST, -EINVAL);
+    }
+
+  if (!vp_cloud_path_ok(cred->cloud_path))
+    {
+      return vp_fail(which, VP_FORM_FIELD_CLOUD_PATH, -EINVAL);
+    }
+
+  /* cloud_port needs no range check: it is a uint16_t, so every value it can
+   * hold is a legal port or the 0 that means "use the default".  The parser
+   * is where a number outside that range is refused, because that is where
+   * the typed text still exists to be refused.
+   */
 
   len = vp_strnlen(cred->ssid, sizeof(cred->ssid));
   if (len == 0 || len > VELASIGHT_PROV_SSID_MAX)
@@ -393,7 +527,10 @@ int vp_form_parse(const char *body, size_t bodylen,
           strcmp(name, "no_password") != 0 &&
           strcmp(name, "mimo_apikey") != 0 &&
           strcmp(name, "volc_appid") != 0 &&
-          strcmp(name, "volc_token") != 0)
+          strcmp(name, "volc_token") != 0 &&
+          strcmp(name, "cloud_host") != 0 &&
+          strcmp(name, "cloud_port") != 0 &&
+          strcmp(name, "cloud_path") != 0)
         {
           goto next;
         }
@@ -481,6 +618,78 @@ int vp_form_parse(const char *body, size_t bodylen,
             }
 
           strcpy(submit->cred.volc_appid, value);
+        }
+      else if (strcmp(name, "cloud_host") == 0)
+        {
+          if (submit->have_cloud_host)
+            {
+              return vp_fail(which, VP_FORM_FIELD_CLOUD_HOST, -EINVAL);
+            }
+
+          submit->have_cloud_host = true;
+          vp_trim_ascii_space(value);
+          if (strlen(value) >= sizeof(submit->cred.cloud_host))
+            {
+              return vp_fail(which, VP_FORM_FIELD_CLOUD_HOST, -E2BIG);
+            }
+
+          strcpy(submit->cred.cloud_host, value);
+        }
+      else if (strcmp(name, "cloud_path") == 0)
+        {
+          if (submit->have_cloud_path)
+            {
+              return vp_fail(which, VP_FORM_FIELD_CLOUD_PATH, -EINVAL);
+            }
+
+          submit->have_cloud_path = true;
+          vp_trim_ascii_space(value);
+          if (strlen(value) >= sizeof(submit->cred.cloud_path))
+            {
+              return vp_fail(which, VP_FORM_FIELD_CLOUD_PATH, -E2BIG);
+            }
+
+          strcpy(submit->cred.cloud_path, value);
+        }
+      else if (strcmp(name, "cloud_port") == 0)
+        {
+          if (submit->have_cloud_port)
+            {
+              return vp_fail(which, VP_FORM_FIELD_CLOUD_PORT, -EINVAL);
+            }
+
+          submit->have_cloud_port = true;
+          vp_trim_ascii_space(value);
+
+          /* Empty stays 0, which resolve() reads as "back to the default".
+           * A non-empty value must be entirely digits and in range: strtol
+           * would accept "80abc" and "0x50", and a port the user did not
+           * type is worse than a rejection they can see.
+           */
+
+          if (value[0] != '\0')
+            {
+              unsigned long port = 0;
+              size_t i;
+
+              for (i = 0; value[i] != '\0'; i++)
+                {
+                  if (value[i] < '0' || value[i] > '9' || i >= 5)
+                    {
+                      return vp_fail(which, VP_FORM_FIELD_CLOUD_PORT,
+                                     -EINVAL);
+                    }
+
+                  port = port * 10u + (unsigned long)(value[i] - '0');
+                }
+
+              if (port == 0 || port > 65535u)
+                {
+                  return vp_fail(which, VP_FORM_FIELD_CLOUD_PORT, -EINVAL);
+                }
+
+              submit->cred.cloud_port = (uint16_t)port;
+            }
         }
       else
         {
@@ -599,6 +808,33 @@ int vp_form_resolve(struct vp_form_submit_s *submit,
           memcpy(cred->volc_token, previous->volc_token,
                  sizeof(cred->volc_token));
         }
+
+      /* The endpoint fields carry over only when the field was *absent*
+       * from the body, not when it arrived empty.  The form pre-fills them,
+       * so an empty box is the user clearing a custom endpoint back to the
+       * built-in default, and carrying the old value over would make that
+       * impossible.  An absent field, by contrast, means this client never
+       * offered the box at all -- an older cached form, or a hand-written
+       * request -- and silently resetting the endpoint for it would be a
+       * change nobody asked for.
+       */
+
+      if (!submit->have_cloud_host)
+        {
+          memcpy(cred->cloud_host, previous->cloud_host,
+                 sizeof(cred->cloud_host));
+        }
+
+      if (!submit->have_cloud_path)
+        {
+          memcpy(cred->cloud_path, previous->cloud_path,
+                 sizeof(cred->cloud_path));
+        }
+
+      if (!submit->have_cloud_port)
+        {
+          cred->cloud_port = previous->cloud_port;
+        }
     }
 
   return vp_credentials_validate_detail(cred, which);
@@ -639,6 +875,21 @@ unsigned int vp_credentials_changed(
           changed |= VP_FORM_CHANGED_VOLC_TOKEN;
         }
 
+      if (now->cloud_host[0] != '\0')
+        {
+          changed |= VP_FORM_CHANGED_CLOUD_HOST;
+        }
+
+      if (now->cloud_path[0] != '\0')
+        {
+          changed |= VP_FORM_CHANGED_CLOUD_PATH;
+        }
+
+      if (now->cloud_port != 0)
+        {
+          changed |= VP_FORM_CHANGED_CLOUD_PORT;
+        }
+
       return changed;
     }
 
@@ -666,6 +917,21 @@ unsigned int vp_credentials_changed(
   if (strcmp(now->volc_token, previous->volc_token) != 0)
     {
       changed |= VP_FORM_CHANGED_VOLC_TOKEN;
+    }
+
+  if (strcmp(now->cloud_host, previous->cloud_host) != 0)
+    {
+      changed |= VP_FORM_CHANGED_CLOUD_HOST;
+    }
+
+  if (strcmp(now->cloud_path, previous->cloud_path) != 0)
+    {
+      changed |= VP_FORM_CHANGED_CLOUD_PATH;
+    }
+
+  if (now->cloud_port != previous->cloud_port)
+    {
+      changed |= VP_FORM_CHANGED_CLOUD_PORT;
     }
 
   return changed;
