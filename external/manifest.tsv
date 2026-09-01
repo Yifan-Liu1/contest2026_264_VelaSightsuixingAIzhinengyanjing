@@ -1,7 +1,7 @@
 # kind	name	overlay_path	default_target	baseline_or_digest	source	file_count	overlay_tree_sha256
 repo	apps	apps	apps	dcc6a95c3b323e533c98fde8fb209f99e24f0fdd	https://github.com/open-vela/nuttx-apps.git	1	4dbb5657ae0a5670d1b233448ff9e61955a5e9eeff80b6f481c1a1cd1ac4f609
 repo	nuttx	nuttx	nuttx	4a67a7bad6bba672db2ac37a64acbdc3c024d6e5	https://github.com/open-vela/nuttx.git	1	f3b1f35f5d3aa4de2863bc3d931f5889cbaea24cc14cd690cfc9316a2cc5d1dd
-repo	packages_ai_agent	packages/ai_agent	packages/ai_agent	31faed70f683a6f5e690437c5507891360f0814a	https://github.com/open-vela/packages_ai_agent.git	15	2da07b716c3510248ba7a0be7d222a688c73e37ba8dc8b4d7d79cca16a364224
+repo	packages_ai_agent	packages/ai_agent	packages/ai_agent	31faed70f683a6f5e690437c5507891360f0814a	https://github.com/open-vela/packages_ai_agent.git	15	955c4425bae8dc494f2eff4944c8ccd5997423563a27feced00f715d4a8d64c7
 repo	bk_avdk_smp	bk_avdk_smp	bk_avdk_smp	d2ded037798530175e5dc5cde6fa1878f5d5ef35	https://github.com/bekencorp/bk_avdk_smp.git	39	8f3e1533357c2a3512a1aafabb190769c5a2850d9ce010be4e0cd7f6a0f0d024
 image	armino_idk	-	localhost/bekencorp/armino-idk:1.5	5617808dab7ae97336fbd58beb37387bb563e0aeef50234b7beca7e8fce01d2d	https://hub.docker.com/r/bekencorp/armino-idk/tags	-	-
 archive	armino_idk_v1.5	-	bekencorp-armino-idk-v1.5.tar.gz	d79a8ec193dafdb27af881a847fd6d3083e5804808c49b890956cbd9dae10a79	https://dl.bekencorp.com/tools/arminosdk/docker_img/armino-idk	-	-

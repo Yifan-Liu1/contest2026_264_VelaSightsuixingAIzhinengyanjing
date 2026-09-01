@@ -803,7 +803,15 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
             /* After volc header: 4-byte sequence (signed) + 4-byte payload_size */
             size_t audio_off = volc_hdr_len + 8;
 
-            if (flen <= audio_off) {
+            /* The sequence field sits immediately after the volc header and is
+             * present even when the frame carries no PCM payload, so it has to
+             * be parsed before any payload-length check.  The server's
+             * end-of-stream terminator was captured on the wire as a 12-byte
+             * frame (flags=3, sequence=-62, payload_size=0), which is exactly
+             * audio_off bytes long.  Rejecting it as a short frame threw away
+             * the only in-band end marker and forced every complete reply to
+             * end on the idle timeout instead, burning the full idle budget. */
+            if (flen < volc_hdr_len + 4) {
                 skipped++;
                 continue;
             }
@@ -815,6 +823,20 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
                 ((uint32_t)buf[volc_hdr_len + 1] << 16) |
                 ((uint32_t)buf[volc_hdr_len + 2] << 8) |
                 (uint32_t)buf[volc_hdr_len + 3]);
+
+            if (flen <= audio_off) {
+                /* No PCM payload.  A negative sequence is the normal
+                 * terminator; anything else is a genuinely short frame. */
+                if (seq < 0) {
+                    last_seq = seq;
+                    last_flags = msg_flags;
+                    ended = "final sequence";
+                    break;
+                }
+
+                skipped++;
+                continue;
+            }
 
             unsigned char* pcm = buf + audio_off;
             size_t pcm_len = flen - audio_off;
