@@ -144,6 +144,16 @@
 #define CLOUD_PATH_UPLOAD     "/contest/v1/upload"
 #define CLOUD_PATH_GET_RESULT "/contest/v1/getResult"
 
+/* Debug-only, and not in the interface document's numbered sections -- it is
+ * called out separately as a debugging aid, alongside ping.  It clears every
+ * deviceId's sessions and saved results on the host, not just this one's, so
+ * it is reserved for cloud_recover_stuck_session() below and for nothing else
+ * that runs unattended.  See there for why calling it automatically is
+ * bounded the way it is.
+ */
+
+#define CLOUD_PATH_RESET      "/contest/v1/reset"
+
 /* Presigned URLs carry their signature as query parameters.  Measured shapes
  * sit around 300 characters, so this leaves generous room; a URL beyond it is
  * rejected by cloud_json_exact() with a log line naming both lengths, rather
@@ -2245,6 +2255,63 @@ int vs_cloud_new_session_id(char *out, size_t cap)
   return 0;
 }
 
+/****************************************************************************
+ * Name: cloud_recover_stuck_session
+ *
+ * Description:
+ *   Call the debug reset endpoint, once, after an open has been refused with
+ *   status 30.
+ *
+ *   That status means this deviceId has an established session with
+ *   messages still outstanding (see the interface document's own wording),
+ *   and the protocol already has a way past it -- "the newer sessionId
+ *   wins... provided the old one has nothing left to deliver".  What this
+ *   recovers from is the case that condition is never met: staging is a mock
+ *   that measurably stops answering polls and uploads after a while (-12 and
+ *   status 30 seen repeatedly on 2026-09-01), which leaves the old session
+ *   permanently "something outstanding" and every later open refused the same
+ *   way, forever, with no path back except a human running the curl by hand.
+ *
+ *   Deliberately not "retry reset on every -EBUSY".  reset clears every
+ *   deviceId on the host, not just this one -- it is the interface document's
+ *   debugging aid, not a numbered endpoint, and running it unattended on
+ *   whatever cadence a caller feels like is how one device's stuck session
+ *   becomes everyone else's data loss on a shared staging box. Three things
+ *   bound the blast radius to "tried once, per attempt to open, and gave up
+ *   quietly if that did not help either":
+ *
+ *     - only for status 30, nothing else -- an -EIO or a transport failure is
+ *       not this problem and reset would not fix it
+ *     - once per vs_cloud_social_open() call, never a retry loop of its own
+ *     - failure here is silent to the caller: the original -EBUSY still
+ *       reaches it, because a debug aid failing is not a new failure mode
+ *       worth its own error path
+ *
+ *   The caller decides whether to open again after this returns; it does not
+ *   retry on its own, so one wasted attempt is the entire cost even if reset
+ *   does not actually help.
+ *
+ ****************************************************************************/
+
+static void cloud_recover_stuck_session(void)
+{
+  char resp[64];
+  int http;
+
+  http = cloud_api_call("POST", CLOUD_PATH_RESET, NULL, resp, sizeof(resp));
+
+  if (http < 200 || http >= 300)
+    {
+      printf("%s: debug reset failed (http %d), leaving the stuck session "
+             "in place\n", CLOUD_TAG, http);
+      return;
+    }
+
+  printf("%s: staging looked stuck (status 30 with no way to clear on its "
+         "own), called the debug reset endpoint -- this cleared every "
+         "device's sessions on the host, not just this one\n", CLOUD_TAG);
+}
+
 int vs_cloud_social_open(struct vs_cloud_session_s *session)
 {
   char body[192];
@@ -2255,6 +2322,7 @@ int vs_cloud_social_open(struct vs_cloud_session_s *session)
   int status = 0;
   int http;
   int ret;
+  bool reset_tried = false;
 
   if (session == NULL)
     {
@@ -2328,6 +2396,7 @@ int vs_cloud_social_open(struct vs_cloud_session_s *session)
       return -ENOMEM;
     }
 
+retry:
   http = cloud_api_call("PUT", CLOUD_PATH_SESSION, body, resp,
                         CONFIG_VS_SOCIAL_REG_RESP_BYTES);
   if (http < 0)
@@ -2359,13 +2428,30 @@ int vs_cloud_social_open(struct vs_cloud_session_s *session)
       printf("%s: open refused, status %d%s%s\n", CLOUD_TAG, status,
              log[0] != '\0' ? ": " : "", log);
 
-      /* 30 is the only failure code this endpoint has, so it covers both
-       * "this deviceId already has a session with results outstanding" and
-       * any server-side error.  -EBUSY is the more useful of the two to
-       * report, because it is the one a caller can act on -- wait rather than
-       * retry immediately -- and the log line above carries whatever the
-       * cloud actually said.  Do not read more into it than that: nothing
-       * here inspects value.log to tell the cases apart.
+      /* status 30 with a stuck deviceId gets one recovery attempt before
+       * this is reported as -EBUSY: see cloud_recover_stuck_session() for why
+       * it is bounded to once here rather than left for the caller to retry
+       * into.  The body is unchanged -- same deviceId, same sessionId, same
+       * timestamp -- because a reset does not invalidate anything about this
+       * request, it just clears whatever the old session was blocking on.
+       */
+
+      if (status == 30 && !reset_tried)
+        {
+          reset_tried = true;
+          cJSON_Delete(root);
+          root = NULL;
+          cloud_recover_stuck_session();
+          goto retry;
+        }
+
+      /* 30 is the only failure code this endpoint has otherwise, so it also
+       * covers any server-side error the reset attempt above did not clear.
+       * -EBUSY is the more useful of the two to report, because it is the one
+       * a caller can act on -- wait rather than retry immediately -- and the
+       * log line above carries whatever the cloud actually said.  Do not read
+       * more into it than that: nothing here inspects value.log to tell the
+       * cases apart.
        */
 
       ret = status == 30 ? -EBUSY : -EIO;

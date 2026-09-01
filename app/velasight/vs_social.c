@@ -342,11 +342,23 @@ static uint64_t social_now_ms(void)
  * ones the page transition depends on.
  */
 
+/* How hard social_post() tries before giving up on a full UI queue.
+ *
+ * Deliberately short.  The caller may be the UI thread itself, which is the
+ * only thing that drains that queue, so waiting cannot help there and the
+ * whole budget is spent before the user notices a stall.  For a worker thread
+ * it is enough to ride out a UI pass that is busy pushing a panel.
+ */
+
+#define SOCIAL_POST_ATTEMPTS  3
+#define SOCIAL_POST_RETRY_US  2000
+
 static void social_post(enum vs_app_event_e type, int error,
                         enum vs_emotion_e emotion, uint32_t color,
                         const char *text)
 {
   struct vs_app_event_s event;
+  unsigned int attempt;
 
   memset(&event, 0, sizeof(event));
   event.type       = type;
@@ -360,10 +372,38 @@ static void social_post(enum vs_app_event_e type, int error,
       snprintf(event.text, sizeof(event.text), "%s", text);
     }
 
-  while (vs_app_post_event(&event) == -EAGAIN)
+  /* Bounded, and the bound is the point: this used to retry forever.
+   *
+   * vs_social_pause() and vs_social_resume() are called from vs_handle_event(),
+   * which runs on the UI thread -- and the UI thread is the only consumer of
+   * this queue.  So on a full queue that loop waited for space that only the
+   * caller could free, inside the caller.  The screen froze with no highlight,
+   * because the UI never got back to vs_render() let alone vs_display_tick(),
+   * and every later key was dead too.  That is what "pressing pause does
+   * nothing and the screen stops responding" was.
+   *
+   * A worker thread spinning here is merely wrong rather than fatal, but it is
+   * still wrong: a producer that cannot deliver should drop and carry on, not
+   * stall the session.
+   *
+   * Dropping a UI notification is a visible glitch -- a page that does not
+   * advance until the next event arrives.  Freezing the display is not
+   * recoverable at all.  The transient social pages carry their own deadline
+   * (see vs_app.c) precisely so that a dropped event costs a timeout and an
+   * error page rather than a session that can never be left.
+   */
+
+  for (attempt = 0; attempt < SOCIAL_POST_ATTEMPTS; attempt++)
     {
-      usleep(10000);
+      if (vs_app_post_event(&event) != -EAGAIN)
+        {
+          return;
+        }
+
+      usleep(SOCIAL_POST_RETRY_US);
     }
+
+  printf("%s: UI event %d dropped, queue full\n", SOCIAL_TAG, (int)type);
 }
 
 /****************************************************************************

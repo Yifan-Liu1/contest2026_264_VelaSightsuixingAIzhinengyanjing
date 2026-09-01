@@ -34,7 +34,31 @@
 
 #define VS_INPUT_EVENT_QUEUE_SIZE 64
 #define VS_INPUT_EVENTS_PER_FRAME 8
+
+/* Matches the queue depth, so one pass can clear a full queue.  Anything less
+ * leaves producers waiting on a backlog the UI is draining one item at a time.
+ */
+
+#define VS_APP_EVENTS_PER_FRAME VS_APP_EVENT_QUEUE_SIZE
+
 #define VS_RESPONSE_VISIBLE_MS 200
+
+/* How long a transient social page waits for the event that should leave it.
+ *
+ * Every one of those pages -- starting, pausing, resuming, exiting,
+ * finalizing -- is entered by the UI and left only when a worker answers.
+ * Nothing guaranteed an answer: a cloud round trip that never completes, or a
+ * notification dropped because the queue was full, left the page with no exit
+ * and only a back-press to escape, and STARTING did not even offer that on the
+ * confirm key.
+ *
+ * Long enough not to pre-empt a slow but working cloud: the finalize path alone
+ * is allowed CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS, and an upload sits behind
+ * CONFIG_VS_SOCIAL_IO_TIMEOUT_MS.  This is the outer bound on all of it, after
+ * which the UI stops waiting and says so.
+ */
+
+#define VS_SOCIAL_STAGE_TIMEOUT_MS 40000
 #define VS_WIFI_RETRY_MS 20000
 
 #define VS_APP_EVENT_QUEUE_SIZE 8
@@ -230,6 +254,13 @@ struct vs_runtime_s
   enum vs_key_e response_key;
   bool response_pending_visible;
   char response_text[VS_TEXT_SHORT];
+
+  /* Deadline for a social page that is waiting on a worker event, 0 when no
+   * such page is showing.  Armed and cleared centrally in the main loop rather
+   * than at each transition, so a page added later cannot forget to do it.
+   */
+
+  uint32_t social_stage_until_ms;
   struct vs_net_status_s network;
   char alert_text[VS_TEXT_LONG];
   char result_text[VS_TEXT_LONG];
@@ -1268,6 +1299,80 @@ static void vs_set_error_reason(struct vs_runtime_s *runtime, int error,
            reason, runtime->error);
 }
 
+/****************************************************************************
+ * Name: vs_social_stage_is_waiting
+ *
+ * Description:
+ *   True for the social pages the UI enters itself and can only leave when a
+ *   worker answers.
+ *
+ *   VS_PAGE_SOCIAL_EXITING is deliberately not one of them: it is driven by
+ *   how long the back key is held, so it is the user's own progress on screen
+ *   and timing it out would fight them.
+ *
+ ****************************************************************************/
+
+static bool vs_social_stage_is_waiting(enum vs_page_e page)
+{
+  return page == VS_PAGE_SOCIAL_STARTING ||
+         page == VS_PAGE_SOCIAL_PAUSING ||
+         page == VS_PAGE_SOCIAL_RESUMING ||
+         page == VS_PAGE_SOCIAL_FINALIZING;
+}
+
+/****************************************************************************
+ * Name: vs_social_stage_timeout
+ *
+ * Description:
+ *   The answer never came.  Leave the page the same way its own failure event
+ *   would have, so a lost notification and a reported failure land the user in
+ *   the same place.
+ *
+ *   Which place that is differs by page, and follows the matching event
+ *   handlers rather than inventing a policy: a start that never started goes
+ *   back where the user came from with the session abandoned, a pause or
+ *   resume that went unanswered returns to the running page and leaves the
+ *   session alone, and a finalize that produced nothing goes to the history
+ *   with the session abandoned.
+ *
+ *   Abandoning matters where it happens: one deviceId may hold one live
+ *   session, so walking away without closing it makes the next attempt fail
+ *   with -EBUSY and report something unrelated to what went wrong here.
+ *
+ ****************************************************************************/
+
+static void vs_social_stage_timeout(struct vs_runtime_s *runtime)
+{
+  runtime->social_stage_until_ms = 0;
+
+  switch (runtime->page)
+    {
+      case VS_PAGE_SOCIAL_STARTING:
+        vs_social_abort();
+        vs_cancel_request(runtime);
+        vs_set_error_reason(runtime, -ETIMEDOUT,
+                            runtime->social_entry_return_page, false,
+                            "社交会话启动无响应");
+        break;
+
+      case VS_PAGE_SOCIAL_PAUSING:
+      case VS_PAGE_SOCIAL_RESUMING:
+        vs_set_error_reason(runtime, -ETIMEDOUT, VS_PAGE_SOCIAL_RUNNING,
+                            false, "社交会话操作无响应");
+        break;
+
+      case VS_PAGE_SOCIAL_FINALIZING:
+        vs_social_abort();
+        vs_cancel_request(runtime);
+        vs_set_error_reason(runtime, -ETIMEDOUT, VS_PAGE_HISTORY, false,
+                            "社交记录整理无响应");
+        break;
+
+      default:
+        break;
+    }
+}
+
 static void vs_switch_network(struct vs_display_s *display,
                               struct vs_runtime_s *runtime,
                               struct vs_network_s *network)
@@ -1978,7 +2083,20 @@ static void vs_handle_event(struct vs_display_s *display,
             break;
 
           case VS_PAGE_SOCIAL_STARTING:
-            if (event->key == VS_KEY_BACK)
+            if (event->key == VS_KEY_CONFIRM)
+              {
+                /* Pause is what this key does once the session is up, and the
+                 * user has no way to know it is not up yet.  Silently dropping
+                 * the press was indistinguishable from a dead screen: no
+                 * highlight, no page change, nothing in the log.  Say "not
+                 * yet" instead, the same way the voice pages answer a confirm
+                 * that arrives before they are ready.
+                 */
+
+                vs_set_response(runtime, VS_KEY_CONFIRM, "正在启动");
+                vs_render_now(display, runtime);
+              }
+            else if (event->key == VS_KEY_BACK)
               {
                 /* Abandon rather than merely forget.  vs_social_abort() still
                  * closes the cloud session on a detached thread: one deviceId
@@ -2384,6 +2502,36 @@ int vs_app_run(void)
             }
         }
 
+      /* Arm, disarm and enforce the deadline on a social page that is waiting
+       * for a worker.  Centralised here rather than spread over the
+       * transitions: every one of those pages is entered from a key handler and
+       * left from an event handler, and the failure this guards against is one
+       * of those events not arriving.  Deciding it from the page on each pass
+       * cannot be forgotten by a handler added later.
+       */
+
+      {
+        bool waiting = vs_social_stage_is_waiting(runtime.page);
+
+        if (!waiting)
+          {
+            runtime.social_stage_until_ms = 0;
+          }
+        else if (runtime.social_stage_until_ms == 0)
+          {
+            runtime.social_stage_until_ms =
+              vs_app_now_ms() + VS_SOCIAL_STAGE_TIMEOUT_MS;
+          }
+        else if ((int32_t)(runtime.social_stage_until_ms -
+                           vs_app_now_ms()) <= 0)
+          {
+            printf("velasight: social stage timed out on page %d\n",
+                   (int)runtime.page);
+            vs_social_stage_timeout(&runtime);
+            vs_render(display, &runtime);
+          }
+      }
+
       /* Input feedback never blocks its action.  SHORT updates the business
        * state immediately and carries its visual overlay onto the resulting
        * page. */
@@ -2403,16 +2551,31 @@ int vs_app_run(void)
           }
       }
 
-      /* Each app event may synchronously push one or both full panels.  Handle
-       * one per pass so a burst cannot keep an already queued press waiting. */
-      if (vs_app_pop_event(&app_event))
-        {
-          if (app_event.type == VS_APP_EVENT_NETWORK_READY ||
-              app_event.type == VS_APP_EVENT_NETWORK_FAILED)
-            network = vs_take_network_result();
-          vs_handle_app_event(&runtime, network, &app_event);
-          vs_render(display, &runtime);
-        }
+      /* Each app event may synchronously push one or both full panels, so this
+       * is batched rather than unbounded -- a burst must not keep an already
+       * queued press waiting behind the whole backlog.
+       *
+       * It used to take exactly one per pass, which made the queue itself the
+       * bottleneck: eight slots drained one per iteration while producers that
+       * could not deliver blocked against them.  A delayed or dropped event is
+       * what leaves a transient page with nothing to advance it.
+       */
+      {
+        unsigned int app_count = 0;
+        while (app_count < VS_APP_EVENTS_PER_FRAME &&
+               vs_app_pop_event(&app_event))
+          {
+            if (app_event.type == VS_APP_EVENT_NETWORK_READY ||
+                app_event.type == VS_APP_EVENT_NETWORK_FAILED)
+              network = vs_take_network_result();
+            vs_handle_app_event(&runtime, network, &app_event);
+            app_count++;
+          }
+        if (app_count != 0)
+          {
+            vs_render(display, &runtime);
+          }
+      }
 
       if (network != NULL && !runtime.network_busy)
         {
