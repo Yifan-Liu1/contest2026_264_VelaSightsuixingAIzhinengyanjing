@@ -31,9 +31,6 @@ fi
 
 DEFAULT_IMAGE="$ROOT/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin"
 RUNTIME_DIR=${AUTOFLASH_RUNTIME_DIR:-"$SCRIPT_DIR/logs/runtime"}
-# The package size changes when the AP partition layout changes.  Keep a
-# product-build default, while allowing the build flow to override it.
-EXPECTED_SIZE=${AUTOFLASH_EXPECTED_SIZE:-5709824}
 
 PORT=/dev/ttyUSB0
 PORTNUM=""
@@ -41,10 +38,57 @@ PORTNUM_SET=0
 BAUD=115200
 CONSOLE_BAUD=115200
 IMAGE="$DEFAULT_IMAGE"
-REBOOT_TRIES=8
 ATTACH_SERIAL=0
-SKIP_SIZE_CHECK=0
 TEST_ONLY=0
+
+# ------------------------------------------------------------ 软复位的时序常量
+#
+# 决定这些数值的是 bk_loader 什么时候会再看一眼，而不是复位本身多快：
+#
+#   bootrom 只在复位后很短时间应答      本文件头部实测 ~473ms
+#   bk_loader 的 LinkCheck 节奏         t=0、t≈1.13s 两次快速尝试，之后每 ~15s 一次
+#
+# 两者相乘的后果：复位落在两次 LinkCheck 之间，这一轮就白费，要等下一次。
+#
+# 关于复位延迟本身，注意不要照抄 bk7258_reset.c 头部那个 8.26s（CP 的 reboot 走
+# NMI + 中断看门狗，2026-08-14 实测）。本机 2026-09-01 实测的握手是 0.24s ~ 2.8s
+# 量级，比那个数字快一个数量级，说明当前固件上这条 `reboot` 走的不是那条 8s 的路。
+# 窗口按 LinkCheck 节奏定，不按 8.26s 定。
+
+# 每次 reboot 之后的观察窗。看到 Gotten Bus 立刻退出，所以快路径不受它影响，
+# 它只决定慢路径上愿意等多久。要够长到能容下一次 ~15s 的 LinkCheck 间隔。
+REBOOT_WINDOW=10
+
+# 次数往少调而不是往多调（原值 8）。两种失效不对等：
+#   拿不到总线   → 提示手按 RST，板子完好
+#   往 bootrom 里插了字节 → 可能擦除完成后写到中途掉链，板子半砖，必须重烧
+# 每一次额外写入都是一次把字节插进 bootrom 的机会，所以宁可多提示按 RST。
+REBOOT_TRIES=3
+
+# 两条命令之间的最小间隔。
+CMD_GAP=0.2
+
+# 逃逸序列之后、reboot 之前的等待，故意比 CMD_GAP 长：CP 在本地消费 Ctrl-] '.'，
+# 但控制台归属切换是它 shell 任务里的异步动作，抢在切换前发 reboot 会丢或发错核。
+BRIDGE_SETTLE=0.3
+
+# 看到 Getting Bus 之后先静置再动手。0.1s 的轮询粒度不能替代它：轮询只保证
+# 第一次写入落在打印之后 0~100ms 的任意点，而 0ms 正是要避开的那一点。
+SETTLE_AFTER_GETTING_BUS=0.1
+
+# 每次重试额外加 1..REBOOT_JITTER_MS 毫秒抖动。固定间隔就是相对板子启动时序的
+# 固定相位，一次落在坏点上，后面每次都落在同一个坏点上。
+REBOOT_JITTER_MS=100
+
+# 第一条 reboot 必须尽快写出去，这里没有可以拖延的余量。
+#
+# 成功的几次实测：reboot 写在首个 Getting Bus 之后 0.1s 上下，总线在 0.24s ~ 2.8s
+# 之间拿到 —— 复位落在 bk_loader 那两次快速尝试的射程里。
+#
+# 反例也是实测的（2026-09-01 11:30）：这里曾经加过 1s 的"先让 bk_loader 自己拿
+# 总线"宽限期，第一条 reboot 因此推迟到 ~1.1s 才写出去，复位落在快速尝试用完之后，
+# 下一次 LinkCheck 在 15s 之后 —— 直接错过，整轮没拿到总线。宽限期因此删掉，只留
+# 一次零成本的 bus_taken 判定。
 
 LOG=""
 FIFO=""
@@ -60,13 +104,11 @@ usage() {
   -n <num>     bk_loader 端口号；默认从 ttyUSB<num> 自动推导
   -b <baud>    烧录波特率，默认 115200
   -B <baud>    固件控制台波特率，默认 115200
-  -s           跳过 all-app.bin 字节数校验
   -a           烧录成功后用 picocom 连接串口
   -t           只测试握手，不写 flash
   -h           显示帮助
 
-环境变量: VELA_ROOT、BK_LOADER、AUTOFLASH_RUNTIME_DIR、
-  AUTOFLASH_EXPECTED_SIZE 可覆盖当前产品包大小校验（当前默认 5709824）。
+环境变量: VELA_ROOT、BK_LOADER、AUTOFLASH_RUNTIME_DIR
 
 日志约束: 烧录过程优先在当前 Shell 实时显示，同时保存文件用于追溯；
           不使用仅写文件、完成后再读取的日志方式。
@@ -99,14 +141,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-while getopts "i:p:n:b:B:sath" opt; do
+while getopts "i:p:n:b:B:ath" opt; do
   case "$opt" in
     i) IMAGE=$OPTARG ;;
     p) PORT=$OPTARG ;;
     n) PORTNUM=$OPTARG; PORTNUM_SET=1 ;;
     b) BAUD=$OPTARG ;;
     B) CONSOLE_BAUD=$OPTARG ;;
-    s) SKIP_SIZE_CHECK=1 ;;
     a) ATTACH_SERIAL=1 ;;
     t) TEST_ONLY=1 ;;
     h) trap - EXIT INT TERM HUP; usage; exit 0 ;;
@@ -141,26 +182,34 @@ if [ "$TEST_ONLY" -eq 0 ]; then
   SIZE=$(stat -c%s -- "$IMAGE") || die "无法读取镜像大小"
   SHA=$(sha256sum -- "$IMAGE" | cut -d' ' -f1) || die "无法计算镜像 SHA256"
   XFER_SECS=$(( (SIZE * 10 + BAUD - 1) / BAUD ))
-  OVERALL_TIMEOUT=$(( XFER_SECS * 2 + 60 ))
+
+  # 握手预算单独算进来，不要让它和擦写预算互相挤。
+  #
+  # 原来的 XFER*2+60 只描述擦写：XFER 随波特率变小，而擦除（实测 ~10s）和每块
+  # 命令应答的开销（实测写入 56.5s 对理论线时 28.5s，两倍）都不随波特率缩小。
+  # -b 2000000 时它算出 118s，而握手在慢路径上本身就要几十秒 —— 那笔时间以前是
+  # 从擦写预算里偷的，一慢就被 timeout 掐在写入中途，把板子留成半砖。
+  HANDSHAKE_BUDGET=$(( (REBOOT_TRIES + 1) * REBOOT_WINDOW ))
+  OVERALL_TIMEOUT=$(( XFER_SECS * 2 + 60 + HANDSHAKE_BUDGET ))
 
   echo "=== 待烧录镜像 ==="
   echo "  路径   : $IMAGE"
   echo "  字节数 : $SIZE"
   echo "  SHA256 : $SHA"
   echo "  串口   : $PORT（bk_loader 端口 $PORTNUM）"
-  echo "  烧录   : ${BAUD} baud，传输约 ${XFER_SECS}s，超时 ${OVERALL_TIMEOUT}s"
+  echo "  烧录   : ${BAUD} baud，传输约 ${XFER_SECS}s"
+  echo "  超时   : ${OVERALL_TIMEOUT}s（擦写 $(( XFER_SECS * 2 + 60 ))s + 握手 ${HANDSHAKE_BUDGET}s）"
   echo "  控制台 : ${CONSOLE_BAUD} baud"
 
-  if [ "$SKIP_SIZE_CHECK" -eq 0 ] && [ "$(basename -- "$IMAGE")" = "all-app.bin" ]; then
-    [ "$SIZE" -eq "$EXPECTED_SIZE" ] \
-      || die "all-app.bin 应为 $EXPECTED_SIZE 字节，实际 $SIZE；用 -s 可跳过检查"
-    echo "  字节数校验通过"
-  fi
+  # 不校验 all-app.bin 的字节数。分区布局变过几次，写死的期望值只会拦下正常
+  # 镜像 —— 对一个只为发现"打包没跑完"的检查来说，这是最糟的失效方式。
+  # 字节数和 SHA256 照旧打印，需要确认烧的是刚编的就比对 SHA256。
 else
-  OVERALL_TIMEOUT=40
+  HANDSHAKE_BUDGET=$(( (REBOOT_TRIES + 1) * REBOOT_WINDOW ))
+  OVERALL_TIMEOUT=$(( HANDSHAKE_BUDGET + 20 ))
   echo "=== 只测试握手，不写 flash ==="
   echo "  串口   : $PORT（bk_loader 端口 $PORTNUM）"
-  echo "  烧录   : ${BAUD} baud"
+  echo "  烧录   : ${BAUD} baud，超时 ${OVERALL_TIMEOUT}s"
   echo "  控制台 : ${CONSOLE_BAUD} baud"
 fi
 
@@ -229,50 +278,69 @@ if [ "$GETTING_BUS" -eq 0 ]; then
     die "bk_loader 在进入握手循环前退出（退出码 $RC，日志: $LOG）"
   fi
 else
-  echo "  bk_loader 已进入握手循环，开始发送软复位"
+  echo "  bk_loader 已进入握手循环，等 ${SETTLE_AFTER_GETTING_BUS}s 再发软复位"
+  sleep "$SETTLE_AFTER_GETTING_BUS"
 fi
 
 GOT_BUS=0
 
-# Both current shells accept reboot.  The AP implementation resets the whole
-# chip directly through the AON watchdog, so try the current owner first and
-# avoid the asynchronous AP-to-CP console hand-off when it is unnecessary.
-printf '\r\nreboot\r\n' > "$PORT" 2>/dev/null || true
-echo "  已向当前控制台发送直接软复位"
-for _ in $(seq 1 15); do
-  if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
-  kill -0 "$LOADER_PID" 2>/dev/null || break
-  sleep 0.1
-done
+# 总线一旦被 bk_loader 拿到，往这个串口再写任何一个字节都会破坏下载协议。
+# 所以每一次写入之前都紧贴一次判定，没有例外 —— 包括下面那条直接软复位。
+#
+# 曾经的写法是：检测到 Getting Bus 就无条件写一次 reboot。板子只要本来就停在
+# bootrom（任何一次失败的烧录都会把它留在那儿），bk_loader 0.2s 就拿到总线，
+# 那 10 个字节就直接落进了正在进行的下载。实测那一次：擦除 13.2s 时 bk_loader
+# 自己发 do_reset_signal 重新握手，整轮报废。
+bus_taken() {
+  grep -aq "Gotten Bus" "$LOG"
+}
+
+# 观察窗：看到 Gotten Bus 立刻退出；bk_loader 死了也退出。
+# 返回 0 表示拿到总线。
+wait_for_bus() {
+  local deadline=$(( $1 * 10 ))
+  local _
+
+  for _ in $(seq 1 "$deadline"); do
+    if bus_taken; then GOT_BUS=1; return 0; fi
+    kill -0 "$LOADER_PID" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
+if bus_taken; then
+  GOT_BUS=1
+  echo "  bk_loader 已经拿到总线（板子本来就停在 bootrom），不发任何软复位"
+else
+  # 两个 shell 都认 reboot。AP 的实现直接捅 AON 看门狗，立刻复位，所以先试当前
+  # 归属者，省掉 AP→CP 那次异步交接。
+  printf '\r\nreboot\r\n' > "$PORT" 2>/dev/null || true
+  echo "  已向当前控制台发送直接软复位，观察 ${REBOOT_WINDOW}s"
+  wait_for_bus "$REBOOT_WINDOW" || true
+fi
 
 for i in $(seq 1 "$REBOOT_TRIES"); do
   [ "$GOT_BUS" -eq 0 ] || break
-  if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
+  if bus_taken; then GOT_BUS=1; break; fi
   kill -0 "$LOADER_PID" 2>/dev/null || break
 
-  # Fallback for an unresponsive AP shell.  The CP consumes Ctrl-] '.' locally,
-  # but owner switching runs asynchronously in its shell task.  Wait for that
-  # transition before sending reboot; the previous 50 ms delay could race the
-  # bridge and lose or misroute the command.
+  # AP shell 不响应时的回退路径：先逃逸回 CP shell，再发 reboot。
+  # 每个 printf 前面都有一次 bus_taken 判定，因为这一串要花 0.5s，总线完全可能
+  # 在中途被拿到 —— 之前正是在这半秒里把字节写进了刚起来的 bootrom。
   printf '\035' > "$PORT" 2>/dev/null || true
-  sleep 0.05
+  sleep "$CMD_GAP"
+  if bus_taken; then GOT_BUS=1; break; fi
   printf '.' > "$PORT" 2>/dev/null || true
-  sleep 0.3
+  sleep "$BRIDGE_SETTLE"
+  if bus_taken; then GOT_BUS=1; break; fi
   printf '\r\nreboot\r\n' > "$PORT" 2>/dev/null || true
-  echo "  第 $i 次 CP 回退软复位已发出"
+  echo "  第 $i 次 CP 回退软复位已发出，观察 ${REBOOT_WINDOW}s"
 
-  # CP's own `reboot` takes the NMI/interrupt-watchdog path, measured at
-  # ~8.37s before the part actually resets (see
-  # board/beken/chips/bk7258/bk7258_reset.c for the measurement writeup).
-  # A 1s observation window was too short to ever see that path complete
-  # before sending another reboot; 5s gives it room to land within a
-  # couple of rounds instead of only via many short, overlapping retries.
-  for _ in $(seq 1 50); do
-    if grep -aq "Gotten Bus" "$LOG"; then GOT_BUS=1; break; fi
-    kill -0 "$LOADER_PID" 2>/dev/null || break
-    sleep 0.1
-  done
-  [ "$GOT_BUS" -eq 0 ] || break
+  wait_for_bus "$REBOOT_WINDOW" && break
+
+  JITTER_MS=$(( RANDOM % REBOOT_JITTER_MS + 1 ))
+  sleep "0.$(printf '%03d' "$JITTER_MS")"
 done
 
 if [ "$GOT_BUS" -eq 1 ]; then

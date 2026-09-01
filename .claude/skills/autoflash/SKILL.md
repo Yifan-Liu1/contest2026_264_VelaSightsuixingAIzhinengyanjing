@@ -19,26 +19,19 @@ sg dialout -c "./autoflash.sh -t"                 # 只测握手，不写 flash
 
 需要 `sg dialout`（串口属 dialout 组）。
 
-## 第一次用：先改一行
+## 实现只有一份，在仓库根目录
 
-脚本顶部有一行工作区根目录，**换机器必须改**：
+`<repo>/autoflash.sh` 是唯一的实现。`.claude/skills/autoflash/autoflash.sh` 只是转发过去的壳子 —— 这里以前放着第二份实现，两份在时序处理上分叉到行为和日志格式都不一样，排查时先得发现"跑的不是这一份"，所以合并了。
 
-```bash
-# ############################################################################
-# 改这一行：你的工作区根目录（里面应有 tools/ 和 bk_avdk_smp/）
-# ############################################################################
-ROOT=/home/mi/vela_competition_ap_console_dev
-```
-
-它派生出两个路径 —— `$ROOT/tools/bk_loader`（烧录器）和 `$ROOT/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin`（默认镜像）。
-
-不想改文件就用环境变量：
+不用改任何路径：脚本从自身位置往上走，找到含 `bk_loader` 的目录当作工作区根，再由它派生默认镜像 `bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin`。要覆盖就用环境变量：
 
 ```bash
-VELA_WS=/your/workspace ./autoflash.sh -a
+VELA_ROOT=/your/workspace ./autoflash.sh -a       # 工作区根
+BK_LOADER=/path/to/bk_loader ./autoflash.sh       # 直接指定烧录器
+AUTOFLASH_RUNTIME_DIR=/tmp/flashlogs ./autoflash.sh   # 运行日志目录
 ```
 
-ROOT 不对时报错会带上当前值和该改哪里，不会只丢一句"文件不存在"。
+日志实时打在当前 Shell，同时留档到 `<repo>/logs/runtime/autoflash-<时间戳>.log`。
 
 ## 参数
 
@@ -46,25 +39,36 @@ ROOT 不对时报错会带上当前值和该改哪里，不会只丢一句"文�
 |---|---|
 `-i <file>` | 要烧的镜像，默认 `bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin` |
 `-p <port>` | 串口设备，默认 `/dev/ttyUSB0` |
-`-n <num>` | `bk_loader` 的端口号，默认 `0` |
+`-n <num>` | `bk_loader` 的端口号，默认从 `ttyUSB<num>` 自动推导 |
 `-b <baud>` | **烧录**波特率，默认 `115200`。只影响下载速度 |
 `-B <baud>` | **控制台**波特率，默认 `115200`。固件编译期定死，一般别动 |
-`-s` | 跳过 `all-app.bin` 字节数校验 |
-`-a` | 烧完自动挂 `screen` 看日志 |
+`-a` | 烧完自动用 `picocom` 连上串口（`Ctrl-A Ctrl-X` 退出）|
 `-t` | 只测握手，用 `read` 代替 `download`，不碰 flash |
 `-h` | 显示帮助 |
 
-环境变量 `VELA_WS=/path/to/workspace` 可覆盖脚本里写的 `ROOT`。
-
 ## 它替你做的五件事
 
-1. **释放串口** — 自动关掉 detached 的 `screen` 会话和残留 `cat`。这是最高频的失败原因
-2. **烧前校验** — 打印 SHA256；当前 `2992K` AP 分区产品包必须为
-   `4,526,080` 字节，打包不完整直接拒绝。分区变化后用
-   `AUTOFLASH_EXPECTED_SIZE` 更新校验值。
-3. **软复位** — 最多 8 次，每次先发 AP 控制台逃逸序列再发 `reboot`
-4. **实时进度条** — 擦除和写入两条进度条照常滚动
+1. **检查串口** — 占用者是 `cat` / `picocom` / `minicom` / `screen` 就自动关掉。这是最高频的失败原因
+2. **烧前信息** — 打印字节数和 SHA256，但**不断言**字节数。分区大小变过几次，
+   写死的期望值只会拦下正常镜像。要确认烧的是刚编的，比对 SHA256 或用下面
+   「完整流程」里的 `cmp`。
+3. **软复位** — 先向当前控制台发一次 `reboot`，不行再最多 3 次「逃逸回 CP shell
+   再 `reboot`」；每次写串口之前都重新判定一次总线是否已被拿到，看到
+   `Getting Bus` 后先等 0.1s，命令之间隔 0.2s，重试之间等 10s 加 1~100ms 抖动
+4. **实时进度条** — 擦除和写入两条进度条照常滚动，同时留档到 `logs/runtime/`
 5. **恢复串口速率** — 高速烧录后把串口拨回控制台波特率
+
+### 为什么写串口之前必须重新判定
+
+总线一旦被 `bk_loader` 拿到，往串口再写任何字节都会插进下载协议。老版本在检测到
+`Getting Bus` 后**无条件**写一次 `reboot`，而板子只要本来就停在 bootrom（任何一次
+失败的烧录都会把它留在那儿），`bk_loader` 0.2s 就拿到总线，那 10 个字节就落进了
+正在进行的下载。
+
+判定也不是万能的：日志里的 `Gotten Bus` 是既成事实，握手进行中的那 0.2s 里查到的
+仍然是"没拿到"。所以除了逐次判定，次数也从 8 降到 3 —— 每一次额外写入都是一次
+把字节插进 bootrom 的机会，而两种失效并不对等：拿不到总线只是提示手按 RST，板子
+完好；写坏链路则可能擦除完成后写到中途掉链，板子半砖必须重烧。
 
 ## 波特率：两个独立的概念
 
@@ -123,7 +127,11 @@ sg dialout -c "stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb raw -echo -crtsct
 
 **转义序列后必须加换行** — CP shell 按行解析。`\x1d` `.` `reboot\r\n` 三次分开写但中间没换行，会被拼成 `.reboot` 这个不存在的命令，板子根本不重启。加 `\r\n` 把那行冲掉才行。
 
-**拿到总线后立刻停止写入** — 每 100 ms 轮询日志里的 `Gotten Bus`，一出现就停。之后再往端口写任何字节都会破坏下载协议。
+**拿到总线后立刻停止写入** — 每 100 ms 轮询日志里的 `Gotten Bus`，一出现就停，并且每次写串口之前再单独判定一次。之后再往端口写任何字节都会破坏下载协议。
+
+**`bk_loader` 的 LinkCheck 节奏是 `t=0`、`t≈1.13s`，之后每 ~15s 一次** — 2026-09-01 实测。配上 bootrom 只应答约 473ms，意味着复位必须落在某次 LinkCheck 上，错过就要再等十几秒。所以第一条 `reboot` 要尽早写出去：在这里加过 1s 的延迟，复位就落在两次 LinkCheck 之间，整轮拿不到总线。
+
+**别照抄 8.26s 那个复位延迟** — `bk7258_reset.c` 头部记的是 2026-08-14 CP 走 NMI + 中断看门狗的测量值。本机 2026-09-01 实测握手是 0.24s ~ 2.8s 量级，当前固件上这条 `reboot` 走的不是那条 8s 的路。
 
 ## 完整流程（改了代码之后）
 
@@ -142,7 +150,7 @@ cd bk_avdk_smp
 sg docker -c "./dbuild.sh make -C projects/app_ab bk7258 SDK_DIR=/armino EXTERNAL_AP_BIN=/armino/build/openvela-ap.bin"
 
 # 3. 烧录
-sg dialout -c "<repo>/.claude/skills/autoflash/autoflash.sh -b 1500000 -a"
+sg dialout -c "<repo>/autoflash.sh -b 2000000 -a"
 ```
 
 打包后建议核对三处，确认烧的是刚编的：
@@ -150,7 +158,7 @@ sg dialout -c "<repo>/.claude/skills/autoflash/autoflash.sh -b 1500000 -a"
 ```bash
 cmp contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin bk_avdk_smp/build/openvela-ap.bin
 cmp contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
-stat -c%s bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin   # 当前必须 4526080
+stat -c%s bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin   # 只记录大小，脚本不再断言
 ```
 
 ## 板上两个 shell
