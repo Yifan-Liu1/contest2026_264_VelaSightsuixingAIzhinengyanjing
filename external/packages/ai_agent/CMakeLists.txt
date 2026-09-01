@@ -209,6 +209,11 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
       ${AGENT_INCDIRS}
     DEPENDS
       mqttc
+      # Pulls in the Helix decoder that volc_tts_ws.c uses to turn the
+      # service's MP3 back into the PCM its callback contract promises.
+      # DEPENDS goes through target_link_libraries, so this also brings
+      # libhelix-mp3/pub onto the include path.
+      libhelix-mp3
     STACKSIZE
       ${CONFIG_EXAMPLES_AI_AGENT_VELA_STACKSIZE}
     PRIORITY

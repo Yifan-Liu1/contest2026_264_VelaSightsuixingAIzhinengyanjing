@@ -21,10 +21,37 @@
  * Flow:
  *   1. TLS connect + HTTP Upgrade to WebSocket
  *   2. Send full_client_request (JSON: app/user/audio/request)
- *   3. Receive audio_only_server_response frames (raw PCM)
+ *   3. Receive audio_only_server_response frames (MP3, decoded here to PCM)
  *   4. Last frame has sequence < 0
  *
  * Binary frame format: see volc_asr.c header comment.
+ *
+ * Why MP3 on the wire and PCM at the callback:
+ *
+ * The callback contract is PCM at AGENT_TTS_WS_SAMPLE_RATE, and it stays that
+ * way -- the module that picks the wire format is the module that undoes it,
+ * so nothing above this file knows the difference.  What changed is the wire
+ * format, because the byte count is what the receive path could not absorb.
+ * Measured against this service for one eleven-second reply:
+ *
+ *   pcm       371564 bytes   256 kb/s    6.1x the board's whole IOB pool
+ *   ogg_opus  373692 bytes   261 kb/s    no better -- see below
+ *   mp3        47088 bytes    32 kb/s    0.78x the pool
+ *
+ * ogg_opus is genuinely Opus (valid OggS pages, OpusHead, one logical stream)
+ * and still useless here: every packet decodes as CELT-only wideband 20 ms at
+ * about 642 bytes, roughly 257 kb/s, and the `bitrate` field is documented as
+ * MP3-only and measurably ignored for Opus.  So Opus offers no way down.
+ *
+ * MP3 at 32 kb/s also takes the WebSocket frames from 16396 bytes to about
+ * 2000, which matters twice over: a 16396-byte frame needs eleven of the
+ * board's 1514-byte network buffers before any of it can be decrypted, and it
+ * exceeds MBEDTLS_SSL_IN_CONTENT_LEN so it always spanned two TLS records.
+ *
+ * The service honours rate=16000 for MP3 -- checked on the wire, all 327
+ * frames of a reply reported MPEG2 Layer III, 16000 Hz, 32 kb/s, mono -- which
+ * matters because this board's DAC cannot clock 24 kHz and there is no
+ * resampler anywhere on the playback path.
  */
 
 #include "infra/config_store.h"
@@ -34,6 +61,7 @@
 #include "voice/volc_tts.h"
 
 #include "cJSON.h"
+#include "mp3dec.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/net_sockets.h"
@@ -60,6 +88,17 @@ static const char* TAG = "volc_tts_ws";
 #define VOLC_SER_JSON 0x10
 #define VOLC_SER_JSON_GZ 0x11 /* JSON + gzip */
 #define VOLC_SER_RAW 0x00
+
+/* Bitrate asked of the service, in kb/s.
+ *
+ * 32 kb/s is an eight-fold cut against 16 kHz PCM and holds a whole reply
+ * inside the board's 60560-byte network buffer pool with room to spare.  Raise
+ * it to 40 or 48 if the voice sounds too rough; both still cut the byte volume
+ * by more than five times.  Anything the service does not offer for MP3 is
+ * refused outright rather than rounded, so keep to its documented ladder.
+ */
+
+#define TTS_MP3_KBPS 32
 
 /* WebSocket constants */
 #define WS_BUF_SIZE (32 * 1024)
@@ -583,7 +622,7 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
     cJSON* audio = cJSON_AddObjectToObject(root, "audio");
 
     cJSON_AddStringToObject(audio, "voice_type", s_speaker);
-    cJSON_AddStringToObject(audio, "encoding", "pcm");
+    cJSON_AddStringToObject(audio, "encoding", "mp3");
 
     /* The ws_binary protocol names the receive sample rate "rate"; a
      * "sample_rate" key is silently ignored, leaving the service's own
@@ -591,6 +630,13 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
      * asks for -- which defeats the point of AGENT_TTS_WS_SAMPLE_RATE.
      */
     cJSON_AddNumberToObject(audio, "rate", AGENT_TTS_WS_SAMPLE_RATE);
+
+    /* Only meaningful for MP3, which is the point: the service ignores this
+     * field for pcm and for ogg_opus, and its MP3 default is 160 kb/s -- five
+     * times what a 16 kHz mono voice needs and only a 1.6x saving over PCM,
+     * which would not have been worth decoding for.
+     */
+    cJSON_AddNumberToObject(audio, "bitrate", TTS_MP3_KBPS);
     cJSON_AddNumberToObject(audio, "speed_ratio", 1.0);
 
     /* request */
@@ -618,14 +664,258 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
     return ret;
 }
 
+/* ── MP3 decode ──────────────────────────────────────────────── */
+
+/* Bytes carried between WebSocket frames.
+ *
+ * One MP3 frame at 32 kb/s and 16 kHz is 144 bytes plus an occasional padding
+ * byte (576 samples / 8 * 32000 / 16000) and the service packs about fourteen
+ * of them into each WebSocket frame, so frames straddle WebSocket boundaries
+ * in both directions and cannot be decoded a WebSocket frame at a time.
+ *
+ * This does not have to hold a whole WebSocket frame: tts_mp3_feed() pushes the
+ * payload through in reservoir-sized bites and drains between them.  It only
+ * has to be comfortably larger than one MP3 frame, and MAINBUF_SIZE is Helix's
+ * own ceiling for the data of a single frame.
+ */
+
+#define TTS_MP3_RESERVOIR (4 * MAINBUF_SIZE)
+
+/* Helix may write two granules of 576 samples for each of two channels.  This
+ * reply is mono MPEG-2 so only 576 are ever used, but the decoder is entitled
+ * to the whole buffer and sizing it any smaller would be a latent overflow.
+ */
+
+#define TTS_MP3_PCM_SAMPLES (MAX_NSAMP * MAX_NGRAN * MAX_NCHAN)
+
+typedef struct {
+    HMP3Decoder dec;
+    unsigned char* in;
+    size_t in_len;
+    short* pcm;
+    int frames;
+    int resyncs;
+    bool reported;
+} tts_mp3_t;
+
+static void tts_mp3_close(tts_mp3_t* m)
+{
+    if (m->dec != NULL) {
+        MP3FreeDecoder(m->dec);
+        m->dec = NULL;
+    }
+
+    free(m->in);
+    m->in = NULL;
+    free(m->pcm);
+    m->pcm = NULL;
+}
+
+static int tts_mp3_open(tts_mp3_t* m)
+{
+    memset(m, 0, sizeof(*m));
+
+    m->in = malloc(TTS_MP3_RESERVOIR);
+    m->pcm = malloc(TTS_MP3_PCM_SAMPLES * sizeof(short));
+
+    /* Helix allocates its own state in eight pieces totalling 23816 bytes.
+     * That does not fit the SRAM heap on this board -- about 18 KB is free once
+     * the Wi-Fi stack and this application are linked -- so those allocations
+     * land in the PSRAM region that bk7258_psram.c hands to the system heap.
+     * Nothing here has to arrange that, but it is why this works at all, and
+     * why the decoder is slower than its cycle count suggests: that region is
+     * not cacheable.  There is a wide margin -- decoding 16 kHz mono costs a
+     * few tens of MHz against a 480 MHz core, and playback only needs to be
+     * kept fed at 1x.
+     */
+
+    m->dec = MP3InitDecoder();
+
+    if (m->in == NULL || m->pcm == NULL || m->dec == NULL) {
+        tts_mp3_close(m);
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+/* Decode every whole frame the reservoir now holds, handing each to the
+ * callback as PCM.  Returns the PCM bytes delivered.
+ *
+ * The three failure returns from MP3Decode() need three different responses,
+ * and they are not interchangeable:
+ *
+ *   ERR_MP3_INDATA_UNDERFLOW    The header parsed but the frame body has not
+ *                               all arrived.  MP3Decode() has already advanced
+ *                               the caller's pointer past the header and side
+ *                               info by this point, so its idea of where we are
+ *                               must be discarded and the reservoir rewound to
+ *                               the sync word from our own bookkeeping.
+ *
+ *   ERR_MP3_MAINDATA_UNDERFLOW  The frame was consumed into the bit reservoir
+ *                               but there was not enough history to decode it,
+ *                               which is normal for the first frame or two of a
+ *                               stream.  The bytes are gone: feeding them again
+ *                               would double-insert into the reservoir.  So this
+ *                               advances like a success, just without output.
+ *
+ *   anything else               Malformed.  One frame is 36 ms of speech, so
+ *                               step over the header and resynchronise rather
+ *                               than abandoning a reply the user is already
+ *                               listening to.
+ */
+
+static size_t tts_mp3_drain(tts_mp3_t* m, volc_tts_chunk_cb cb,
+    void* user_data)
+{
+    size_t delivered = 0;
+
+    for (;;) {
+        unsigned char* p = m->in;
+        int left = (int)m->in_len;
+        int off = MP3FindSyncWord(p, left);
+        int rc;
+
+        if (off < 0) {
+            /* Nothing frame-shaped in hand.  A sync word spans two bytes and
+             * can straddle the boundary, so keep a short tail rather than
+             * rescanning the same bytes on every arrival.
+             */
+
+            if (m->in_len > 3) {
+                memmove(m->in, m->in + m->in_len - 3, 3);
+                m->in_len = 3;
+            }
+
+            return delivered;
+        }
+
+        p += off;
+        left -= off;
+
+        rc = MP3Decode(m->dec, &p, &left, m->pcm, 0);
+
+        if (rc == ERR_MP3_INDATA_UNDERFLOW) {
+            if (off > 0) {
+                m->in_len -= (size_t)off;
+                memmove(m->in, m->in + off, m->in_len);
+            }
+
+            return delivered;
+        }
+
+        if (rc != ERR_MP3_NONE && rc != ERR_MP3_MAINDATA_UNDERFLOW) {
+            size_t skip = (size_t)off + 1;
+
+            m->resyncs++;
+            m->in_len -= skip;
+            memmove(m->in, m->in + skip, m->in_len);
+            continue;
+        }
+
+        /* Both remaining cases consumed the frame, so commit what MP3Decode
+         * reports rather than recomputing the frame length here.
+         */
+
+        m->in_len = left > 0 ? (size_t)left : 0;
+        memmove(m->in, p, m->in_len);
+
+        if (rc == ERR_MP3_MAINDATA_UNDERFLOW) {
+            continue;
+        }
+
+        {
+            MP3FrameInfo info;
+
+            MP3GetLastFrameInfo(m->dec, &info);
+
+            if (!m->reported) {
+                m->reported = true;
+
+                /* Reported once, and loudly if it is wrong, because there is no
+                 * resampler on the playback path and the DAC was configured
+                 * before the first frame arrived.  A mismatch would come out as
+                 * speech at the wrong speed, which is far harder to attribute
+                 * after the fact than a line saying so here.
+                 */
+
+                if (info.samprate != AGENT_TTS_WS_SAMPLE_RATE
+                    || info.nChans != 1) {
+                    syslog(LOG_ERR,
+                        "[%s] mp3 is %d Hz %d channel(s), expected %d Hz mono; "
+                        "playback rate will be wrong\n",
+                        TAG, info.samprate, info.nChans,
+                        AGENT_TTS_WS_SAMPLE_RATE);
+                } else {
+                    syslog(LOG_INFO,
+                        "[%s] mp3 %d Hz mono %d kb/s, %d sample(s) per frame\n",
+                        TAG, info.samprate, info.bitrate / 1000,
+                        info.outputSamps);
+                }
+            }
+
+            if (info.outputSamps > 0) {
+                size_t bytes = (size_t)info.outputSamps * sizeof(short);
+
+                cb((const unsigned char*)m->pcm, bytes, 0, user_data);
+                m->frames++;
+                delivered += bytes;
+            }
+        }
+    }
+}
+
+/* Push one WebSocket payload through the decoder, in bites the reservoir can
+ * hold, draining between them.  Returns the PCM bytes delivered.
+ */
+
+static size_t tts_mp3_feed(tts_mp3_t* m, const unsigned char* data, size_t len,
+    volc_tts_chunk_cb cb, void* user_data)
+{
+    size_t delivered = 0;
+
+    while (len > 0) {
+        size_t room = TTS_MP3_RESERVOIR - m->in_len;
+        size_t take = len < room ? len : room;
+
+        memcpy(m->in + m->in_len, data, take);
+        m->in_len += take;
+        data += take;
+        len -= take;
+
+        delivered += tts_mp3_drain(m, cb, user_data);
+
+        /* A full reservoir that decoded nothing cannot make progress, so drop
+         * all but a sync-word tail.  With a reservoir four times Helix's
+         * single-frame ceiling this is unreachable for well-formed audio; it is
+         * here so the loop is provably finite rather than as a expected path.
+         */
+
+        if (m->in_len == TTS_MP3_RESERVOIR) {
+            m->resyncs++;
+            memmove(m->in, m->in + m->in_len - 3, 3);
+            m->in_len = 3;
+        }
+    }
+
+    return delivered;
+}
+
 /* ── Receive audio responses ─────────────────────────────────── */
 
 static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
     void* user_data, volc_tts_cancel_cb cancel, void* cancel_data)
 {
     unsigned char* buf = malloc(WS_BUF_SIZE);
+    tts_mp3_t mp3;
 
     if (!buf) {
+        return -ENOMEM;
+    }
+
+    if (tts_mp3_open(&mp3) != 0) {
+        syslog(LOG_ERR, "[%s] no memory for the mp3 decoder\n", TAG);
+        free(buf);
         return -ENOMEM;
     }
 
@@ -673,7 +963,14 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
      * counts and the last sequence number are reported once at the end.
      */
 
+    /* audio_bytes counts decoded PCM, because that is what the duration in the
+     * summary is derived from.  wire_bytes counts what actually crossed the
+     * socket, which is the number this change exists to shrink -- reporting
+     * both is what makes the ratio visible in the log.
+     */
+
     size_t audio_bytes = 0;
+    size_t wire_bytes = 0;
     int32_t last_seq = 0;
     int pings = 0;
     int frontend = 0;
@@ -825,7 +1122,7 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
                 (uint32_t)buf[volc_hdr_len + 3]);
 
             if (flen <= audio_off) {
-                /* No PCM payload.  A negative sequence is the normal
+                /* No audio payload.  A negative sequence is the normal
                  * terminator; anything else is a genuinely short frame. */
                 if (seq < 0) {
                     last_seq = seq;
@@ -838,12 +1135,19 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
                 continue;
             }
 
-            unsigned char* pcm = buf + audio_off;
-            size_t pcm_len = flen - audio_off;
+            /* MP3, not PCM.  The callback still receives PCM: the decoder
+             * below turns each WebSocket payload into as many 576-sample
+             * frames as it holds and calls cb() once per frame, so what
+             * arrives here in one piece leaves in about fourteen.
+             */
 
-            cb(pcm, pcm_len, 0, user_data);
+            unsigned char* mp3_data = buf + audio_off;
+            size_t mp3_len = flen - audio_off;
+
+            wire_bytes += mp3_len;
+            audio_bytes += tts_mp3_feed(&mp3, mp3_data, mp3_len, cb,
+                user_data);
             chunks++;
-            audio_bytes += pcm_len;
             last_seq = seq;
             last_flags = msg_flags;
 
@@ -880,25 +1184,39 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
      * the screen say "系统操作失败" about a reply the user had just listened
      * to.  Report the truncation and let the round stand. */
 
-    if (chunks > 0 && err != 0) {
-        syslog(LOG_WARNING, "[%s] audio truncated after %d chunk(s): %d\n",
-            TAG, chunks, err);
+    if (mp3.frames > 0 && err != 0) {
+        syslog(LOG_WARNING, "[%s] audio truncated after %d frame(s): %d\n",
+            TAG, mp3.frames, err);
         err = 0;
     }
 
-    if (chunks > 0) {
+    if (mp3.frames > 0) {
         cb(NULL, 0, 1, user_data);
     }
 
     syslog(LOG_INFO,
-        "[%s] %s: %d chunk(s) %zu byte(s) (%lu ms audio), last seq %ld "
-        "flags %d, %d ping(s) %d ack(s) %d frontend %d skipped\n",
-        TAG, ended, chunks, audio_bytes,
+        "[%s] %s: %d chunk(s) %zu mp3 byte(s) -> %d frame(s) %zu pcm byte(s) "
+        "(%lu ms audio), last seq %ld flags %d, %d ping(s) %d ack(s) "
+        "%d frontend %d skipped %d resync(s)\n",
+        TAG, ended, chunks, wire_bytes, mp3.frames, audio_bytes,
         (unsigned long)(audio_bytes * 1000u
             / (AGENT_TTS_WS_SAMPLE_RATE * 2u)),
-        (long)last_seq, last_flags, pings, acks, frontend, skipped);
+        (long)last_seq, last_flags, pings, acks, frontend, skipped,
+        mp3.resyncs);
 
-    if (chunks == 0 && err == 0) {
+    /* Held open until here so the reservoir could deliver whatever the last
+     * WebSocket frame completed, and so the counters above are the decoder's
+     * own rather than a copy that could drift from them.
+     */
+
+    tts_mp3_close(&mp3);
+
+    /* Chunks without frames means the transport worked and the decode did not,
+     * which is a different fault from silence on the wire and must not be
+     * reported as success: the caller would treat a mute round as spoken.
+     */
+
+    if (mp3.frames == 0 && err == 0) {
         return -EPROTO;
     }
 

@@ -135,6 +135,13 @@ CONFIG_IOB_BUFSIZE=1514
 CONFIG_IOB_NBUFFERS=40
 CONFIG_LIBC_LOCALTIME=y
 CONFIG_LIBYUV=y
+# Fixed-point MP3 decoder, for TTS audio arriving as 32 kb/s MP3 rather than
+# 16 kHz PCM.  The service charges 256 kb/s for PCM and 261 kb/s for ogg_opus
+# (measured: it encodes Opus CELT-only at ~257 kb/s and ignores the bitrate
+# field for it), against 32 kb/s for MP3 -- an eight-fold cut in the bytes the
+# receive path has to absorb, and it takes the WebSocket frames down from
+# 16396 bytes to about 2000 at the same time.
+CONFIG_LIB_HELIX_MP3=y
 CONFIG_LIB_OPUS=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_KVDB_TOOL=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_AGENT_CAMERA=y
