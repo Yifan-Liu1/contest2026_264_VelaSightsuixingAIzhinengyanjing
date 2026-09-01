@@ -72,6 +72,26 @@
 #  define CONFIG_VS_SOCIAL_IMAGE_HEIGHT 480
 #endif
 
+#ifndef CONFIG_VS_SOCIAL_CAPTURE_FPS
+#  define CONFIG_VS_SOCIAL_CAPTURE_FPS 5
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_STACKSIZE_SESSION
+#  define CONFIG_VS_SOCIAL_STACKSIZE_SESSION 16384
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_STACKSIZE_AUDIO
+#  define CONFIG_VS_SOCIAL_STACKSIZE_AUDIO 32768
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_STACKSIZE_UPLOAD
+#  define CONFIG_VS_SOCIAL_STACKSIZE_UPLOAD 16384
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_STACKSIZE_CAPTURE
+#  define CONFIG_VS_SOCIAL_STACKSIZE_CAPTURE 8192
+#endif
+
 #ifndef CONFIG_VS_SOCIAL_AUDIO_CHUNK_MS
 #  define CONFIG_VS_SOCIAL_AUDIO_CHUNK_MS 2000
 #endif
@@ -104,9 +124,7 @@
 #  define CONFIG_VS_SOCIAL_INFLIGHT_MAX 16
 #endif
 
-#ifndef CONFIG_VS_SOCIAL_STACKSIZE
-#  define CONFIG_VS_SOCIAL_STACKSIZE 8192
-#endif
+
 
 #define SOCIAL_TAG "vs_social"
 
@@ -193,6 +211,17 @@ struct social_inflight_s
   bool audio_seen;
 };
 
+/* What social_poll_once() needs to do its work, gathered so it can live
+ * somewhere other than that function's stack.  See social_state_s::poll.
+ */
+
+struct social_poll_scratch_s
+{
+  const char *ids[VS_CLOUD_POLL_MAX_IDS];
+  char id_store[VS_CLOUD_POLL_MAX_IDS][VS_CLOUD_MSG_ID_MAX];
+  struct vs_social_event_s events[VS_CLOUD_POLL_MAX_IDS * 2];
+};
+
 struct social_state_s
 {
   pthread_mutex_t lock;
@@ -246,6 +275,28 @@ struct social_state_s
 
   struct vs_media_stream_s *camera;
   struct vs_audio_cap_s    *mic;
+
+  /* social_poll_once()'s working set, off its stack.
+   *
+   * These three arrays are 12 KiB together, almost all of it the events one:
+   * VS_CLOUD_POLL_MAX_IDS is 16, each id can answer with both an image and an
+   * audio event so the array is twice that, and vs_social_event_s is 364 bytes
+   * because it carries msg_id, display_text, suggestion and log inline.
+   *
+   * As locals they were a 12 KiB frame on an 8 KiB thread stack, which the
+   * ARMv8-M stack limit caught as a UsageFault on the first call -- three
+   * milliseconds into every session, every time.  Enlarging the stack alone
+   * would have left a function whose frame is larger than most tasks' entire
+   * stacks, so they moved here instead, allocated once per session from PSRAM
+   * for the same reason the ogg encoder's state is.
+   *
+   * A single allocation shared by one caller is safe because there is one:
+   * social_poll_once() is called from social_session_worker() and from nowhere
+   * else, on that one thread.
+   */
+
+  struct social_poll_scratch_s *poll;
+  bool poll_psram;
 
   pthread_t session_thread;
   pthread_t capture_thread;
@@ -976,13 +1027,22 @@ static bool social_emotion_step(const struct vs_social_event_s *event,
 
 static void social_poll_once(void)
 {
-  const char *ids[VS_CLOUD_POLL_MAX_IDS];
-  char id_store[VS_CLOUD_POLL_MAX_IDS][VS_CLOUD_MSG_ID_MAX];
-  struct vs_social_event_s events[VS_CLOUD_POLL_MAX_IDS * 2];
+  struct social_poll_scratch_s *scratch = g_social.poll;
   size_t n = 0;
   size_t got = 0;
   size_t i;
   int ret;
+
+  /* Read once, without the lock, and only here.  The pointer is written by
+   * social_session_worker() before this thread reaches its polling loop and
+   * cleared after that loop has ended, so on this thread it cannot change
+   * across a call.
+   */
+
+  if (scratch == NULL)
+    {
+      return;
+    }
 
   /* Snapshot the identifiers under the lock, then release it: the GET blocks
    * for a round trip and the uploader has to keep making progress.
@@ -991,9 +1051,9 @@ static void social_poll_once(void)
   pthread_mutex_lock(&g_social.lock);
   for (i = 0; i < g_social.inflight_count && n < VS_CLOUD_POLL_MAX_IDS; i++)
     {
-      snprintf(id_store[n], sizeof(id_store[n]), "%s",
+      snprintf(scratch->id_store[n], sizeof(scratch->id_store[n]), "%s",
                g_social.inflight[i].msg_id);
-      ids[n] = id_store[n];
+      scratch->ids[n] = scratch->id_store[n];
       n++;
     }
   pthread_mutex_unlock(&g_social.lock);
@@ -1003,9 +1063,10 @@ static void social_poll_once(void)
       return;
     }
 
-  ret = vs_cloud_social_poll_event(g_social.session.session_id, ids, n,
-                                   events,
-                                   sizeof(events) / sizeof(events[0]), &got);
+  ret = vs_cloud_social_poll_event(g_social.session.session_id,
+                                   scratch->ids, n, scratch->events,
+                                   sizeof(scratch->events) /
+                                   sizeof(scratch->events[0]), &got);
   if (ret < 0)
     {
       /* Transport failures here are not fatal to the session: the data is
@@ -1020,7 +1081,7 @@ static void social_poll_once(void)
 
   for (i = 0; i < got; i++)
     {
-      struct vs_social_event_s *ev = &events[i];
+      struct vs_social_event_s *ev = &scratch->events[i];
       bool raise = false;
       bool clear = false;
       bool deliver_advice = false;
@@ -1219,13 +1280,31 @@ static void social_release_devices(void)
 {
   struct vs_media_stream_s *camera;
   struct vs_audio_cap_s *mic;
+  struct social_poll_scratch_s *poll;
+  bool poll_psram;
 
   pthread_mutex_lock(&g_social.lock);
   camera = g_social.camera;
   mic    = g_social.mic;
+  poll   = g_social.poll;
+  poll_psram = g_social.poll_psram;
   g_social.camera = NULL;
   g_social.mic    = NULL;
+
+  /* Cleared under the lock and before the free, so a poll that has already
+   * loaded the pointer cannot be joined by one that loads it after the memory
+   * is gone.  Only the session thread calls social_poll_once(), and it is the
+   * thread running this, so in practice there is no such race -- this keeps
+   * that from being a requirement of the code rather than of the comment.
+   */
+
+  g_social.poll = NULL;
   pthread_mutex_unlock(&g_social.lock);
+
+  if (poll != NULL)
+    {
+      social_free((unsigned char *)poll, poll_psram);
+    }
 
   if (camera != NULL)
     {
@@ -1432,14 +1511,22 @@ static void social_finalize_sequence(void)
  ****************************************************************************/
 
 static int social_spawn(pthread_t *thread, void *(*entry)(void *),
-                        const char *what)
+                        size_t stacksize, const char *what)
 {
   pthread_attr_t attr;
   struct sched_param param;
   int ret;
 
   pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, CONFIG_VS_SOCIAL_STACKSIZE);
+
+  /* Per thread, because one shared size cannot fit all four: the audio thread
+   * runs libopus with its working arrays on the stack, while the capture thread
+   * measures a 24-byte frame.  A single value big enough for the first is four
+   * times what the others will ever touch, and the value that used to be here
+   * was not big enough for either.
+   */
+
+  pthread_attr_setstacksize(&attr, stacksize);
 
   /* Above the UI, below the network stack, matching the layout vs_types.h
    * describes: these threads move media and must not be held off by a redraw.
@@ -1498,8 +1585,25 @@ static void *social_session_worker(void *arg)
    * something else and is therefore the likelier failure.
    */
 
+  /* The polling scratch, before the devices, because it is the cheapest thing
+   * to fail and the only one whose failure means the session could not report
+   * anything even if every device worked.
+   */
+
+  g_social.poll = (struct social_poll_scratch_s *)
+    social_alloc(sizeof(*g_social.poll), &g_social.poll_psram);
+  if (g_social.poll == NULL)
+    {
+      printf("%s: no memory for the %zu-byte poll scratch\n", SOCIAL_TAG,
+             sizeof(*g_social.poll));
+      social_post(VS_APP_EVENT_SOCIAL_START_FAILED, -ENOMEM, VS_EMOTION_NONE,
+                  0, "系统资源不足");
+      goto close_session;
+    }
+
   ret = vs_media_stream_open(&g_social.camera, CONFIG_VS_SOCIAL_IMAGE_WIDTH,
-                             CONFIG_VS_SOCIAL_IMAGE_HEIGHT);
+                             CONFIG_VS_SOCIAL_IMAGE_HEIGHT,
+                             CONFIG_VS_SOCIAL_CAPTURE_FPS);
   if (ret < 0)
     {
       printf("%s: camera unavailable: %d\n", SOCIAL_TAG, ret);
@@ -1527,7 +1631,7 @@ static void *social_session_worker(void *arg)
     }
 
   if (social_spawn(&g_social.upload_thread, social_upload_worker,
-                   "upload") == 0)
+                   CONFIG_VS_SOCIAL_STACKSIZE_UPLOAD, "upload") == 0)
     {
       g_social.upload_joinable = true;
     }
@@ -1539,14 +1643,14 @@ static void *social_session_worker(void *arg)
     }
 
   if (social_spawn(&g_social.capture_thread, social_capture_worker,
-                   "capture") == 0)
+                   CONFIG_VS_SOCIAL_STACKSIZE_CAPTURE, "capture") == 0)
     {
       g_social.capture_joinable = true;
     }
 
   if (g_social.mic != NULL &&
       social_spawn(&g_social.audio_thread, social_audio_worker,
-                   "audio") == 0)
+                   CONFIG_VS_SOCIAL_STACKSIZE_AUDIO, "audio") == 0)
     {
       g_social.audio_joinable = true;
     }
@@ -1713,7 +1817,7 @@ int vs_social_start(uint32_t request_id)
   pthread_mutex_unlock(&g_social.lock);
 
   ret = social_spawn(&g_social.session_thread, social_session_worker,
-                     "session");
+                     CONFIG_VS_SOCIAL_STACKSIZE_SESSION, "session");
   if (ret < 0)
     {
       pthread_mutex_lock(&g_social.lock);

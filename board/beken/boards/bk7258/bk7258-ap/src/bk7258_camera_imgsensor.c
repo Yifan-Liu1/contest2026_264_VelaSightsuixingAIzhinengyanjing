@@ -1829,8 +1829,27 @@ static int bk7258_gc2145_validate_frame_setting(
    * is claimed that the hardware is not doing.
    */
 
+  /* nfps == 0 is the third case, and leaving it out of the two above was a
+   * bug.  At such a mode there is no sensor rate to program -- the window
+   * table fixes it, which is why 480x480 enumerates none -- so there is no
+   * request here to reject and nothing that could be claimed falsely: what
+   * the application receives is paced by the capture module's JPEG sampler,
+   * which does honour the interval (bk7258_camera_jpeg_sample_period()).
+   *
+   * Rejecting instead made the answer depend on history rather than on the
+   * request.  priv->mode is the mode last *started*, so the first
+   * VIDIOC_S_PARM after boot at 480x480 was compared against the 640x480 the
+   * init sequence leaves programmed, took the mode != priv->mode path and
+   * succeeded; every later one compared 480x480 against itself and returned
+   * -EINVAL.  Same call, same arguments, different result depending on what
+   * had streamed before.
+   *
+   * start_capture() and apply_mode() both already guard on nfps > 0 for the
+   * same reason; this was the one place that did not.
+   */
+
   if (interval != NULL && interval->denominator != 0 &&
-      mode == priv->mode)
+      mode == priv->mode && mode->nfps > 0)
     {
       uint32_t fps = interval->denominator / (interval->numerator ?
                                              interval->numerator : 1);
@@ -1887,6 +1906,20 @@ static int bk7258_gc2145_start_capture(
     {
       fps = interval->denominator / (interval->numerator ?
                                      interval->numerator : 1);
+    }
+
+  /* At a mode with no programmable rate the request is not addressed to this
+   * half at all, so drop it here rather than carrying it into the comparison
+   * below.  current_fps stays 0 at such a mode -- apply_mode() has no rate to
+   * record -- so a request left in place would compare unequal on every
+   * stream start and rewrite the whole window table each time, which is
+   * exactly what the "only reprogram when something changed" test above the
+   * mode lookup exists to avoid.
+   */
+
+  if (mode->nfps == 0)
+    {
+      fps = 0;
     }
 
   /* A rate carried over from a different resolution may not exist at this

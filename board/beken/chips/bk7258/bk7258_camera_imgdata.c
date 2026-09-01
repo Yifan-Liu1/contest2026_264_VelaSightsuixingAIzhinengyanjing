@@ -273,6 +273,14 @@ struct bk7258_camera_imgdata_s
   int8_t jpeg_raw_ready;           /* Newest complete one, -1 if none */
   uint32_t jpeg_raw_bytes;
   clock_t jpeg_next_sample;        /* Earliest tick for the next encode */
+
+  /* The delivery rate in force for this stream, and the period derived from
+   * it.  CONFIG_BK7258_CAMERA_JPEG_FPS is the ceiling; an application may ask
+   * for less through VIDIOC_S_PARM.  See bk7258_camera_jpeg_sample_period().
+   */
+
+  uint32_t jpeg_fps;
+  clock_t  jpeg_sample_period;
   volatile bool jpeg_encoding;     /* An encode is in flight */
   volatile bool jpeg_buf_armed;    /* The framework queued a buffer that has
                                     * not been completed yet */
@@ -401,6 +409,71 @@ static void bk7258_camera_now(FAR struct timeval *ts)
 
   ts->tv_sec  = ticks / TICK_PER_SEC;
   ts->tv_usec = (ticks % TICK_PER_SEC) * (USEC_PER_SEC / TICK_PER_SEC);
+}
+
+/****************************************************************************
+ * Name: bk7258_camera_jpeg_sample_period
+ *
+ * Description:
+ *   Work out how often this stream should deliver a frame, from the interval
+ *   the application asked for and the build's ceiling.
+ *
+ *   CONFIG_BK7258_CAMERA_JPEG_FPS stays what its help text says it is -- an
+ *   upper bound, defaulting to the rate the encoder can actually reach, so a
+ *   build never throttles itself below the hardware.  What was missing is the
+ *   other half of that argument: it says sampling "belongs to whoever is
+ *   uploading", but the interval such a caller passes was accepted by the
+ *   framework and then discarded here, so the only way to sample slower was
+ *   to lower the ceiling for every application in the image.
+ *
+ *   That mattered once social mode existed.  It wants a few frames a second
+ *   and paces its own dequeues accordingly, but the pacing was on the wrong
+ *   side of the driver: every frame this module delivers costs a copy out of
+ *   the drain ring plus, on the hardware path, a full 4:2:2 Huffman
+ *   validation over non-cacheable PSRAM, and it was paying that at the
+ *   ceiling rate while reading a fraction of the result.  Lowering the
+ *   ceiling instead would have taken web_tool's live preview down with it,
+ *   because both are the same /dev/video0 and the ceiling is one build-wide
+ *   constant.
+ *
+ *   Zero or nonsense means "no request": the framework seeds the interval
+ *   from the sensor's default and a caller that never issues VIDIOC_S_PARM
+ *   should keep the behaviour it had.  A request above the ceiling is capped
+ *   rather than refused, because the ceiling is a statement about the
+ *   hardware and no caller can argue with it.
+ *
+ ****************************************************************************/
+
+static void bk7258_camera_jpeg_sample_period(
+    FAR struct bk7258_camera_imgdata_s *priv,
+    FAR const imgdata_interval_t *interval)
+{
+  uint32_t fps = CONFIG_BK7258_CAMERA_JPEG_FPS;
+
+  if (interval != NULL && interval->denominator != 0)
+    {
+      uint32_t requested = interval->denominator /
+                           (interval->numerator != 0 ?
+                            interval->numerator : 1u);
+
+      if (requested != 0 && requested < fps)
+        {
+          fps = requested;
+        }
+    }
+
+  priv->jpeg_fps = fps;
+
+  /* At least one tick, so a rate the tick resolution cannot express degrades
+   * to "every frame" instead of to a period of zero, which would compare as
+   * already due and defeat the gate entirely.
+   */
+
+  priv->jpeg_sample_period = MSEC2TICK(1000u / fps);
+  if (priv->jpeg_sample_period == 0)
+    {
+      priv->jpeg_sample_period = 1;
+    }
 }
 
 /****************************************************************************
@@ -908,8 +981,7 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
       return;
     }
 
-  priv->jpeg_next_sample = clock_systime_ticks() +
-    MSEC2TICK(1000u / CONFIG_BK7258_CAMERA_JPEG_FPS);
+  priv->jpeg_next_sample = clock_systime_ticks() + priv->jpeg_sample_period;
 
   /* The completed slot is frozen and one frame is smaller than a slot, so
    * this copy cannot wrap or race the DMA now writing the next slot.
@@ -1311,8 +1383,7 @@ static void bk7258_camera_frame_done(FAR void *arg)
                * from 4.39 to 2.26 fps, because encode and wait then add up.
                */
 
-              priv->jpeg_next_sample = now +
-                MSEC2TICK(1000u / CONFIG_BK7258_CAMERA_JPEG_FPS);
+              priv->jpeg_next_sample = now + priv->jpeg_sample_period;
               priv->jpeg_encoding = true;
               priv->jpeg_buf_armed = false;
               work_queue(LPWORK, &priv->jpeg_work,
@@ -1766,6 +1837,12 @@ static int bk7258_camera_imgdata_start_capture(
   priv->jpeg_chunks = 0;
   priv->jpeg_short = 0;
 
+  /* Ahead of the software/hardware split below, because both pace themselves
+   * from this and only one of them is taken.
+   */
+
+  bk7258_camera_jpeg_sample_period(priv, interval);
+
   bk7258_yuv_buf_configure(priv->width, priv->height);
 
   if (priv->jpeg && priv->jpeg_software)
@@ -1893,6 +1970,11 @@ static int bk7258_camera_imgdata_start_capture(
       priv->jpeg_bit_fail = 0;
       priv->jpeg_hw_busy = 0;
       priv->jpeg_sw_skipped = 0;
+
+      /* Seeded to "due now" so the first frame of a session is never delayed
+       * by the pacing; the period itself was computed before the split above.
+       */
+
       priv->jpeg_next_sample = clock_systime_ticks();
 
       bk7258_yuv_buf_set_frame_buffer((uint32_t)(uintptr_t)priv->jpeg_stage);
@@ -2018,7 +2100,7 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
              (unsigned int)priv->jpeg_no_soi,
              (unsigned int)priv->jpeg_sw_skipped,
              (unsigned int)priv->jpeg_hw_busy,
-             CONFIG_BK7258_CAMERA_JPEG_FPS);
+             (unsigned int)priv->jpeg_fps);
 
       printf("bk7258_camera_imgdata: stop_capture: frames=%u timeouts=%u "
              "elapsed=%ums measured=%u.%02u fps\n",
@@ -2053,7 +2135,7 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
                      (unsigned int)priv->set_buf_live,
                      (int)priv->jpeg_buf_armed,
                      (int)priv->jpeg_encoding,
-                     CONFIG_BK7258_CAMERA_JPEG_FPS);
+                     (unsigned int)priv->jpeg_fps);
             }
 
           printf("bk7258_camera_imgdata: stop_capture: jpeg chunks=%u "

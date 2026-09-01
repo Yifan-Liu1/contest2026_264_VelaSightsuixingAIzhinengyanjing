@@ -45,11 +45,22 @@ void board_autoled_on(int led);
 void board_autoled_off(int led);
 void bk7258_led_initialize(void);
 
+/* Unconditional because both configurations call it, from opposite sides of
+ * the same switch: with VELASIGHT the SD-NAND completion in bk7258_mmcsd.c
+ * does, and without it the nand_config_loader task in bk7258_bringup.c does.
+ * Declaring it under #ifdef VELASIGHT therefore broke exactly the build that
+ * needs it most -- configs/nsh compiles with -Werror, so the missing
+ * declaration was an error rather than a warning, and that configuration has
+ * not built since.  bk7258_agent_config.c is compiled unconditionally, so
+ * there is one definition to link against either way.
+ */
+
+void bk7258_nand_seed_agent_config(void);
+
 #ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 int bk7258_wifi_wait_ready(void);
 void bk7258_display_reveal(void);
 bool bk7258_ai_config_ready(void);
-void bk7258_nand_seed_agent_config(void);
 #endif
 
 #ifdef CONFIG_BK7258_SDIO

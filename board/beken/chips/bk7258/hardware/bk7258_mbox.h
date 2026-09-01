@@ -410,6 +410,27 @@ int bk7258_mb_uart_init(void);
 void bk7258_mb_uart_start(void);
 void bk7258_mb_uart_request_state(void);
 ssize_t bk7258_mbox_uart_write(const uint8_t *data, size_t length);
+
+/* Latch "this system is crashing", which is what arms
+ * bk7258_mbox_uart_drain_polled().  One way: nothing clears it, because
+ * nothing recovers from what sets it.  Called from board_autoled_on() for
+ * LED_ASSERTION and LED_PANIC, which _assert() raises before it produces any
+ * output.
+ */
+
+void bk7258_mbox_uart_crash_mode(void);
+
+/* Drain the console TX ring to the hardware with register writes and bounded
+ * spins only.  For crash paths: safe from interrupt context and with
+ * interrupts disabled, where the worker that normally does this cannot run.
+ *
+ * Does nothing until bk7258_mbox_uart_crash_mode() has been called.  That gate
+ * is not advisory -- this function bypasses the transport's sequencing and
+ * reuses its staging buffer, so running it beside a live transport corrupts
+ * the link.  Best-effort by construction; see the implementation.
+ */
+
+void bk7258_mbox_uart_drain_polled(void);
 ssize_t bk7258_mbox_uart_read(uint8_t *data, size_t length,
                               unsigned int *status);
 void bk7258_mbox_uart_early_init(void);

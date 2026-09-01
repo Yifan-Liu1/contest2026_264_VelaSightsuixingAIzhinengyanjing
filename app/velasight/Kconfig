@@ -663,6 +663,39 @@ config VS_SOCIAL_IMAGE_INTERVAL_MS
 		re-measured.  The number to watch is the "sampled N frames" line
 		at the end of a session against the session's duration.
 
+config VS_SOCIAL_CAPTURE_FPS
+	int "VelaSight social camera delivery rate (fps)"
+	default 5
+	range 1 30
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		What the camera driver is asked to deliver during a session, as a
+		per-stream request rather than a build setting.
+
+		This is not the same knob as VS_SOCIAL_IMAGE_INTERVAL_MS above.
+		That one decides which frames this application reads; this one
+		decides how many the driver bothers to produce.  Without it the
+		driver runs at CONFIG_BK7258_CAMERA_JPEG_FPS -- about 16.7 fps
+		measured at 480x480 -- and every frame costs a copy out of the
+		drain ring plus a full 4:2:2 Huffman validation over
+		non-cacheable PSRAM, in interrupt and work-queue context,
+		alongside the microphone and the mailbox.  A session that reads
+		three frames a second has no use for the other fourteen.
+
+		Deliberately above the rate the interval implies (340 ms is about
+		2.94 fps).  The headroom is what keeps a fresh frame waiting when
+		the capture thread comes back, instead of making it wait out the
+		remainder of a driver period.
+
+		Set it to 0 to ask for nothing and take the driver's own rate.
+		A rate the driver will not accept is not fatal -- the session
+		opens at whatever the driver chose and says so in the log.
+
+		Lowering CONFIG_BK7258_CAMERA_JPEG_FPS instead would have the
+		same effect here and the wrong effect everywhere else: that
+		ceiling is build-wide and /dev/video0 is shared with web_tool's
+		live preview and agent_camera.
+
 config VS_SOCIAL_IMAGE_WIDTH
 	int "VelaSight social frame width"
 	default 480
@@ -796,16 +829,75 @@ config VS_SOCIAL_INFLIGHT_MAX
 		nothing else -- the cloud still has the data and still counts it
 		in the end-of-session timeline.
 
-config VS_SOCIAL_STACKSIZE
-	int "VelaSight social thread stack size"
-	default 8192
-	range 4096 32768
+# Stacks, one option per session thread.
+#
+# These were a single shared option, which cannot work: the four threads differ
+# by a large factor in what they need, so one value is either too small for the
+# worst of them or many times too large for the rest.  It was 8192 while the
+# session thread wanted 12 KiB in a single frame, and the hardware stack limit
+# turned that into a UsageFault three milliseconds into every session --
+# measured 2026-09-01, from the assertion dump rather than inferred.
+#
+# They come from PSRAM, not from the SRAM heap as the help text here used to
+# claim.  The same dump put the session thread's stack at 0x60a1eb10, inside
+# PSRAM_SECTION, along with the other three.  So being generous costs room in a
+# 6 MB region that holds only framebuffers and these stacks, and costs nothing
+# in the SRAM the kernel is actually short of.  All four are claimed only while
+# a session is running.
+
+config VS_SOCIAL_STACKSIZE_SESSION
+	int "VelaSight social session-thread stack size"
+	default 16384
+	range 4096 65536
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		Stack for each of the four session threads.
+		The orchestrator: opens the devices, spawns the other three, polls
+		for results and builds the closing minutes.
 
-		The session thread is the one that needs it: cJSON parsing of a
-		full end-of-session response, with both timelines, recurses.
-		These are pthread stacks, so they come from the SRAM heap -- four
-		of them at this size is real memory, and it is only claimed while
-		a session is running.
+		Sized for the closing sequence rather than for the polling loop.
+		cJSON parsing of a full end-of-session response, with both
+		timelines, recurses, and social_finalize_sequence() alone measures
+		about 1 KiB of frame.
+
+		social_poll_once() used to dominate this thread at 12 KiB in one
+		frame -- 32 vs_social_event_s of 364 bytes each.  That array is now
+		allocated from PSRAM once per session, so this no longer has to
+		cover it.
+
+config VS_SOCIAL_STACKSIZE_AUDIO
+	int "VelaSight social audio-thread stack size"
+	default 32768
+	range 4096 65536
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		The largest of the four, and not by a small margin, because it is
+		the one that runs libopus.
+
+		libopus is built here with VAR_ARRAYS, so its working buffers land
+		on the caller's stack rather than inside the encoder state object.
+		app/audio_test, the only other user of this same encoder, records
+		from measurement that 8 KiB was not enough and uses 32768.
+
+		Note that the encoder *state* already comes from PSRAM.  That does
+		nothing for the stack, which is the part VAR_ARRAYS moves.
+
+config VS_SOCIAL_STACKSIZE_UPLOAD
+	int "VelaSight social upload-thread stack size"
+	default 16384
+	range 4096 65536
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Pops the ring and does the cloud round trip: HTTP request assembly,
+		optionally TLS, then a JSON response to parse.  Its own frame is
+		trivial and everything it needs sits below it.
+
+config VS_SOCIAL_STACKSIZE_CAPTURE
+	int "VelaSight social capture-thread stack size"
+	default 8192
+	range 4096 65536
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		The shallowest of the four: a poll, an ioctl and a copy, with a
+		measured frame of 24 bytes.  Left at the old shared default because
+		there is no reason to trim it, and against a frame that shallow the
+		whole value is headroom.

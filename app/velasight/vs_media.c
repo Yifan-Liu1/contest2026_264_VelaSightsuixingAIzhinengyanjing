@@ -433,7 +433,7 @@ struct vs_media_stream_s
 #define VS_MEDIA_POLL_SLICE_MS 50
 
 int vs_media_stream_open(struct vs_media_stream_s **stream,
-                         uint16_t width, uint16_t height)
+                         uint16_t width, uint16_t height, uint32_t fps)
 {
   struct vs_media_stream_s *s;
   struct v4l2_requestbuffers req;
@@ -496,6 +496,35 @@ int vs_media_stream_open(struct vs_media_stream_s **stream,
       goto errout;
     }
 
+  /* The delivery rate, here rather than just before STREAMON.  It only needs
+   * the format, which is now set, and the driver only accepts it while the
+   * stream is off -- and VIDIOC_QBUF below runs the framework's capture-state
+   * machine, which is not somewhere to be relying on the state having stayed
+   * put.
+   *
+   * Advisory by design: a driver that will not take the rate still streams, so
+   * this logs and carries on at whatever rate the driver chose.  Losing the
+   * request costs efficiency; failing the open would cost the session.
+   */
+
+  if (fps != 0)
+    {
+      struct v4l2_streamparm parm;
+
+      memset(&parm, 0, sizeof(parm));
+      parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      parm.parm.capture.timeperframe.numerator   = 1;
+      parm.parm.capture.timeperframe.denominator = fps;
+
+      if (ioctl(s->fd, VIDIOC_S_PARM, (unsigned long)&parm) < 0)
+        {
+          printf("vs_media: stream %lu fps not accepted (errno=%d), "
+                 "continuing at the driver's rate\n",
+                 (unsigned long)fps, errno);
+          fps = 0;
+        }
+    }
+
   memset(&req, 0, sizeof(req));
   req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   req.memory = V4L2_MEMORY_MMAP;
@@ -552,7 +581,17 @@ int vs_media_stream_open(struct vs_media_stream_s **stream,
 
   s->streaming = true;
   *stream = s;
-  printf("vs_media: stream open %ux%u\n", width, height);
+
+  if (fps != 0)
+    {
+      printf("vs_media: stream open %ux%u at up to %lu fps\n", width, height,
+             (unsigned long)fps);
+    }
+  else
+    {
+      printf("vs_media: stream open %ux%u\n", width, height);
+    }
+
   return 0;
 
 errout:

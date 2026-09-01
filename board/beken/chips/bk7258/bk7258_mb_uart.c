@@ -27,6 +27,20 @@
 #endif
 
 #define MB_UART_TX_SIZE       CONFIG_BK7258_MB_UART0_TXBUFSIZE
+
+/* Bounds for bk7258_mbox_uart_drain_polled().  Every loop it runs has to
+ * terminate on its own, because the caller is a crash path: there is no
+ * scheduler to preempt it and nothing left to recover if it spins forever.
+ *
+ * CHUNKS covers a whole ring at BK7258_MB_UART_CHUNK_SIZE per frame with room
+ * to spare.  FIFO_SPINS is generous because a full peer FIFO drains on the
+ * CP's own interrupt.  SETTLE_SPINS is the gap between frames, discussed at
+ * the function.
+ */
+
+#define MB_UART_POLLED_CHUNKS       64u
+#define MB_UART_POLLED_FIFO_SPINS   200000u
+#define MB_UART_POLLED_SETTLE_SPINS 20000u
 #define MB_UART_RX_CAPACITY   CONFIG_BK7258_MB_UART0_RXBUFSIZE
 #define MB_UART_RX_SIZE       (MB_UART_RX_CAPACITY + 1u)
 #define MB_UART_RTS_ASSERT    BK7258_MB_UART_CHUNK_SIZE
@@ -87,6 +101,21 @@ struct mb_uart_control
 };
 
 static struct mb_uart_control g_uart;
+
+/* The frame bk7258_mbox_uart_drain_polled() submits, and its sequence
+ * counter.  A file static rather than a local because the peer reads the
+ * message out of this memory after the call that queued it has returned --
+ * the same reason the transport's own slots are statics.  Aligned to 32 to
+ * match them.
+ */
+
+static struct bk7258_mb_wire_message g_polled_message
+  __attribute__((aligned(32)));
+static uint8_t g_polled_seq;
+
+/* Set once, by bk7258_mbox_uart_crash_mode(), and never cleared. */
+
+static volatile bool g_crash_mode;
 
 _Static_assert(MB_UART_TX_SIZE > BK7258_MB_UART_CHUNK_SIZE &&
                MB_UART_TX_SIZE <= UINT16_MAX,
@@ -704,6 +733,179 @@ void bk7258_mbox_uart_set_callback(bk7258_mb_uart_callback_t callback,
   g_uart.callback = callback;
   g_uart.callback_arg = arg;
   up_irq_restore(flags);
+}
+
+/****************************************************************************
+ * Name: bk7258_mbox_uart_drain_polled
+ *
+ * Description:
+ *   Push whatever is in the TX ring straight at the mailbox hardware, using
+ *   nothing but register writes and bounded spins.
+ *
+ *   This exists because the ordinary path cannot report a crash.  Console
+ *   bytes reach the CP only when mb_uart_worker() moves them, and that is a
+ *   kthread woken by a semaphore: it needs interrupts and a scheduler.  An
+ *   assertion has neither -- a stack-limit violation arrives as a HardFault,
+ *   so _assert() runs in exception context with interrupts off -- and
+ *   bk7258_mbox_uart_flush() cannot help either, because it waits by calling
+ *   nxsig_usleep().  So the register dump and stack trace were written into
+ *   the ring and left there, and the only evidence an assertion had happened
+ *   at all was the red LED plus the CP resetting the part eight seconds later
+ *   for a missing heartbeat.  Three separate faults were diagnosed by
+ *   inference from timestamps because of this.
+ *
+ *   The CP is alive and printing throughout that window, and eight seconds is
+ *   an enormous budget for a few kilobytes, so there is nothing wrong with the
+ *   transport -- only with needing a scheduler to use it.
+ *
+ *   Deliberately best-effort, and the compromises are worth naming:
+ *
+ *   - No ACK is read, so tx_read advances on submission rather than on
+ *     completion, and the staging area is reused after a fixed settle spin
+ *     instead of after the CP confirms it copied the payload.  A chunk can
+ *     therefore be lost or torn.  Losing some of a dump beats losing all of
+ *     it, which is what happens today.
+ *   - Peer RTS is ignored.  Flow control protects a running system from
+ *     overrunning the CP's log queue; a system that is about to be reset has
+ *     no later output to protect.
+ *   - It reuses BK7258_MB_UART_TX_ADDRESS, so it will corrupt a normal
+ *     UART_DATA transaction that was in flight.  That transaction's ACK is
+ *     never coming.
+ *
+ *   Safe to call from interrupt context and with interrupts already disabled;
+ *   it does not block, allocate or print.
+ *
+ ****************************************************************************/
+
+void bk7258_mbox_uart_crash_mode(void)
+{
+  g_crash_mode = true;
+}
+
+void bk7258_mbox_uart_drain_polled(void)
+{
+  FAR uint8_t *destination =
+    (FAR uint8_t *)(uintptr_t)BK7258_MB_UART_TX_ADDRESS;
+  unsigned int chunk;
+
+  /* The gate, and the reason it is here rather than at the call site.
+   *
+   * Everything below bypasses the transport: it stamps its own sequence
+   * numbers, does not wait for acknowledgements, ignores the peer's flow
+   * control and reuses the staging buffer a live transaction may still own.
+   * Those are all defensible once nothing is going to run again, and all
+   * corrupting when something is.
+   *
+   * Measured 2026-08-31: hooked into every interrupt-context syslog rather
+   * than into crash paths only, this moved the CP's console link-down during
+   * social mode from 1.75 s after the camera opened to 378 ms.  The hook was
+   * too broad, and putting the check at that one call site would have left the
+   * next caller free to make the same mistake.  Enforcing it here means the
+   * only way to arm this is to declare a crash.
+   */
+
+  if (!g_crash_mode || !g_uart.initialized)
+    {
+      return;
+    }
+
+  for (chunk = 0; chunk < MB_UART_POLLED_CHUNKS; chunk++)
+    {
+      irqstate_t flags;
+      uint32_t wire[2];
+      uint16_t length;
+      uint16_t first;
+      unsigned int spin;
+      int ret = -EAGAIN;
+
+      flags = up_irq_save();
+
+      length = tx_count();
+      if (length == 0)
+        {
+          up_irq_restore(flags);
+          return;
+        }
+
+      if (length > BK7258_MB_UART_CHUNK_SIZE)
+        {
+          length = BK7258_MB_UART_CHUNK_SIZE;
+        }
+
+      first = MB_UART_TX_SIZE - g_uart.tx_read;
+      if (first > length)
+        {
+          first = length;
+        }
+
+      memcpy(destination, &g_uart.tx_ring[g_uart.tx_read], first);
+      if (first != length)
+        {
+          memcpy(destination + first, g_uart.tx_ring, length - first);
+        }
+
+      /* A fresh sequence number per chunk, for the same reason the transport
+       * stamps one: consecutive frames that carry the same one look like a
+       * retransmission to the peer.
+       */
+
+      memset(&g_polled_message, 0, sizeof(g_polled_message));
+      g_polled_message.header =
+        bk7258_mb_make_header(BK7258_MB_UART_DATA, 0, 0, ++g_polled_seq,
+                              BK7258_MB_CHAN_UART0_TX);
+      g_polled_message.payload_address = BK7258_MB_UART_TX_ADDRESS;
+      g_polled_message.payload_length = length;
+
+      wire[0] = (uint32_t)(uintptr_t)&g_polled_message;
+      wire[1] = sizeof(g_polled_message);
+
+      __asm__ volatile("dmb sy" ::: "memory");
+
+      /* -EAGAIN is the peer's receive FIFO being full, which is transient and
+       * the one failure worth waiting out.  Anything else means the hardware
+       * will not take this frame however long we spin.
+       */
+
+      for (spin = 0; spin < MB_UART_POLLED_FIFO_SPINS; spin++)
+        {
+          ret = bk7258_mbox_send(0, wire);
+          if (ret != -EAGAIN)
+            {
+              break;
+            }
+        }
+
+      if (ret < 0)
+        {
+          up_irq_restore(flags);
+          return;
+        }
+
+      g_uart.tx_read = (g_uart.tx_read + length) % MB_UART_TX_SIZE;
+      g_uart.stats.data_tx++;
+      length = tx_count();
+      up_irq_restore(flags);
+
+      if (length == 0)
+        {
+          return;
+        }
+
+      /* Only between chunks, never after the last one.  The wait is to stop
+       * the next chunk overwriting a payload the CP has not copied yet, so
+       * with no next chunk there is nothing to wait for -- and this function
+       * is called once per line during a dump, so paying it on every call
+       * would be most of the cost for none of the benefit.
+       *
+       * The CP's receive handler takes microseconds; this is slack rather than
+       * a measured requirement.
+       */
+
+      for (spin = 0; spin < MB_UART_POLLED_SETTLE_SPINS; spin++)
+        {
+          __asm__ volatile("nop");
+        }
+    }
 }
 
 int bk7258_mbox_uart_flush(unsigned int timeout_ms)

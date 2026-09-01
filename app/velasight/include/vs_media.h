@@ -72,6 +72,22 @@ struct vs_media_stream_s;
  *   Same geometry rule as vs_media_capture_jpeg() -- 480x480, 640x480 or
  *   864x480 -- rejected here rather than several ioctls deep.
  *
+ *   fps asks the driver to deliver no faster than that, and asking matters
+ *   even though the caller controls its own grab cadence: pacing on this side
+ *   only decides which frames are read, while the driver goes on producing at
+ *   its ceiling and pays a copy plus a full Huffman validation for each one.
+ *   The two are different costs and only the driver can avoid the second.
+ *
+ *   Pass 0 to take the driver's own rate.  A value it cannot honour is not an
+ *   error: the stream opens at whatever rate the driver chose, because a rate
+ *   is an efficiency request and refusing to capture over one would trade a
+ *   working session for a tidier abstraction.
+ *
+ *   This is a per-stream request, not a build setting -- which is the point.
+ *   /dev/video0 is shared with web_tool and agent_camera, and the build-wide
+ *   ceiling (CONFIG_BK7258_CAMERA_JPEG_FPS) cannot be lowered for one caller
+ *   without lowering it for all of them.
+ *
  * Returned Value:
  *   0 with *stream filled, or a negative errno.  -EBUSY when the device is
  *   already owned, which is the case worth naming: the idle assistant's photo
@@ -82,7 +98,7 @@ struct vs_media_stream_s;
  ****************************************************************************/
 
 int vs_media_stream_open(struct vs_media_stream_s **stream,
-                         uint16_t width, uint16_t height);
+                         uint16_t width, uint16_t height, uint32_t fps);
 
 /****************************************************************************
  * Name: vs_media_stream_grab

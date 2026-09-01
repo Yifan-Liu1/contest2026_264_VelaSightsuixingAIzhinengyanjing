@@ -26,6 +26,18 @@ CONFIG_ARCH_CHIP_CUSTOM_DIR="../vendor/beken/chips/bk7258"
 CONFIG_ARCH_CHIP_CUSTOM_DIR_RELPATH=y
 CONFIG_ARCH_CHIP_CUSTOM_NAME="bk7258"
 CONFIG_ARCH_INTERRUPTSTACK=2048
+# Assertions have to be able to say what happened.
+#
+# _assert() guards dump_assert_info() and dump_fatal_info() with
+# CONFIG_DEBUG_ALERT, which was off, so an assertion produced no output at all
+# -- and CONFIG_ARCH_LEDS was on, so the only trace it left was the red LED.
+# Measured 2026-08-31: three separate AP faults in social mode were all
+# indistinguishable at the console, and had to be narrowed down by inferring
+# from CP heartbeat timestamps.  Two of those inferences were wrong.
+#
+# CONFIG_DEBUG_ALERT itself takes no value here: it has no prompt and is only
+# reachable through select, from either of the two options below.
+CONFIG_ARCH_STACKDUMP=y
 CONFIG_ARCH_TRUSTZONE_SECURE=y
 CONFIG_ARMV8M_CMSE=y
 CONFIG_ARMV8M_ICACHE=y
@@ -71,6 +83,20 @@ CONFIG_BUILTIN=y
 CONFIG_CRYPTO=y
 CONFIG_CRYPTO_MBEDTLS=y
 CONFIG_CRYPTO_RANDOM_POOL=y
+# Kernel DEBUGASSERT()s and the extended parameter checks, on top of the
+# assertion output CONFIG_ARCH_STACKDUMP already selects.
+#
+# This one changes behaviour rather than only reporting it, which is worth
+# stating plainly while a fault is still being chased: it adds assertions that
+# can fire, and parameter validation that costs time.  Both cut either way --
+# an assertion that fires with a file and line is the answer, and a timing
+# shift can move the fault instead.  It does not add ordinary log output on its
+# own; per its help text, subsystem debug output is selected separately.
+#
+# Drop this line and keep CONFIG_ARCH_STACKDUMP if the added assertions turn
+# out to obscure the fault rather than name it.  Stack dumps do not depend on
+# it.
+CONFIG_DEBUG_FEATURES=y
 CONFIG_DEFAULT_TASK_STACKSIZE=4096
 CONFIG_DEV_GPIO=y
 CONFIG_DEV_RANDOM=y

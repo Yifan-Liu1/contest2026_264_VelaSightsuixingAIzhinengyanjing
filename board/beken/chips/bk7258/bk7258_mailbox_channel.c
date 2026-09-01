@@ -32,6 +32,12 @@
 #define MB_DOWN_RETRY          MSEC2TICK(100)
 #define MB_TX_PRIORITY         105
 
+/* Consecutive UART0_TX failures before the link is treated as broken rather
+ * than busy.  See handle_ack() for why a single one must not count.
+ */
+
+#define MB_UART_TX_FAIL_ABORT  4u
+
 /* The CP's flash operation notification (its flash_notify.c): the header
  * command carries the edge, param1 the request/acknowledge state.  Values
  * come from the IPC_FLASH_OP_* enumerations there and cross cores, so they
@@ -159,6 +165,14 @@ static bool g_reset_pending;
 static bool g_probe_requested;
 static uint8_t g_probe_attempts;
 static uint8_t g_recovery_index;
+
+/* Consecutive UART0_TX failures, and where the next dispatch scan starts among
+ * the channels that take turns.  Both are explained where they are used:
+ * complete_active() and dispatch_locked().
+ */
+
+static uint8_t g_uart_tx_failures;
+static uint8_t g_dispatch_rotor;
 static clock_t g_down_since;
 static enum bk7258_mb_link_state g_diag_state;
 static uint32_t g_peer_reset_generation;
@@ -447,6 +461,7 @@ static int dispatch_locked(void)
   struct active_transaction *active;
   struct logical_channel *channel;
   unsigned int i;
+  unsigned int n;
   int ret;
 
   /* ACKs always outrank RESET and ordinary commands. */
@@ -485,8 +500,32 @@ static int dispatch_locked(void)
       return OK;
     }
 
-  for (i = 0; i < MB_CHANNEL_COUNT; i++)
+  /* One transaction is in flight at a time, so the order this loop visits
+   * channels in is a priority order, and a strict scan from 0 makes it a
+   * starvation order too: whatever sits at a lower index and always has
+   * something queued keeps everything below it off the link indefinitely.
+   *
+   * That is not hypothetical.  WIFI_DATA_TX is index 5 and UART0_TX is index
+   * 6, so any sustained upload -- social mode is the first workload that
+   * produces one -- stops the console from ever being dispatched.  Starved
+   * past MB_TIMEOUT it fails, and handle_ack() used to answer that by
+   * aborting the link, which stops the heartbeat, which resets the part.
+   *
+   * Index 0 keeps absolute precedence because that is HW_CTRL_TX, the
+   * heartbeat: it is answering an 8 s deadline and is one small frame every
+   * 2 s, so it costs the others nothing to always let it go first.  The rest
+   * take turns, which bounds how long any of them can be held off by the
+   * others rather than leaving it open-ended.
+   *
+   * Rotating is not enough on its own -- see handle_ack(), which is where a
+   * starved console frame turned into a link abort.
+   */
+
+  for (n = 0; n < MB_CHANNEL_COUNT; n++)
     {
+      i = n == 0 ? 0 :
+          1u + (g_dispatch_rotor + (n - 1u)) % (MB_CHANNEL_COUNT - 1u);
+
       channel = &g_channels[i];
       if (!channel->queued)
         {
@@ -557,6 +596,17 @@ static int dispatch_locked(void)
 
           g_probe_attempts++;
           g_stats.probes++;
+        }
+
+      /* Hand the turn to the next channel, so the one that just sent goes to
+       * the back of the queue instead of winning again.  Index 0 is outside
+       * the rotation and does not move it: the heartbeat keeps its precedence
+       * without consuming anyone else's turn.
+       */
+
+      if (i != 0)
+        {
+          g_dispatch_rotor = (uint8_t)(i % (MB_CHANNEL_COUNT - 1u));
         }
 
       return OK;
@@ -713,10 +763,37 @@ static void handle_ack(const struct bk7258_mb_wire_message *message)
         }
     }
 
-  else if (bk7258_mb_header_channel(message) == BK7258_MB_CHAN_UART0_TX &&
-           result < 0)
+  else if (bk7258_mb_header_channel(message) == BK7258_MB_CHAN_UART0_TX)
     {
-      begin_abort(result);
+      /* One unanswered console frame is not evidence of a broken link, for the
+       * same reason an ordinary message is not (see mailbox_tx_worker): the
+       * heartbeat and everything else were working up to that moment, and a
+       * recovery is what would destroy them.  begin_abort() here puts the link
+       * into PROBING, and while it is there bk7258_mailbox_send_wire() refuses
+       * every heartbeat -- so the CP resets the part unless recovery finishes
+       * inside its 8 s budget, which nothing here guarantees.
+       *
+       * Measured 2026-08-31: entering social mode starts sustained uploads,
+       * UART0_TX is last in the dispatch order and starved past MB_TIMEOUT,
+       * and this line turned that into "IPC[1]heartbeat timeout" and a reboot
+       * loop with the AP running normally throughout.  The dispatch rotation
+       * below is the other half of that fix; this half makes a console frame
+       * that is merely late cost a log line instead of the chip.
+       *
+       * A link that really is down fails these consecutively, which is what
+       * the threshold distinguishes.  At MB_TIMEOUT per failure it takes
+       * ~800 ms to decide, an order of magnitude inside the CP's budget.
+       */
+
+      if (result >= 0)
+        {
+          g_uart_tx_failures = 0;
+        }
+      else if (++g_uart_tx_failures >= MB_UART_TX_FAIL_ABORT)
+        {
+          g_uart_tx_failures = 0;
+          begin_abort(result);
+        }
     }
 
   (void)dispatch_locked();
@@ -1096,6 +1173,8 @@ int bk7258_mailbox_init(void)
       g_recovery_index = 0;
       g_probe_attempts = 0;
       g_peer_reset_generation = 0;
+      g_uart_tx_failures = 0;
+      g_dispatch_rotor = 0;
       nxsem_init(&g_tx_sem, 0, 0);
       nxsem_init(&g_diag_sem, 0, 0);
       g_state_initialized = true;
@@ -1181,6 +1260,24 @@ int bk7258_mailbox_send_wire(uint8_t logical_channel,
       up_irq_restore(flags);
       return -EBUSY;
     }
+
+  /* Not READY means not sendable, with one exemption: the UART0 state frame
+   * that *is* the probe recovery runs on.
+   *
+   * The heartbeat is deliberately not exempted here even though it is the one
+   * thing the CP's 8 s watchdog measures, because the slot it would have to
+   * use (g_active) is quarantined for the duration of a recovery -- the peer's
+   * FIFO may still reference it, which is what the quarantine exists to
+   * prevent.  Letting it queue instead would be worse than refusing: the
+   * caller latches g_heartbeat_pending on a successful submission and would
+   * then stop retrying altogether, where -ENOLINK makes it retry every
+   * IPC_HEARTBEAT_RETRY until the link is back.
+   *
+   * So the cost of a recovery that outlasts eight seconds is a chip reset, and
+   * the defence is to not enter one for a reason that is not a broken link --
+   * see handle_ack(), where a starved console frame used to do exactly that,
+   * and dispatch_locked(), where the starvation came from.
+   */
 
   if (g_link_state != BK7258_MB_LINK_READY &&
       !(g_link_state == BK7258_MB_LINK_PROBING &&

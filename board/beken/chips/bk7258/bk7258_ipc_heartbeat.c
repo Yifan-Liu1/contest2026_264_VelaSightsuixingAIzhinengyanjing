@@ -23,6 +23,17 @@
 #define IPC_RESPONSE_TIMEOUT_MS        600u
 #define IPC_HEARTBEAT_INTERVAL         MSEC2TICK(2000)
 #define IPC_HEARTBEAT_RETRY            MSEC2TICK(100)
+
+/* How long a submitted heartbeat may stay unanswered before it is written off
+ * and a fresh one is sent.  See bk7258_ipc_heartbeat_poll().
+ *
+ * Five times the transport's own MB_TIMEOUT, so it only fires when a
+ * completion really was lost rather than merely late, and an eighth of the
+ * CP's 8 s budget, so writing one off still leaves room for three more
+ * attempts before that budget is spent.
+ */
+
+#define IPC_HEARTBEAT_PENDING_MAX      MSEC2TICK(1000)
 #define IPC_HEARTBEAT_POLL_US           10000u
 #define IPC_HEARTBEAT_PRIORITY          110
 
@@ -34,7 +45,9 @@ static volatile bool g_heartbeat_enabled;
 static volatile bool g_heartbeat_pending;
 static volatile uint32_t g_heartbeat_completions;
 static clock_t g_next_heartbeat;
+static clock_t g_heartbeat_pending_since;
 static uint32_t g_heartbeat_failures;
+static uint32_t g_heartbeat_abandoned;
 static uint32_t g_heartbeat_submissions;
 static uint32_t g_heartbeat_reported;
 static bool g_ipc_started;
@@ -134,9 +147,49 @@ void bk7258_ipc_heartbeat_poll(void)
   clock_t now;
   int ret;
 
-  if (!g_heartbeat_enabled || g_heartbeat_pending)
+  if (!g_heartbeat_enabled)
     {
       return;
+    }
+
+  /* A submission that is never completed used to stop the heartbeat for good,
+   * which means a CP reset: this flag is what suppresses the next one, and
+   * only the completion callback cleared it.
+   *
+   * Every ordinary failure does reach that callback -- the transport times an
+   * in-flight transaction out after MB_TIMEOUT, and begin_abort() fails the
+   * queued ones -- but a frame still sitting in its channel queue when the
+   * link leaves READY does not: dispatch_locked() will not promote it while
+   * the link is recovering, and the two paths that drop to DOWN after a failed
+   * probe complete the probe rather than the queue.  The frame then waits for
+   * a READY that the missing heartbeat is about to prevent.
+   *
+   * Writing it off and sending another turns that into a delay.  The stale
+   * frame is harmless if it does eventually go out: it carries the same
+   * indication, so the peer sees a heartbeat either way.
+   */
+
+  if (g_heartbeat_pending)
+    {
+      if ((sclock_t)(clock_systime_ticks() - g_heartbeat_pending_since) <
+          (sclock_t)IPC_HEARTBEAT_PENDING_MAX)
+        {
+          return;
+        }
+
+      g_heartbeat_pending = false;
+      g_heartbeat_abandoned++;
+
+      /* Powers of two only, like the failure report below: this path is
+       * reached once per lost completion and the console it would print to is
+       * the mailbox that is already in trouble.
+       */
+
+      if ((g_heartbeat_abandoned & (g_heartbeat_abandoned - 1u)) == 0)
+        {
+          syslog(LOG_ERR, "IPC heartbeat submission abandoned, count=%lu\n",
+                 (unsigned long)g_heartbeat_abandoned);
+        }
     }
 
   if (g_heartbeat_completions != g_heartbeat_reported)
@@ -188,6 +241,7 @@ void bk7258_ipc_heartbeat_poll(void)
   message.payload_length = sizeof(*payload);
   g_heartbeat_result = -EINPROGRESS;
   g_heartbeat_pending = true;
+  g_heartbeat_pending_since = now;
   ret = bk7258_mailbox_send_wire(BK7258_MB_CHAN_HW_CTRL_TX, &message,
                                  ipc_heartbeat_complete, NULL);
   if (ret == OK)
@@ -218,6 +272,7 @@ int bk7258_ipc_heartbeat_start(void)
   g_heartbeat_pending = false;
   g_heartbeat_completions = 0;
   g_heartbeat_failures = 0;
+  g_heartbeat_abandoned = 0;
   g_heartbeat_submissions = 0;
   g_heartbeat_reported = 0;
   ret = ipc_send(IPC_CPU1_POWER_UP_INDICATION, 0);
