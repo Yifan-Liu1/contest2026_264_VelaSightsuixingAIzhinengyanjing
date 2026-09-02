@@ -55,6 +55,13 @@ struct wifi_command_slot
   uint32_t generation;
 };
 
+/* End of a slot chain.  Slot indices are small (CONFIG_BK7258_WIFI_TX_SLOTS is
+ * eight by default) and zero is a valid one, so the terminator cannot be zero
+ * and the chain heads cannot rely on g_wifi being zero-initialised.
+ */
+
+#define WIFI_TX_CHAIN_END 0xFFu
+
 struct wifi_tx_slot
 {
   struct bk7258_wifi_pbuf pbuf;
@@ -66,6 +73,15 @@ struct wifi_tx_slot
   bool transport_rejected;
   uint8_t vif;
   uint32_t role_epoch;
+
+  /* Next slot in whichever of the two chains below holds this one.  Frames are
+   * handed to the CP as a chain rather than one at a time (see wifi_flush_tx),
+   * so a slot belongs to at most one chain and the chain is walked by index
+   * here rather than through the cpdu's own next pointer -- that one lives in
+   * memory the CP writes, and the completion path must not depend on it.
+   */
+
+  uint8_t chain_next;
 } __attribute__((aligned(32)));
 
 struct wifi_rx_packet
@@ -147,6 +163,38 @@ struct wifi_driver
   struct wifi_rx_packet packets[WIFI_PACKET_QUEUE];
   struct wifi_command_slot command[BK7258_WIFI_CMD_SLOTS];
   struct wifi_tx_slot tx[CONFIG_BK7258_WIFI_TX_SLOTS];
+
+  /* Outgoing frames waiting for the mailbox, and the batch currently handed
+   * over and waiting for its acknowledgement.
+   *
+   * The mailbox carries one transaction at a time across all of its channels,
+   * and a transaction can describe a whole chain of frames -- the CP walks it
+   * (cif_main.c: for (i = 0; i < msg.num && head != NULL; i++)).  Sending one
+   * frame per transaction therefore spends a turn on the shared link for every
+   * forty-byte acknowledgement a download produces, which is most of what the
+   * outbound direction carries.  Accumulating instead is what the vendor's own
+   * AP firmware does (wdrv_txdata_pre_process(), wdrv_tx.c), and tx_sent_num
+   * here is its sending_flag.
+   */
+
+  uint8_t tx_pend_head;
+  uint8_t tx_pend_tail;
+  uint8_t tx_pend_num;
+  uint8_t tx_sent_head;
+  uint8_t tx_sent_num;
+
+  /* How well the batching actually works, which is not something the shape of
+   * the code can tell you: it depends on whether frames arrive while a
+   * transaction is already in flight.  Mirrors the vendor's tx_list_num and
+   * ipc_txc_cnt, and is read through the wlan0 procfs entry so a measurement
+   * does not have to go out over the console -- console traffic shares the
+   * mailbox and would perturb the thing being measured.
+   */
+
+  uint32_t tx_batches;
+  uint32_t tx_batched_frames;
+  uint8_t tx_batch_max;
+
   uint8_t node_head;
   uint8_t node_tail;
   uint8_t node_count;
@@ -561,6 +609,48 @@ static bool wifi_tx_busy(void)
   return false;
 }
 
+/* Give up the frames that are still only queued.
+ *
+ * Called with packet_lock and the driver spinlock held, from the paths that
+ * invalidate whatever the frames were addressed to: a CP reset and the
+ * interface going down.
+ *
+ * Safe in exactly the case the in-flight frames are not.  A queued frame was
+ * never handed to the CP, so no DMA can be reading it and dropping it costs a
+ * retransmission rather than a use-after-free -- which is why the slots that
+ * were handed over stay quarantined here, as they always have.
+ *
+ * The slots are marked rejected rather than freed, so the packets go out
+ * through wifi_collect_rejected_tx() on the next worker pass.  netpkt_free()
+ * belongs off these locks, and that path already does it that way.
+ */
+
+static void wifi_tx_pending_drop_locked(void)
+{
+  uint8_t index = g_wifi.tx_pend_head;
+  unsigned int guard;
+
+  for (guard = 0; guard <= CONFIG_BK7258_WIFI_TX_SLOTS &&
+                  index != WIFI_TX_CHAIN_END; guard++)
+    {
+      struct wifi_tx_slot *tx = &g_wifi.tx[index];
+      uint8_t next = tx->chain_next;
+
+      tx->chain_next = WIFI_TX_CHAIN_END;
+      tx->transport_pending = false;
+      if (tx->active)
+        {
+          tx->transport_rejected = true;
+        }
+
+      index = next;
+    }
+
+  g_wifi.tx_pend_head = WIFI_TX_CHAIN_END;
+  g_wifi.tx_pend_tail = WIFI_TX_CHAIN_END;
+  g_wifi.tx_pend_num = 0;
+}
+
 static void wifi_role_deactivate(enum wifi_role role)
 {
   enum wifi_role deactivated_role = WIFI_ROLE_NONE;
@@ -817,7 +907,14 @@ static bool wifi_sync_reset_generation(void)
   /* A peer generation change proves the old CP can no longer reference AP
    * command slots.  TX slots remain quarantined because DMA completion is
    * not proven by a CP reset.
+   *
+   * Queued frames are the exception, and the reason they are safe is the same
+   * reason the others are not: they were never handed over, so nothing on the
+   * far side can be reading them.  Keeping them would send frames addressed to
+   * a role that no longer exists.
    */
+
+  wifi_tx_pending_drop_locked();
 
   for (i = 0; i < BK7258_WIFI_CMD_SLOTS; i++)
     {
@@ -1306,28 +1403,178 @@ static struct wifi_tx_slot *wifi_tx_slot(uint32_t cpdu_address)
   return NULL;
 }
 
+/* One acknowledgement resolves the whole batch that was handed over, so every
+ * slot in the in-flight chain is dealt with here rather than the single one an
+ * arg could name.
+ *
+ * Runs from the mailbox's acknowledgement path, which cannot take a mutex, so
+ * this touches only the driver spinlock and leaves sending the next batch to
+ * the worker.  Posting the semaphore unconditionally is the point: it is the
+ * re-kick the vendor's wdrv_tx_complete() performs when its tx_list is not
+ * empty, except that here the worker is what decides whether there is one.
+ */
+
 static void wifi_tx_transport_complete(
   const struct bk7258_mb_wire_message *ack, int result, void *arg)
 {
-  struct wifi_tx_slot *tx = arg;
-  bool wake = false;
+  unsigned int guard;
   irqstate_t flags;
+  uint8_t index;
 
   (void)ack;
+  (void)arg;
+
   flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
-  if (tx->transport_pending)
+  index = g_wifi.tx_sent_head;
+
+  /* Bounded by the slot count as well as by the terminator.  A chain holds each
+   * slot at most once, so a longer walk would mean it had been corrupted, and
+   * spinning on that here would take the core down with interrupts disabled.
+   */
+
+  for (guard = 0; guard <= CONFIG_BK7258_WIFI_TX_SLOTS &&
+                  index != WIFI_TX_CHAIN_END; guard++)
     {
-      tx->transport_pending = false;
-      if (result == -EREMOTEIO && tx->active)
+      struct wifi_tx_slot *tx = &g_wifi.tx[index];
+      uint8_t next = tx->chain_next;
+
+      tx->chain_next = WIFI_TX_CHAIN_END;
+      if (tx->transport_pending)
         {
-          tx->transport_rejected = true;
-          wake = true;
+          tx->transport_pending = false;
+
+          /* -EREMOTEIO is the CP refusing the frame.  The slot still holds the
+           * packet, so it goes to wifi_collect_rejected_tx() exactly as a
+           * single-frame transfer used to.
+           */
+
+          if (result == -EREMOTEIO && tx->active)
+            {
+              tx->transport_rejected = true;
+            }
         }
+
+      index = next;
     }
+
+  g_wifi.tx_sent_head = WIFI_TX_CHAIN_END;
+  g_wifi.tx_sent_num = 0;
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
-  if (wake)
+
+  nxsem_post(&g_wifi.work_sem);
+}
+
+/* Hand every frame that has accumulated to the CP as a single transaction.
+ *
+ * At most one batch per call: the mailbox carries one transaction at a time
+ * across all of its channels, so a second would only be refused.  The caller
+ * must hold packet_lock -- the order every other user of the TX slots takes,
+ * and what makes the window below safe, since no frame can be appended while
+ * the spinlock is dropped for the send.
+ */
+
+static void wifi_flush_tx(void)
+{
+  uint32_t head_address;
+  uint32_t tail_address;
+  unsigned int guard;
+  irqstate_t flags;
+  uint8_t high_water = 0;
+  uint8_t tail_index;
+  uint8_t index;
+  uint8_t num;
+  int ret;
+
+  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+
+  /* tx_sent_num is the vendor's sending_flag: while a batch is outstanding new
+   * frames simply wait, and its acknowledgement starts the next one.
+   */
+
+  if (g_wifi.tx_sent_num != 0 || g_wifi.tx_pend_num == 0 ||
+      !bk7258_mailbox_link_ready())
     {
-      nxsem_post(&g_wifi.work_sem);
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      return;
+    }
+
+  index = g_wifi.tx_pend_head;
+  tail_index = g_wifi.tx_pend_tail;
+  num = g_wifi.tx_pend_num;
+  head_address = (uint32_t)(uintptr_t)g_wifi.tx[index].headroom;
+  tail_address = (uint32_t)(uintptr_t)g_wifi.tx[tail_index].headroom;
+
+  g_wifi.tx_sent_head = index;
+  g_wifi.tx_sent_num = num;
+  g_wifi.tx_pend_head = WIFI_TX_CHAIN_END;
+  g_wifi.tx_pend_tail = WIFI_TX_CHAIN_END;
+  g_wifi.tx_pend_num = 0;
+
+  /* Marked now rather than when the frame was queued, because until this point
+   * no transaction covered it and wifi_tx_busy() would have reported a frame as
+   * being in the mailbox when it was only waiting for it.
+   */
+
+  for (guard = 0; guard <= CONFIG_BK7258_WIFI_TX_SLOTS &&
+                  index != WIFI_TX_CHAIN_END; guard++)
+    {
+      g_wifi.tx[index].transport_pending = true;
+      index = g_wifi.tx[index].chain_next;
+    }
+
+  g_wifi.tx_batches++;
+  g_wifi.tx_batched_frames += num;
+  if (num > g_wifi.tx_batch_max)
+    {
+      g_wifi.tx_batch_max = num;
+      high_water = num;
+    }
+
+  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+
+  /* Reported only when the batch beats every previous one, which bounds this to
+   * one line per attainable size -- at most CONFIG_BK7258_WIFI_TX_SLOTS for the
+   * life of the boot.  That is deliberate: the console shares the mailbox with
+   * these very frames, so anything that logged per batch would be measuring
+   * itself.  tx_batches and tx_batched_frames carry the averages for a debugger
+   * or a future readout that does not go through the console.
+   */
+
+  if (high_water != 0)
+    {
+      printf("bk7258_wifi: TX batch reached %u frame(s)\n",
+             (unsigned int)high_water);
+    }
+
+  ret = wifi_send_node(BK7258_WIFI_DATA_TX_CHANNEL, 2, head_address,
+                       tail_address, num, wifi_tx_transport_complete, NULL);
+  if (ret < 0)
+    {
+      /* Put the batch back instead of dropping it.  The upper half has already
+       * been told these frames were accepted, and a refused transaction is
+       * backpressure rather than a delivery failure -- which is the difference
+       * from the code this replaces, where the error reached
+       * netdev_upper_txpoll() and the packet was freed there.  Nothing can have
+       * queued behind them, because the caller still holds packet_lock.
+       */
+
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      index = g_wifi.tx_sent_head;
+      for (guard = 0; guard <= CONFIG_BK7258_WIFI_TX_SLOTS &&
+                      index != WIFI_TX_CHAIN_END; guard++)
+        {
+          g_wifi.tx[index].transport_pending = false;
+          index = g_wifi.tx[index].chain_next;
+        }
+
+      g_wifi.tx_pend_head = g_wifi.tx_sent_head;
+      g_wifi.tx_pend_tail = tail_index;
+      g_wifi.tx_pend_num = g_wifi.tx_sent_num;
+      g_wifi.tx_sent_head = WIFI_TX_CHAIN_END;
+      g_wifi.tx_sent_num = 0;
+      g_wifi.tx_batches--;
+      g_wifi.tx_batched_frames -= num;
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
     }
 }
 
@@ -1801,6 +2048,17 @@ static int wifi_worker(int argc, char **argv)
       (void)wifi_sync_reset_generation();
       wifi_collect_rejected_tx(&notifications);
       wifi_flush_recycle();
+
+      /* The outgoing batch.  Reached both from the acknowledgement of the
+       * previous one, which posts work_sem, and from this loop's own timeout --
+       * so a chain left waiting because the mailbox was down or busy is retried
+       * every WIFI_WORK_INTERVAL rather than waiting for the next frame to
+       * arrive and push it.
+       */
+
+      nxmutex_lock(&g_wifi.packet_lock);
+      wifi_flush_tx();
+      nxmutex_unlock(&g_wifi.packet_lock);
       for (;;)
         {
           if (bk7258_mailbox_peer_reset_generation() !=
@@ -1985,6 +2243,13 @@ static int wifi_ifdown(struct netdev_lowerhalf_s *lower)
   flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
   g_wifi.admin_up = false;
   g_wifi.tx_gate = false;
+
+  /* Closing tx_gate stops new frames, but whatever had accumulated would
+   * otherwise sit in the chain until the interface came back up and then go out
+   * against whatever role it found.
+   */
+
+  wifi_tx_pending_drop_locked();
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
   wifi_set_carrier(false);
@@ -2064,22 +2329,55 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
 
   tx->packet = packet;
   tx->active = true;
-  tx->transport_pending = true;
+  tx->transport_pending = false;
   tx->transport_rejected = false;
   tx->vif = vif;
   tx->role_epoch = role_epoch;
-  ret = wifi_send_node(BK7258_WIFI_DATA_TX_CHANNEL, 2,
-                       (uint32_t)(uintptr_t)cpdu,
-                       (uint32_t)(uintptr_t)cpdu, 1,
-                       wifi_tx_transport_complete, tx);
-  if (ret < 0)
-    {
-      tx->packet = NULL;
-      tx->active = false;
-      tx->transport_pending = false;
-    }
+
+  /* Append to the outgoing chain rather than starting a transaction of its own.
+   *
+   * Both links are written here: the index chain this driver walks, and the
+   * cpdu's next pointer that the CP walks.  Only this function writes either,
+   * and it holds packet_lock, so no ordering barrier is needed until the send
+   * itself -- wifi_send_node() issues one.
+   */
+
+  {
+    irqstate_t flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+    uint8_t self = (uint8_t)(tx - &g_wifi.tx[0]);
+
+    cpdu->next = 0;
+    tx->chain_next = WIFI_TX_CHAIN_END;
+
+    if (g_wifi.tx_pend_num == 0)
+      {
+        g_wifi.tx_pend_head = self;
+      }
+    else
+      {
+        struct wifi_tx_slot *prev = &g_wifi.tx[g_wifi.tx_pend_tail];
+
+        ((struct bk7258_wifi_cpdu *)prev->headroom)->next =
+          (uint32_t)(uintptr_t)cpdu;
+        prev->chain_next = self;
+      }
+
+    g_wifi.tx_pend_tail = self;
+    g_wifi.tx_pend_num++;
+    rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+  }
+
+  /* Tries to send immediately, and does nothing if a batch is already in
+   * flight -- in which case this frame goes out with the next one, which is
+   * where the saving comes from.  The packet now belongs to the driver either
+   * way, so this returns OK: netdev_ops_s documents that as the contract for
+   * taking a packet onto a driver queue, and returning an error instead would
+   * have netdev_upper_txpoll() free a frame that is still chained here.
+   */
+
+  wifi_flush_tx();
   nxmutex_unlock(&g_wifi.packet_lock);
-  return ret;
+  return OK;
 }
 
 static netpkt_t *wifi_receive(struct netdev_lowerhalf_s *lower)
@@ -2789,6 +3087,18 @@ int bk7258_wifi_initialize(void)
     {
       *(uint32_t *)g_wifi.command[i].bytes =
         BK7258_WIFI_CMD_PATTERN_FREE;
+    }
+
+  /* Explicitly, and before the worker below starts touching the chains: the
+   * memset above leaves these zero, and zero is slot 0 rather than "no slot".
+   */
+
+  g_wifi.tx_pend_head = WIFI_TX_CHAIN_END;
+  g_wifi.tx_pend_tail = WIFI_TX_CHAIN_END;
+  g_wifi.tx_sent_head = WIFI_TX_CHAIN_END;
+  for (i = 0; i < CONFIG_BK7258_WIFI_TX_SLOTS; i++)
+    {
+      g_wifi.tx[i].chain_next = WIFI_TX_CHAIN_END;
     }
 
   ret = bk7258_mailbox_register_rx(BK7258_WIFI_CMD_RX_CHANNEL,
