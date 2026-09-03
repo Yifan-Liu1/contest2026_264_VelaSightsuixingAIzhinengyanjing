@@ -102,6 +102,62 @@ int main(void)
           "does not mutate an invalid scan");
   }
 
+  /* Prefix validation: the capture driver decides bit alignment from the
+   * first few MCUs instead of the whole frame, so the two entry points must
+   * agree wherever the limit does not bite, and the limited one must still
+   * find and repair a shift.
+   */
+
+  {
+    unsigned char good[16] = {0x28, 0xa0, 0x0f};
+    size_t len = 3;
+
+    CHECK(bk7258_jpeg_realign_entropy_prefix(good, &len, sizeof(good),
+                                             16, 8, 0) == 0,
+          "prefix mode with no limit accepts an aligned scan");
+
+    len = 3;
+    CHECK(bk7258_jpeg_realign_entropy_prefix(good, &len, sizeof(good),
+                                             16, 8, 99) == 0,
+          "a limit above the frame's MCU count behaves as full validation");
+    CHECK(len == 3 && good[0] == 0x28 && good[1] == 0xa0 &&
+          good[2] == 0x0f,
+          "prefix mode leaves an aligned scan byte-for-byte unchanged");
+  }
+
+  {
+    unsigned char shifted[16] = {0x14, 0x50, 0x07};
+    size_t len = 3;
+    int shift = bk7258_jpeg_realign_entropy_prefix(shifted, &len,
+                                                   sizeof(shifted),
+                                                   16, 8, 1);
+
+    CHECK(shift == 1, "prefix mode detects the spurious leading bit");
+    CHECK(len == 3 && shifted[0] == 0x28 && shifted[1] == 0xa0 &&
+          shifted[2] == 0x0f,
+          "prefix mode repairs the scan exactly as full validation does");
+  }
+
+  {
+    /* One MCU of payload described as a two-MCU frame.  This is the
+     * documented cost of the prefix: the full walk sees the scan end early,
+     * the prefix walk stops before it would.
+     */
+
+    unsigned char one_mcu[16] = {0x28, 0xa0, 0x0f};
+    size_t len = 3;
+
+    CHECK(bk7258_jpeg_realign_entropy(one_mcu, &len, sizeof(one_mcu),
+                                      32, 8) < 0,
+          "full validation rejects a scan that stops one MCU short");
+
+    len = 3;
+    CHECK(bk7258_jpeg_realign_entropy_prefix(one_mcu, &len,
+                                             sizeof(one_mcu),
+                                             32, 8, 1) == 0,
+          "prefix validation accepts it after the MCU it was told to check");
+  }
+
   printf("%d checks, %d failure(s)\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

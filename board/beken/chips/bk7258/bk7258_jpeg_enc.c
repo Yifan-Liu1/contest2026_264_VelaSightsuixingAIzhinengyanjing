@@ -193,6 +193,10 @@
 #define JPEG_BITRATE_MAX_1280            (50u * 1024u)
 #define JPEG_BITRATE_MIN_1280            (30u * 1024u)
 
+#ifndef CONFIG_BK7258_JPEG_BITRATE_PCT
+#  define CONFIG_BK7258_JPEG_BITRATE_PCT 100
+#endif
+
 #define JPEG_X_PIXEL_320                 40u
 #define JPEG_X_PIXEL_640                 80u
 #define JPEG_X_PIXEL_1280                160u
@@ -399,6 +403,18 @@ static void bk7258_jpeg_enc_set_target_bitrate(uint32_t x_pixel)
         low_size = JPEG_BITRATE_MIN_640;
         break;
     }
+
+  /* Scaled, so the frame size can be traded against everything downstream of
+   * it without editing the vendor's table.
+   *
+   * Every byte the encoder emits is a byte the DMA moves, the EOF handler
+   * copies out of the ring and the validator walks, so this is the one knob
+   * that shortens all three at once.  It costs picture quality, which is why
+   * 100 -- the vendor's own numbers, unchanged -- is the default.
+   */
+
+  up_size  = up_size / 100u * CONFIG_BK7258_JPEG_BITRATE_PCT;
+  low_size = low_size / 100u * CONFIG_BK7258_JPEG_BITRATE_PCT;
 
   putreg32(up_size, JPEG_TARGET_BYTE_H);
   putreg32(low_size, JPEG_TARGET_BYTE_L);

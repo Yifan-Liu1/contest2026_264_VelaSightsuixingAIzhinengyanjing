@@ -398,12 +398,13 @@ static bool jpeg_decode_block(FAR struct jpeg_bits_s *bits,
 
 static bool jpeg_alignment_valid(FAR const uint8_t *buf, size_t len,
                                  uint16_t width, uint16_t height,
-                                 unsigned int shift)
+                                 unsigned int shift, uint32_t mcu_limit)
 {
   struct jpeg_bits_s bits = {buf, len, 0, 0, 0, false};
   uint32_t mcus_x = ((uint32_t)width + 15u) / 16u;
   uint32_t mcus_y = ((uint32_t)height + 7u) / 8u;
   uint32_t mcus = mcus_x * mcus_y;
+  bool partial = mcu_limit != 0 && mcu_limit < mcus;
   uint32_t i;
   unsigned int padding = 0;
   int bit;
@@ -412,6 +413,11 @@ static bool jpeg_alignment_valid(FAR const uint8_t *buf, size_t len,
       jpeg_skip_bits(&bits, shift) < 0)
     {
       return false;
+    }
+
+  if (partial)
+    {
+      mcus = mcu_limit;
     }
 
   for (i = 0; i < mcus; i++)
@@ -423,6 +429,18 @@ static bool jpeg_alignment_valid(FAR const uint8_t *buf, size_t len,
         {
           return false;
         }
+    }
+
+  /* The tail test belongs to the whole scan.  A prefix walk has by
+   * construction not reached the end, so requiring the padding there would
+   * reject every frame; what it has established -- that this shift decodes
+   * cleanly where a wrong one could not -- is the whole question it was
+   * asked.
+   */
+
+  if (partial)
+    {
+      return !bits.invalid;
     }
 
   while ((bit = jpeg_get_bit(&bits)) >= 0)
@@ -527,9 +545,9 @@ static size_t jpeg_write_shifted(FAR uint8_t *dest,
   return outpos;
 }
 
-int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
-                                size_t capacity, uint16_t width,
-                                uint16_t height)
+int bk7258_jpeg_realign_entropy_prefix(FAR uint8_t *buf, FAR size_t *len,
+                                       size_t capacity, uint16_t width,
+                                       uint16_t height, uint32_t mcu_limit)
 {
   size_t scanlen;
   unsigned int shift;
@@ -549,7 +567,8 @@ int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
 
   for (shift = 0; shift < 8; shift++)
     {
-      if (jpeg_alignment_valid(buf, scanlen, width, height, shift))
+      if (jpeg_alignment_valid(buf, scanlen, width, height, shift,
+                               mcu_limit))
         {
           size_t outlen;
           FAR uint8_t *scratch;
@@ -578,4 +597,12 @@ int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
     }
 
   return -EBADMSG;
+}
+
+int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
+                                size_t capacity, uint16_t width,
+                                uint16_t height)
+{
+  return bk7258_jpeg_realign_entropy_prefix(buf, len, capacity, width,
+                                            height, 0);
 }

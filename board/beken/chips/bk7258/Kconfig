@@ -307,6 +307,94 @@ config BK7258_CAMERA_HW_JPEG
 		prove every hardware frame is correctly assembled; when disabled,
 		/dev/video0 uses the slower libjpeg software encoder.
 
+if BK7258_CAMERA_HW_JPEG
+
+config BK7258_CAMERA_JPEG_VALIDATE_MCUS
+	int "Macroblocks of each frame to Huffman-validate (0 = all)"
+	default 128
+	range 0 65535
+	---help---
+		The driver decides whether the encoder inserted spurious leading
+		entropy bits by decoding the scan and seeing whether it decodes.
+		Bit alignment is a property of the whole scan -- a stream read one
+		bit off desynchronises within a few blocks -- so a prefix answers
+		the question, and the whole frame is what makes the answer
+		expensive: 640x480 is 2400 macroblocks of table-driven decode over
+		non-cacheable PSRAM, measured at ~35 ms per frame, which is more
+		than a frame period and is why the delivered rate sits at about
+		half the sensor's.
+
+		What a prefix cannot see is corruption after the prefix. The
+		byte-count reconciliation below covers that class instead, the way
+		the vendor's own EOF handler does.
+
+		Set 0 to walk every macroblock, which is what this driver did
+		before the knob existed. Frames that fail are always rejected, at
+		either setting.
+
+config BK7258_CAMERA_JPEG_RECONCILE
+	bool "Reject frames whose delivered length disagrees with the hardware"
+	default n
+	---help---
+		Compare the bytes the drain DMA actually moved against the
+		hardware's own byte_count_pfrm, less the five CRC bytes it appends,
+		and fail the frame when they differ by more than a small window.
+		This is what dvp_camera_jpeg_eof_handler() does in the vendor
+		driver, and it costs one subtraction.
+
+		Off by default because the window is a property of this board's
+		drain behaviour: the difference is recorded and printed by
+		stop_capture at either setting, so measure it before enforcing it.
+		Enforcing with a wrong window rejects every frame.
+
+config BK7258_CAMERA_JPEG_DRAIN_SPINS
+	int "Bounded wait for the encoder FIFO to empty at EOF"
+	default 100000
+	range 0 1000000
+	---help---
+		EOF means the encoder stopped producing, not that the bitstream
+		reached memory, so the handler waits for the output FIFO to drain
+		before it snapshots the span. The wait is a busy loop in interrupt
+		context, and the vendor does not have it at all -- its handler
+		flushes and stops the channel immediately and catches a short frame
+		through the byte-count comparison instead.
+
+		stop_capture prints the worst and average spin counts, so the real
+		cost is measurable before this is lowered. Zero disables the wait
+		entirely, which is the vendor's behaviour.
+
+config BK7258_CAMERA_JPEG_DMA_DEST_BURST
+	int "Drain DMA destination burst length (0=single, 1=INC4, 2=INC8, 3=INC16)"
+	default 0
+	range 0 3
+	---help---
+		The vendor sets INC16 on the memory side of its JPEG drain channel
+		and SINGLE on the FIFO side (dvp_camera_dma_config(), CONFIG_SPE
+		branch). The FIFO side must stay SINGLE here because its address
+		does not advance, so only the destination is adjustable.
+
+		Zero is the reset value and what this port has always used. Raising
+		it is a throughput experiment: it changes how the AHB moves the
+		25 KB of a frame and nothing else.
+
+config BK7258_JPEG_BITRATE_PCT
+	int "Hardware JPEG rate-control target, percent of the vendor's values"
+	default 100
+	range 20 200
+	---help---
+		Scales both bounds the encoder's rate control aims for. The vendor's
+		table is 35 KB/20 KB at 640x480, 20 KB/5 KB at 320x240 and
+		50 KB/30 KB at 1280x720 (jpeg_hal.c), and 100 leaves them exactly
+		as they are.
+
+		Every byte the encoder emits is a byte the DMA moves, the EOF
+		handler copies out of the drain ring and the validator walks, so
+		this is the one setting that shortens all three together. It pays
+		for that in picture quality, which is why it defaults to the
+		vendor's numbers.
+
+endif
+
 endif
 
 endif

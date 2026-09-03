@@ -156,9 +156,59 @@
  */
 
 #define BK7258_CAMERA_JPEG_SOI_SCAN   256u
-#define BK7258_CAMERA_JPEG_DRAIN_SPINS 100000u
 #define BK7258_CAMERA_JPEG_EOI_BACK   16u
 #define BK7258_CAMERA_JPEG_EOI_FWD    1024u
+
+/* How long the EOF handler may wait for the encoder's output FIFO to empty.
+ *
+ * Configurable because it is a busy-wait in interrupt context and the vendor
+ * does not have it at all: its EOF handler flushes and stops the channel
+ * straight away, and catches whatever the drain left behind through the
+ * byte-count reconciliation below.  Keeping the wait is cheaper than
+ * discarding a frame, but only measurement can say how long it really runs,
+ * which is what jpeg_drain_spins_max is for.
+ */
+
+#ifndef CONFIG_BK7258_CAMERA_JPEG_DRAIN_SPINS
+#  define CONFIG_BK7258_CAMERA_JPEG_DRAIN_SPINS 100000
+#endif
+
+#define BK7258_CAMERA_JPEG_DRAIN_SPINS \
+  ((uint32_t)CONFIG_BK7258_CAMERA_JPEG_DRAIN_SPINS)
+
+/* How many macroblocks of a delivered frame are Huffman-validated.
+ *
+ * Zero means the whole frame, which is what this driver did until now and
+ * what CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS=0 restores.  See
+ * bk7258_jpeg_realign_entropy_prefix() for why a prefix settles the question
+ * the walk is asked (bit alignment is a property of the whole scan) and what
+ * it gives up (corruption past the prefix, which the reconciliation covers).
+ */
+
+#ifndef CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS
+#  define CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS 0
+#endif
+
+#ifndef CONFIG_BK7258_CAMERA_JPEG_DMA_DEST_BURST
+#  define CONFIG_BK7258_CAMERA_JPEG_DMA_DEST_BURST 0
+#endif
+
+/* Tolerance for the delivered-versus-counted comparison.
+ *
+ * The hardware appends JPEG_CRC_SIZE (5) bytes after the end-of-image marker
+ * and the last DMA chunk is accounted in whole 32-bit words, so a healthy
+ * frame does not match exactly; the vendor allows any difference short of a
+ * whole chunk.  This window is deliberately much tighter, because its
+ * purpose here is to notice a span that picked up a neighbour's bytes.
+ */
+
+#define BK7258_CAMERA_JPEG_RECON_SLACK 64
+
+#ifdef CONFIG_BK7258_CAMERA_JPEG_RECONCILE
+#  define BK7258_CAMERA_JPEG_RECON_ENFORCED 1
+#else
+#  define BK7258_CAMERA_JPEG_RECON_ENFORCED 0
+#endif
 
 /* Smallest V4L2 buffer this driver will drain an encoded frame into.
  *
@@ -315,9 +365,49 @@ struct bk7258_camera_imgdata_s
   volatile uint32_t jpeg_bit_fail;  /* Frames with no valid bit alignment. */
   volatile uint8_t jpeg_tail[8];    /* Bytes around a rejected frame's end. */
   volatile uint32_t jpeg_tail_at;   /* Where jpeg_tail was sampled. */
-  /* The drain ring.  The DMA writes into this continuously for the whole
-   * streaming session and is never stopped or re-armed between frames; a
-   * frame is a span of it, copied out when the encoder reports EOF.
+
+  /* Where the time in a delivered frame actually goes.
+   *
+   * Cycle counts, not ticks: at CONFIG_USEC_PER_TICK=1000 a tick cannot see
+   * the copy at all, and "0 ms" is indistinguishable from "not measured".
+   * up_perf_gettime() is the DWT cycle counter on this core (armv8-m
+   * arm_perf.c), so these are directly comparable with each other and, once
+   * divided by the elapsed wall time, they also say what the core clock
+   * really is -- which is the one number the driver has so far had to assume
+   * (CONFIG_BK7258_CPU_FREQ_HZ only ever reached systick).
+   */
+
+  volatile uint32_t jpeg_copy_cycles;    /* Ring span -> V4L2 buffer */
+  volatile uint32_t jpeg_hdr_cycles;     /* write_header() */
+  volatile uint32_t jpeg_scratch_cycles; /* Entropy in/out of scratch */
+  volatile uint32_t jpeg_realign_cycles; /* Huffman/MCU validation */
+  clock_t jpeg_start_cycles;             /* Cycle counter at stream start */
+
+  /* Worst and total FIFO drain waits, and how often the wait ran out. */
+
+  volatile uint32_t jpeg_drain_spins_max;
+  volatile uint32_t jpeg_drain_spins_sum;
+  volatile uint32_t jpeg_drain_timeouts;
+
+  /* The vendor's frame-integrity check: what the hardware says it encoded
+   * against what the DMA actually delivered (dvp_camera_jpeg_eof_handler()).
+   * Recorded always; enforced only with CONFIG_BK7258_CAMERA_JPEG_RECONCILE,
+   * because the tolerance window is a property of this board's drain
+   * behaviour and has to be measured before it can be trusted to reject.
+   */
+
+  volatile int32_t jpeg_recon_delta;    /* Last delivered-minus-counted */
+  volatile int32_t jpeg_recon_worst;    /* Largest magnitude seen */
+  volatile uint32_t jpeg_recon_bad;     /* Frames outside the window */
+
+  /* The drain ring.  Three slots: the DMA owns one at a time and is switched
+   * to the next at every EOF -- flush, stop, re-arm, exactly as the vendor
+   * does at its own frame boundary (dvp_camera_jpeg_eof_handler()).  The
+   * difference is only where it re-arms to: the vendor points the channel at
+   * the next frame buffer it will hand up, while this driver cannot (the
+   * framework supplies one buffer at a time, inside the completion
+   * callback), so a frame is a span of the slot that was just closed,
+   * copied out from there.
    */
 
   FAR uint8_t *jpeg_ring;
@@ -331,6 +421,17 @@ struct bk7258_camera_imgdata_s
   volatile uint32_t jpeg_finish_pending; /* EOF snapshots with FINISH pending */
   volatile uint32_t jpeg_pending_mask;   /* First 32 delivered frame indices */
   volatile int32_t jpeg_pending_delta;   /* raw delivered - hw byte_count */
+
+  /* Set by any path that decided the pipeline is out of step, cleared by the
+   * VSYNC handler once it has reset it.  The vendor keeps exactly one such
+   * flag (dvp_driver_handle_t::error) and every producer of an error sets it
+   * rather than recovering on the spot, so recovery always lands on a frame
+   * boundary.  Before this, only the encoder's own err_count could trigger a
+   * reset, and a frame lost to a missing EOI or an unrecognisable span left
+   * the hardware running with whatever phase had caused it.
+   */
+
+  volatile bool jpeg_error;
   volatile bool capturing;
   imgdata_capture_t capture_cb;
   FAR void *capture_cb_arg;
@@ -497,16 +598,16 @@ static void bk7258_camera_watchdog_arm(
  * Name: bk7258_camera_jpeg_dma_arm
  *
  * Description:
- *   Points the drain channel at the current V4L2 buffer and starts it.
+ *   Points the drain channel at the slot the DMA is to own next and starts
+ *   it.
  *
- *   Called both at stream start and from the frame-done path, so it must be
- *   safe in interrupt context: register writes only.
+ *   Called at stream start, from the frame-done path and from the VSYNC
+ *   recovery, so it must be safe in interrupt context: register writes only.
  *
- *   The destination loops over exactly the buffer the framework gave us.
- *   That bound is what keeps a runaway encoder from writing past the buffer:
- *   a frame larger than the buffer wraps and corrupts its own beginning,
- *   which the EOI check then rejects, instead of corrupting somebody else's
- *   memory.
+ *   The destination loops over exactly one slot of the ring.  That bound is
+ *   what keeps a runaway encoder from writing past it: a frame larger than a
+ *   slot wraps and corrupts its own beginning, which the SOI/EOI checks then
+ *   reject, instead of corrupting somebody else's memory.
  *
  ****************************************************************************/
 
@@ -538,6 +639,15 @@ static void bk7258_camera_jpeg_dma_arm(
   cfg.dest_loop_start = dest;
   cfg.dest_loop_end   = dest + slot_bytes;
   cfg.data_width      = BK7258_DMA_WIDTH_32BITS;
+
+  /* Burst lengths.  The vendor uses SINGLE on the FIFO side and INC16 into
+   * memory (dvp_camera_dma_config(), CONFIG_SPE branch); a FIFO source must
+   * stay SINGLE because its address does not advance, so only the
+   * destination is a knob.
+   */
+
+  cfg.src_burst       = BK7258_DMA_BURST_SINGLE;
+  cfg.dest_burst      = CONFIG_BK7258_CAMERA_JPEG_DMA_DEST_BURST;
 
   /* Cleared here because the delivered length of the next frame is counted
    * from this point: arming resets the destination to the top of the buffer.
@@ -655,6 +765,7 @@ static void bk7258_camera_jpeg_validate_work(FAR void *arg)
   uint32_t frame_len;
   size_t entropy_len;
   clock_t validate_start;
+  clock_t mark;
   int bitshift;
   int result = EIO;
 
@@ -664,11 +775,15 @@ static void bk7258_camera_jpeg_validate_work(FAR void *arg)
       return;
     }
 
+  mark = up_perf_gettime();
   hdrlen = (uint32_t)bk7258_jpeg_enc_write_header(priv->frame_buf,
                                                    BK7258_JPEG_ENC_PAD);
+  priv->jpeg_hdr_cycles += (uint32_t)(up_perf_gettime() - mark);
+
   if (hdrlen == 0)
     {
       priv->jpeg_hdr_fail++;
+      priv->jpeg_error = true;
     }
   else
     {
@@ -682,16 +797,25 @@ static void bk7258_camera_jpeg_validate_work(FAR void *arg)
         }
       else
         {
+          mark = up_perf_gettime();
           memcpy(priv->jpeg_validate_scratch,
                  priv->frame_buf + hdrlen, entropy_len);
-          bitshift = bk7258_jpeg_realign_entropy(
+          priv->jpeg_scratch_cycles += (uint32_t)(up_perf_gettime() - mark);
+
+          mark = up_perf_gettime();
+          bitshift = bk7258_jpeg_realign_entropy_prefix(
             priv->jpeg_validate_scratch, &entropy_len,
-            priv->jpeg_validate_scratch_bytes, priv->width, priv->height);
+            priv->jpeg_validate_scratch_bytes, priv->width, priv->height,
+            CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS);
+          priv->jpeg_realign_cycles += (uint32_t)(up_perf_gettime() - mark);
 
           if (bitshift > 0)
             {
+              mark = up_perf_gettime();
               memcpy(priv->frame_buf + hdrlen,
                      priv->jpeg_validate_scratch, entropy_len);
+              priv->jpeg_scratch_cycles +=
+                (uint32_t)(up_perf_gettime() - mark);
             }
         }
 
@@ -702,6 +826,7 @@ static void bk7258_camera_jpeg_validate_work(FAR void *arg)
       if (bitshift < 0)
         {
           priv->jpeg_bit_fail++;
+          priv->jpeg_error = true;
         }
       else
         {
@@ -818,6 +943,23 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
         }
     }
 
+  if (i > priv->jpeg_drain_spins_max)
+    {
+      priv->jpeg_drain_spins_max = i;
+    }
+
+  priv->jpeg_drain_spins_sum += i;
+
+  if (i >= BK7258_CAMERA_JPEG_DRAIN_SPINS)
+    {
+      /* The FIFO never reported empty.  The frame is very likely short, so
+       * let the VSYNC handler reset rather than trusting the span.
+       */
+
+      priv->jpeg_drain_timeouts++;
+      priv->jpeg_error = true;
+    }
+
   /* Match the vendor frame boundary: flush the partial DMA word, stop the
    * channel, snapshot its completed slot, and restart into a fresh slot
    * before doing any copy or validation.  Earlier stop/re-arm attempts used
@@ -891,6 +1033,7 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
            */
 
           priv->jpeg_no_soi++;
+          priv->jpeg_error = true;
           priv->jpeg_ring_read = write_pos;
 
           if (priv->capturing)
@@ -900,6 +1043,51 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
 
           return;
         }
+    }
+
+  /* The vendor's integrity check, on the span that is about to be delivered.
+   *
+   * dvp_camera_jpeg_eof_handler() compares what the DMA moved against the
+   * hardware's own byte_count_pfrm and, when they disagree by anything short
+   * of a whole chunk, flags the frame and lets the next VSYNC reset the
+   * pipeline.  It costs one subtraction and catches the class of fault a
+   * Huffman walk cannot see: a span that lost bytes, or picked up a
+   * neighbour's.
+   */
+
+  priv->jpeg_recon_delta = (int32_t)delivered - (int32_t)bytes -
+                           (int32_t)BK7258_JPEG_ENC_CRC_SIZE;
+
+  if (priv->jpeg_recon_delta > priv->jpeg_recon_worst ||
+      -priv->jpeg_recon_delta > priv->jpeg_recon_worst)
+    {
+      priv->jpeg_recon_worst = priv->jpeg_recon_delta < 0 ?
+                               -priv->jpeg_recon_delta :
+                               priv->jpeg_recon_delta;
+    }
+
+  if (priv->jpeg_recon_delta > BK7258_CAMERA_JPEG_RECON_SLACK ||
+      priv->jpeg_recon_delta < -BK7258_CAMERA_JPEG_RECON_SLACK)
+    {
+      priv->jpeg_recon_bad++;
+
+#ifdef CONFIG_BK7258_CAMERA_JPEG_RECONCILE
+      priv->jpeg_error = true;
+      priv->jpeg_ring_read = write_pos;
+
+      if (priv->capture_cb != NULL)
+        {
+          bk7258_camera_now(&ts);
+          priv->capture_cb(EIO, 0, &ts, priv->capture_cb_arg);
+        }
+
+      if (priv->capturing)
+        {
+          bk7258_camera_watchdog_arm(priv);
+        }
+
+      return;
+#endif
     }
 
   capacity = priv->frame_buf_size > BK7258_JPEG_ENC_PAD ?
@@ -913,6 +1101,7 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
        */
 
       priv->jpeg_ring_over++;
+      priv->jpeg_error = true;
       priv->jpeg_ring_read = write_pos;
 
 
@@ -989,7 +1178,10 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
 
   if (delivered > 0)
     {
+      clock_t mark = up_perf_gettime();
+
       memcpy(buf, raw + priv->jpeg_ring_read, delivered);
+      priv->jpeg_copy_cycles += (uint32_t)(up_perf_gettime() - mark);
     }
 
   priv->jpeg_ring_read = write_pos;
@@ -1036,6 +1228,7 @@ static void bk7258_camera_jpeg_eof(FAR void *arg, uint32_t bytes)
   if (len == 0)
     {
       priv->jpeg_short++;
+      priv->jpeg_error = true;
 
       /* Record what is actually at the reported length, so the next run says
        * what the encoder produced instead of guessing at it.
@@ -1135,12 +1328,23 @@ static void bk7258_camera_jpeg_vsync(FAR void *arg)
 
   bk7258_jpeg_enc_get_stats(&st);
 
-  if (st.err_count == priv->jpeg_err_seen)
+  /* Two sources, one recovery.  The encoder's own frame_err counter is what
+   * this handler was built on; jpeg_error is everything the drain side
+   * decided was out of step -- a span with no SOI, a length the hardware
+   * disagrees with, a frame that never showed an end-of-image marker.  The
+   * vendor funnels all of them into a single flag for exactly this reason
+   * (dvp_driver_handle_t::error, cleared in the vendor's own
+   * dvp_camera_vsync_negedge_handler()): recovering anywhere other than a
+   * frame boundary reproduces the phase problem it is trying to clear.
+   */
+
+  if (st.err_count == priv->jpeg_err_seen && !priv->jpeg_error)
     {
       return;
     }
 
   priv->jpeg_err_seen = st.err_count;
+  priv->jpeg_error = false;
   priv->jpeg_resets++;
 
   bk7258_yuv_buf_stop();
@@ -1970,6 +2174,17 @@ static int bk7258_camera_imgdata_start_capture(
       priv->jpeg_bit_fail = 0;
       priv->jpeg_hw_busy = 0;
       priv->jpeg_sw_skipped = 0;
+      priv->jpeg_error = false;
+      priv->jpeg_copy_cycles = 0;
+      priv->jpeg_hdr_cycles = 0;
+      priv->jpeg_scratch_cycles = 0;
+      priv->jpeg_realign_cycles = 0;
+      priv->jpeg_drain_spins_max = 0;
+      priv->jpeg_drain_spins_sum = 0;
+      priv->jpeg_drain_timeouts = 0;
+      priv->jpeg_recon_delta = 0;
+      priv->jpeg_recon_worst = 0;
+      priv->jpeg_recon_bad = 0;
 
       /* Seeded to "due now" so the first frame of a session is never delayed
        * by the pacing; the period itself was computed before the split above.
@@ -1994,6 +2209,7 @@ static int bk7258_camera_imgdata_start_capture(
       bk7258_camera_jpeg_dma_arm(priv);
 
       priv->start_ticks = clock_systime_ticks();
+      priv->jpeg_start_cycles = up_perf_gettime();
       bk7258_yuv_buf_start_jpeg();
       bk7258_jpeg_enc_start();
     }
@@ -2163,6 +2379,65 @@ static int bk7258_camera_imgdata_stop_capture(FAR struct imgdata_s *data)
                  (unsigned int)(priv->jpeg_validate_runs ?
                    TICK2MSEC(priv->jpeg_validate_ticks) /
                    priv->jpeg_validate_runs : 0u));
+
+          /* Cycle-resolution breakdown, and the core clock it implies.
+           *
+           * Reported per delivered frame so the four numbers add up to
+           * something comparable with the validator average above, and as a
+           * derived frequency so that CONFIG_BK7258_CPU_FREQ_HZ -- which
+           * only ever reached systick -- can be checked against the
+           * hardware rather than believed.
+           *
+           * Only for the hardware path: everything below is maintained by
+           * the drain and validation code, so on a software session it would
+           * print whatever the last hardware session left behind.
+           */
+
+          if (!priv->jpeg_software && priv->jpeg_validate_runs != 0)
+            {
+              uint32_t runs = priv->jpeg_validate_runs;
+
+              printf("bk7258_camera_imgdata: stop_capture: cycles/frame "
+                     "copy=%u hdr=%u scratch=%u realign=%u "
+                     "(validate_mcus=%d)\n",
+                     (unsigned int)(priv->jpeg_copy_cycles / runs),
+                     (unsigned int)(priv->jpeg_hdr_cycles / runs),
+                     (unsigned int)(priv->jpeg_scratch_cycles / runs),
+                     (unsigned int)(priv->jpeg_realign_cycles / runs),
+                     CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS);
+            }
+
+          if (!priv->jpeg_software && ms != 0)
+            {
+              uint32_t elapsed_cycles =
+                (uint32_t)(up_perf_gettime() - priv->jpeg_start_cycles);
+
+              printf("bk7258_camera_imgdata: stop_capture: core clock "
+                     "measured=%u kHz configured=%u kHz\n",
+                     (unsigned int)(elapsed_cycles / ms),
+                     (unsigned int)(CONFIG_BK7258_CPU_FREQ_HZ / 1000));
+            }
+
+          if (!priv->jpeg_software)
+            {
+              printf("bk7258_camera_imgdata: stop_capture: drain spins "
+                     "max=%u avg=%u timeouts=%u limit=%u\n",
+                     (unsigned int)priv->jpeg_drain_spins_max,
+                     (unsigned int)(priv->jpeg_vsyncs ?
+                       priv->jpeg_drain_spins_sum / priv->jpeg_vsyncs : 0u),
+                     (unsigned int)priv->jpeg_drain_timeouts,
+                     (unsigned int)BK7258_CAMERA_JPEG_DRAIN_SPINS);
+
+              printf("bk7258_camera_imgdata: stop_capture: reconcile "
+                     "last=%d worst=%d outside_window=%u slack=%d "
+                     "enforced=%d\n",
+                     (int)priv->jpeg_recon_delta,
+                     (int)priv->jpeg_recon_worst,
+                     (unsigned int)priv->jpeg_recon_bad,
+                     BK7258_CAMERA_JPEG_RECON_SLACK,
+                     BK7258_CAMERA_JPEG_RECON_ENFORCED);
+            }
+
           printf("bk7258_camera_imgdata: stop_capture: bytes[%u-4..+4] = "
                  "%02x %02x %02x %02x | %02x %02x %02x %02x\n",
                  (unsigned int)priv->jpeg_tail_at,

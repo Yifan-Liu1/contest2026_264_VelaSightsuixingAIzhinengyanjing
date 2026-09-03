@@ -164,6 +164,16 @@ bool bk7258_jpeg_enc_fifo_empty(void);
 
 #define BK7258_JPEG_ENC_PAD           256u
 
+/* Bytes the block appends after the end-of-image marker.
+ *
+ * The vendor names it JPEG_CRC_SIZE and subtracts it from every accumulated
+ * DMA length before comparing against byte_count_pfrm
+ * (bk_avdk_smp/ap/include/driver/hal/hal_jpeg_types.h, and
+ * dvp_camera_jpeg_eof_handler()).  Its only use here is the same comparison.
+ */
+
+#define BK7258_JPEG_ENC_CRC_SIZE      5u
+
 /* Staging room for the SOF0 and DQT segments copied out of the block's
  * header: 19 + 69 + 69 = 157 bytes measured, rounded up.
  */
@@ -244,6 +254,32 @@ static inline size_t bk7258_jpeg_find_sos_entropy(
  * negated errno without mutation when no alignment validates or capacity is
  * insufficient for the overlap-safe repair.  `capacity` starts at `buf`.
  */
+
+/* As above, but stop decoding after mcu_limit macroblocks.
+ *
+ * Bit alignment is a property of the whole scan, not of a position within
+ * it: a Huffman stream read one bit off desynchronises within a few blocks
+ * and every subsequent code is garbage.  Deciding it therefore does not need
+ * the whole frame, and the whole frame is what makes the check expensive --
+ * a 640x480 scan is 2400 MCUs of table-driven decode over non-cacheable
+ * PSRAM.
+ *
+ * What a prefix cannot see is corruption *after* the prefix, which the full
+ * walk catches through its trailing-padding test.  The capture driver covers
+ * that with the vendor's own check instead: the hardware's byte_count_pfrm
+ * against the bytes the DMA actually delivered
+ * (bk7258_camera_jpeg_reconcile()), plus the end-of-image marker having been
+ * found where that count says it should be.
+ *
+ * mcu_limit == 0 means "no limit" and is exactly the full-frame behaviour,
+ * including the padding test.  A limit at or above the frame's MCU count is
+ * also treated as full.
+ */
+
+int bk7258_jpeg_realign_entropy_prefix(FAR uint8_t *buf, FAR size_t *len,
+                                       size_t capacity, uint16_t width,
+                                       uint16_t height,
+                                       uint32_t mcu_limit);
 
 int bk7258_jpeg_realign_entropy(FAR uint8_t *buf, FAR size_t *len,
                                 size_t capacity, uint16_t width,

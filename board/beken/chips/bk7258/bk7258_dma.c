@@ -123,6 +123,17 @@
 #define BK7258_DMA_REQ_MUX_SRC_SEC       (1u << 20)
 #define BK7258_DMA_REQ_MUX_DEST_SEC      (1u << 21)
 
+/* req_mux[25:24] src_burst_len, req_mux[27:26] dest burst length.  Field
+ * order from ap/middleware/soc/bk7258_ap/soc/dma_struct.h: src_req_mux[4:0],
+ * dest_req_mux[9:5], src_read_interval[15:12], dest_write_interval[19:16],
+ * src_sec_attr[20], dest_sec_attr[21], bus_err_int_en[22], src_burst_len,
+ * dtst_burst_len, pixel_trans_type[29:28].
+ */
+
+#define BK7258_DMA_REQ_MUX_SRC_BURST_SHIFT  24u
+#define BK7258_DMA_REQ_MUX_DEST_BURST_SHIFT 26u
+#define BK7258_DMA_REQ_MUX_BURST_MASK       0x3u
+
 #define BK7258_DMA_STATUS_REMAIN_LEN_MASK 0x1ffffu
 #define BK7258_DMA_STATUS_FLUSH_SRC_BUFF  (1u << 17)
 #define BK7258_DMA_STATUS_FINISH_INT      (1u << 18)
@@ -273,6 +284,8 @@ void bk7258_dma_configure(uint32_t src_addr, uint32_t dest_addr,
   cfg.dest_loop_start = 0;
   cfg.dest_loop_end   = 0;
   cfg.data_width      = BK7258_DMA_WIDTH_8BITS;
+  cfg.src_burst       = BK7258_DMA_BURST_SINGLE;
+  cfg.dest_burst      = BK7258_DMA_BURST_SINGLE;
 
   bk7258_dma_configure_ex(&cfg);
 }
@@ -309,15 +322,20 @@ int bk7258_dma_configure_ex(const struct bk7258_dma_cfg_s *cfg)
    * src_sec_attr/dest_sec_attr are set because this AP is the secure world;
    * the reference sets both for its JPEG channel under CONFIG_SPE
    * (bk_dma_set_src_sec_attr/bk_dma_set_dest_sec_attr in
-   * dvp_camera_dma_config()).  Burst lengths are left at their reset value:
-   * the reference's INC16 destination burst is a throughput choice, not a
-   * requirement, and one variable at a time.
+   * dvp_camera_dma_config()).  Burst lengths come from the caller and
+   * default to the reset value: the reference's INC16 destination burst is a
+   * throughput choice, not a requirement, so it is a knob rather than a
+   * default here.
    */
 
   putreg32(((uint32_t)cfg->src_dev & BK7258_DMA_REQ_MUX_MASK) <<
              BK7258_DMA_REQ_MUX_SRC_SHIFT |
            ((uint32_t)cfg->dest_dev & BK7258_DMA_REQ_MUX_MASK) <<
              BK7258_DMA_REQ_MUX_DEST_SHIFT |
+           ((uint32_t)cfg->src_burst & BK7258_DMA_REQ_MUX_BURST_MASK) <<
+             BK7258_DMA_REQ_MUX_SRC_BURST_SHIFT |
+           ((uint32_t)cfg->dest_burst & BK7258_DMA_REQ_MUX_BURST_MASK) <<
+             BK7258_DMA_REQ_MUX_DEST_BURST_SHIFT |
            BK7258_DMA_REQ_MUX_SRC_SEC | BK7258_DMA_REQ_MUX_DEST_SEC,
            BK7258_DMA_CH_REQ_MUX(cfg->channel));
 

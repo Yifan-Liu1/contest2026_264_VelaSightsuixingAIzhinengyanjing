@@ -28,6 +28,7 @@
 
 #include <nuttx/config.h>
 #include <nuttx/arch.h>
+#include <nuttx/irq.h>
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -122,6 +123,15 @@ struct bk7258_gc2145_dev_s
 {
   struct imgsensor_s sensor;    /* Must be first: base-pointer cast. */
   bool initialized;
+
+  /* Whether the DVP output pads are driving.  See
+   * bk7258_gc2145_set_stream(): the sensor is silent from init() until
+   * start_capture() opens the pads, which is what lets the capture module
+   * arm the encoder against a quiescent bus.
+   */
+
+  bool streaming;
+  bool stream_off_pending;      /* stop_capture() ran in interrupt context */
   uint32_t current_fps;         /* Rate programmed, 0 = fixed by the mode. */
   FAR const struct gc2145_mode *mode;   /* Resolution programmed. */
 };
@@ -736,7 +746,6 @@ static const struct gc2145_reg g_gc2145_init_regs[] =
   { 0x9F, 0x40 },
   { 0xFE, 0x00 },
   { 0xFE, 0x00 },
-  { 0xF2, 0x0F },
   { 0xFE, 0x02 },
   { 0x40, 0xBF },
   { 0x46, 0xCF },
@@ -1520,6 +1529,58 @@ static bool bk7258_gc2145_write_reg_table(const struct gc2145_reg *table,
   return true;
 }
 
+/****************************************************************************
+ * Name: bk7258_gc2145_set_stream
+ *
+ * Description:
+ *   Open or close GC2145's DVP output pads (page 0 register 0xF2).
+ *
+ *   This is the sensor's stream enable, and having it is what lets the
+ *   capture path be brought up the way the vendor brings its own up:
+ *   bk_dvp_open() arms the DMA, configures YUV_BUF, enables the JPEG block
+ *   (step 5) and only then calls sensor->init() (step 6), so its encoder
+ *   never sees a partial frame.  The NuttX framework already calls in that
+ *   order -- v4l2_cap.c's start_capture() runs IMGDATA_START_CAPTURE()
+ *   before IMGSENSOR_START_CAPTURE() -- so the only thing missing was a
+ *   sensor that stays quiet in between.
+ *
+ *   0xF2 is the same register the vendor's own table uses for this: it
+ *   writes 0x00 in the preamble and 0x0F at the end of gc2145_init
+ *   (bk_avdk_smp/ap/components/bk_peripheral/src/dvp/dvp_gc2145.c), i.e. its
+ *   init sequence is itself "pads off, configure, pads on".  This port had
+ *   copied both writes into one table, so the pads opened at init() and
+ *   never closed again.
+ *
+ *   One page select plus one register write, so tens of microseconds on the
+ *   ~100kHz bitbang bus.  Callers must be in task context.
+ *
+ ****************************************************************************/
+
+static bool bk7258_gc2145_set_stream(FAR struct bk7258_gc2145_dev_s *priv,
+                                     bool on)
+{
+  static const struct gc2145_reg on_regs[] =
+    {
+      { 0xFE, 0x00 },
+      { 0xF2, 0x0F },
+    };
+
+  static const struct gc2145_reg off_regs[] =
+    {
+      { 0xFE, 0x00 },
+      { 0xF2, 0x00 },
+    };
+
+  if (!bk7258_gc2145_write_reg_table(on ? on_regs : off_regs, 2))
+    {
+      return false;
+    }
+
+  priv->streaming = on;
+  priv->stream_off_pending = false;
+  return true;
+}
+
 /* Symmetric counterpart of power_on()/reset()/mclk_enable(): assert
  * reset, cut the sensor's supply and close the MCLK clock gate.  Without
  * this, closing /dev/video0 left GPIO49 driving both DVP LDOs and the
@@ -1724,11 +1785,10 @@ static int bk7258_gc2145_init(FAR struct imgsensor_s *sensor)
          (unsigned int)g_gc2145_modes[GC2145_DEFAULT_MODE].width,
          (unsigned int)g_gc2145_modes[GC2145_DEFAULT_MODE].height);
 
-  /* A mode is programmed here, not left until start_capture(), because the
-   * sensor streams continuously once initialised: without a window table it
-   * would be driving the DVP bus with whatever geometry the init table
-   * leaves behind.  start_capture() reprograms it if the application asked
-   * for something else.
+  /* A mode is programmed here, not left until start_capture(), so that the
+   * pads open onto a configured window the first time they do.  The sensor
+   * itself stays silent: 0xF2 is left at the 0x00 the init table's preamble
+   * writes, and bk7258_gc2145_set_stream() opens it at start_capture().
    */
 
   if (!bk7258_gc2145_apply_mode(priv,
@@ -1740,8 +1800,11 @@ static int bk7258_gc2145_init(FAR struct imgsensor_s *sensor)
       return -EIO;
     }
 
-  printf("bk7258_camera_imgsensor: init: complete at %ux%u %ufps, sensor "
-         "now continuously outputting DVP signal\n",
+  priv->streaming = false;
+  priv->stream_off_pending = false;
+
+  printf("bk7258_camera_imgsensor: init: complete at %ux%u %ufps, DVP pads "
+         "closed until start_capture\n",
          (unsigned int)priv->mode->width, (unsigned int)priv->mode->height,
          (unsigned int)priv->current_fps);
 
@@ -1876,6 +1939,17 @@ static int bk7258_gc2145_start_capture(
 
   printf("bk7258_camera_imgsensor: start_capture: entry\n");
 
+  /* A previous session that ended in interrupt context could not touch the
+   * bus, so close the pads here instead.  Doing it before the mode is
+   * programmed also means the window table is never rewritten while the
+   * sensor is driving.
+   */
+
+  if (priv->stream_off_pending)
+    {
+      bk7258_gc2145_set_stream(priv, false);
+    }
+
   ret = bk7258_gc2145_validate_frame_setting(sensor, type, nr_datafmts,
                                               datafmts, interval);
   if (ret < 0)
@@ -1952,15 +2026,20 @@ static int bk7258_gc2145_start_capture(
              (unsigned int)mode->width, (unsigned int)mode->height);
     }
 
-  /* GC2145 has no separate streaming-enable register in this driver's
-   * ported tables -- the sensor outputs DVP data continuously once its
-   * init sequence completes in bk7258_gc2145_init().  Capture
-   * start/stop is entirely a matter of whether the imgdata half
-   * (YUV_BUF) is listening.
+  /* Last: the capture module has already armed its DMA and enabled the JPEG
+   * block by the time this runs (v4l2_cap.c start_capture()), so opening the
+   * pads here is what makes the encoder's first frame a whole one.
    */
 
-  printf("bk7258_camera_imgsensor: start_capture: OK at %ux%u %ufps (sensor "
-         "streaming continuously since init)\n",
+  if (!bk7258_gc2145_set_stream(priv, true))
+    {
+      printf("bk7258_camera_imgsensor: start_capture: enabling the DVP pads "
+             "FAILED\n");
+      return -EIO;
+    }
+
+  printf("bk7258_camera_imgsensor: start_capture: OK at %ux%u %ufps (DVP "
+         "pads opened)\n",
          (unsigned int)priv->mode->width, (unsigned int)priv->mode->height,
          (unsigned int)priv->current_fps);
 
@@ -1993,13 +2072,28 @@ static int bk7258_gc2145_get_frame_interval(
 static int bk7258_gc2145_stop_capture(FAR struct imgsensor_s *sensor,
                                        imgsensor_stream_type_t type)
 {
-  /* v4l2_cap.c's complete_capture() calls IMGSENSOR_STOP_CAPTURE() from
-   * interrupt context when it runs out of vacant buffer containers, so
-   * this must not printf().  GC2145 keeps streaming regardless (no
-   * streaming-enable bit in this driver's register tables), so there is
-   * nothing to do here anyway.
+  FAR struct bk7258_gc2145_dev_s *priv =
+      (FAR struct bk7258_gc2145_dev_s *)sensor;
+
+  /* Close the DVP pads, so the next session can arm the encoder against a
+   * quiescent bus (bk7258_gc2145_set_stream()).
+   *
+   * v4l2_cap.c's complete_capture() reaches stop_capture() from interrupt
+   * context when it runs out of vacant buffer containers, and the I2C here
+   * is a bitbang that must not run there -- nor may this printf().  In that
+   * case the write is deferred to the next start_capture(), which closes the
+   * pads before it programs anything.  The frame that session starts on is
+   * then recovered by the capture module's VSYNC handler, exactly as it was
+   * before this gate existed.
    */
 
+  if (up_interrupt_context())
+    {
+      priv->stream_off_pending = true;
+      return OK;
+    }
+
+  bk7258_gc2145_set_stream(priv, false);
   return OK;
 }
 

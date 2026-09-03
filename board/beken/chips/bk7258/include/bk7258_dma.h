@@ -58,6 +58,19 @@
 #define BK7258_DMA_WIDTH_16BITS    1u
 #define BK7258_DMA_WIDTH_32BITS    2u
 
+/* AHB burst length, per endpoint.  Same encoding as the vendor's
+ * dma_burst_len_t (bk_avdk_smp/ap/include/driver/hal/hal_dma_types.h), which
+ * is also the raw field value.  Reset state is SINGLE; the vendor sets
+ * SINGLE on the source and INC16 on the destination for its JPEG drain
+ * channel, but only on secure-mode builds (dvp_camera_dma_config() under
+ * CONFIG_SPE), so it is a throughput choice rather than a requirement.
+ */
+
+#define BK7258_DMA_BURST_SINGLE    0u
+#define BK7258_DMA_BURST_INC4      1u
+#define BK7258_DMA_BURST_INC8      2u
+#define BK7258_DMA_BURST_INC16     3u
+
 /****************************************************************************
  * Public Types
  ****************************************************************************/
@@ -85,6 +98,8 @@ struct bk7258_dma_cfg_s
   uint32_t dest_loop_start;
   uint32_t dest_loop_end;
   uint8_t  data_width;        /* BK7258_DMA_WIDTH_*. */
+  uint8_t  src_burst;         /* BK7258_DMA_BURST_*, 0 = SINGLE (reset). */
+  uint8_t  dest_burst;
 };
 
 /****************************************************************************
