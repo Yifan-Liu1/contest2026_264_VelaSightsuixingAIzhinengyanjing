@@ -308,13 +308,17 @@ OpenAI SDK 示例（SDK 发的就是 Bearer），所以 Bearer 应当可用；�
 | `social_cue install` | ✅ | 把 skill 文档写进 `/mnt/sdnand/ai_agent/skills/`（4767 字节） |
 
 
-另有一条环境相关的：`serial_cmd.sh -r` 复位后只等 4 s 就发 `ap_console open`，而当前固件
-到 NSH 提示符要约 6 s（开机动画 1.7 s + camera/audio/jpeg 注册），所以 `-r` 之后的命令**可能
-被丢弃**（会看到 `AP console input drops`）。稳妥做法是分两步：
+`serial_cmd.sh -r` 复位后**轮询** `ap_console open` 直到 AP 应答，所以不再需要拆成两步；
+早期版本写死等 4 s，而固件到 NSH 提示符约 6 s（开机动画 1.7 s + camera/audio/jpeg 注册），
+命令会被丢弃（表现为 `AP console input drops`）。
+
+要注意的是 `-r` 之后板子正在起 Wi-Fi、provisioning、velasight，CPU 被抢，**测出来的帧率
+不能和热态比**：同一条 `agent_camera 480x480 n=30`，冷态（`-r`）实测 7.49 fps，热态（`-b`）
+17.83 fps。做性能回归一律用 `-b`，`-r` 只用于要干净启动日志的场合。
 
 ```sh
-./serial_cmd.sh -r -w 14 >/dev/null            # 只复位
-./serial_cmd.sh -w 60 'ap_console open' '你的命令'
+./serial_cmd.sh -r -w 40 -e 'agent_camera: OK' 'agent_camera 480x480 n=30'   # 冷态
+./serial_cmd.sh -b -w 40 -e 'agent_camera: OK' 'agent_camera 480x480 n=30'   # 热态
 ```
 
 ## 八、构建、打包、烧录

@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -254,9 +255,11 @@ def item_serial_free(serial_port: str) -> None:
            "when anything holds this port, so the backend must not keep it"
            % (serial_port, holder or "nothing"))
 
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
     out = subprocess.run(["bash", "-c",
-                          "cd /home/mi/AAAOpenVela && ./serial_cmd.sh -w 2 "
-                          "'uname -a' 2>&1 | tail -2"],
+                          "cd %s && ./serial_cmd.sh -w 2 "
+                          "'uname -a' 2>&1 | tail -2" % shlex.quote(repo)],
                          capture_output=True, text=True, timeout=90)
     record("serial_cmd.sh still works", "字节" in out.stdout,
            out.stdout.strip()[-300:] or out.stderr.strip()[-300:])
