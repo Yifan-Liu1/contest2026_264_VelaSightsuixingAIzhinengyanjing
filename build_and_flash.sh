@@ -121,7 +121,21 @@ grep -q 'vs_settings_save_volume' "$AP_OUT/System.map" || die 'volume persistenc
 # The network buffer pool feeds TCP read-ahead. A 16 KiB TLS record needs
 # eleven buffers before mbedtls can decrypt it; the pool cannot move to PSRAM
 # because iob_initialize() runs before the CP powers PSRAM up.
-grep -q '^CONFIG_IOB_NBUFFERS=40$' "$AP_OUT/.config" || die "IOB pool is not 40: $(grep '^CONFIG_IOB_NBUFFERS=' "$AP_OUT/.config")"
+#
+# Raised from 40 to 60, with the throttle halved to 4, because the pool also
+# sets the receive window: tcp_get_recvwindow() advertises iob_navail(true) *
+# CONFIG_IOB_BUFSIZE. A measured download bottomed out at 9 free of 40, which
+# is 1 after the old throttle, and the window collapsed to 1094 bytes while the
+# far end sat waiting on it for 20% of the transfer.
+#
+# The 30 KB this needs comes from JPEG_FAST_BITS in bk7258_jpeg_entropy.c,
+# dropped from 12 to 8 so the four Huffman acceleration tables cost 2 KB
+# instead of 32 KB. The trade is deliberate: those tables only speed up
+# realigning a captured camera frame and have a correctness-preserving
+# fallback, while the IOB pool decides how fast every download runs and cannot
+# be moved to PSRAM at all.
+grep -q '^CONFIG_IOB_NBUFFERS=60$' "$AP_OUT/.config" || die "IOB pool is not 60: $(grep '^CONFIG_IOB_NBUFFERS=' "$AP_OUT/.config")"
+grep -q '^CONFIG_IOB_THROTTLE=4$' "$AP_OUT/.config" || die "IOB throttle is not 4: $(grep '^CONFIG_IOB_THROTTLE=' "$AP_OUT/.config")"
 for app in KVDB_TOOL AGENT_CAMERA AUDIO_TEST CONV CAMERA_PREVIEW CTRLC_TEST \
            HELLO_SCREEN PERIPH_SELFTEST SOCIAL_CUE SDNAND_INIT WEB_TOOL; do
   grep -q "^CONFIG_LVX_USE_DEMO_CONTEST2026_264_${app}=y$" \

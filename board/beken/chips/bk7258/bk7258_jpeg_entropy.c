@@ -16,7 +16,28 @@
 
 #include "bk7258_jpeg_enc.h"
 
-#define JPEG_FAST_BITS 12u
+/* Bits resolved by one lookup in the Huffman acceleration tables.
+ *
+ * Each of the four tables is uint16_t[1 << JPEG_FAST_BITS], so this is a
+ * multiplier on 8 KB of SRAM: at 12 bits the four cost 32 KB, at 8 bits they
+ * cost 2 KB.
+ *
+ * Eight is what libjpeg has used as HUFF_LOOKAHEAD for decades, and it is
+ * enough for the great majority of codes, which are short.  Nothing depends on
+ * a hit: jpeg_decode_huff() falls through to the canonical bit-at-a-time
+ * decoder whenever the table entry is zero, so a smaller table costs decode
+ * time on long codes and nothing else.
+ *
+ * The 30 KB this releases goes to CONFIG_IOB_NBUFFERS, where it does far more
+ * good.  The IOB pool sets the advertised TCP receive window through
+ * tcp_get_recvwindow(), it cannot be moved to PSRAM because iob_initialize()
+ * runs before the CP powers PSRAM up, and a measured download had it down to
+ * 9 free of 40 with the window collapsed to 1094 bytes.  This table, by
+ * contrast, is only touched while realigning a captured camera frame
+ * (bk7258_camera_imgdata.c), never on the network path.
+ */
+
+#define JPEG_FAST_BITS 8u
 #define JPEG_FAST_SIZE (1u << JPEG_FAST_BITS)
 
 struct jpeg_huff_s

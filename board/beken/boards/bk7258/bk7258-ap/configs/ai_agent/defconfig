@@ -132,7 +132,22 @@ CONFIG_MBR_PARTITION=y
 CONFIG_IDLETHREAD_STACKSIZE=4096
 CONFIG_INIT_ENTRYPOINT="nsh_main"
 CONFIG_IOB_BUFSIZE=1514
-CONFIG_IOB_NBUFFERS=40
+# The pool a download's receive window is computed from.
+#
+# tcp_get_recvwindow() advertises iob_navail(true) * CONFIG_IOB_BUFSIZE, and
+# iob_navail(true) is the free count less CONFIG_IOB_THROTTLE.  A measured
+# 15-second download bottomed out at 9 free of 40 -- 31 in use between the
+# Wi-Fi driver's queued packets, TCP read-ahead and the write buffers -- which
+# left 1 after the throttle and collapsed the advertised window to 1094 bytes.
+# The far end saw exactly that and spent 20% of the transfer waiting on it.
+#
+# Four more buffers cost 6056 bytes and leave 17112 free, which is the margin
+# this build booted with before; 8 more would leave 11056, and the AP core has
+# already been seen to fail to start at 8448.  Halving the throttle is free and
+# does the same job at the low water mark, at the price of a smaller reserve
+# for the paths that allocate unthrottled.
+CONFIG_IOB_NBUFFERS=60
+CONFIG_IOB_THROTTLE=4
 CONFIG_LIBC_LOCALTIME=y
 CONFIG_LIBYUV=y
 # Fixed-point MP3 decoder, for TTS audio arriving as 32 kb/s MP3 rather than
@@ -150,6 +165,7 @@ CONFIG_LVX_USE_DEMO_CONTEST2026_264_CONV=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_CAMERA_PREVIEW=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_CTRLC_TEST=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_HELLO_SCREEN=y
+CONFIG_LVX_USE_DEMO_CONTEST2026_264_NETBENCH=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_PERIPH_SELFTEST=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_SOCIAL_CUE=y
 CONFIG_LVX_USE_DEMO_CONTEST2026_264_SDNAND_INIT=y
