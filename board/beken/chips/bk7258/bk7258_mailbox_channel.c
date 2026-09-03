@@ -19,6 +19,7 @@
 #include <nuttx/spinlock.h>
 
 #include "bk7258_driver.h"
+#include "bk7258_netstats.h"
 #include "hardware/bk7258_mbox.h"
 
 #define MB_CHANNEL_COUNT       7u
@@ -1537,6 +1538,55 @@ int bk7258_mailbox_wait_hw_control(unsigned int timeout_ms)
 int bk7258_mailbox_wait_pwc(unsigned int timeout_ms)
 {
   return wait_channel(BK7258_MB_CHAN_PWC_TX, timeout_ms);
+}
+
+/****************************************************************************
+ * Name: bk7258_mailbox_fill_counters
+ *
+ * Description:
+ *   Same numbers bk7258_mailbox_dump_stats() prints, handed back as data so
+ *   that a caller measuring throughput can subtract two snapshots.  It must
+ *   not print: the console is one of this transport's own channels, so a
+ *   readout that logged would add the traffic it is trying to measure.
+ *
+ ****************************************************************************/
+
+void bk7258_mailbox_fill_counters(struct bk7258_net_counters *counters)
+{
+  struct bk7258_mbox_stats physical;
+
+  if (counters == NULL)
+    {
+      return;
+    }
+
+  bk7258_mbox_get_stats(&physical);
+
+  counters->mb_tx              = g_stats.tx;
+  counters->mb_rx              = g_stats.rx;
+  counters->mb_timeout         = g_stats.timeout;
+  counters->mb_fifo_full       = g_stats.fifo_full;
+  counters->mb_bad_ack         = g_stats.bad_ack;
+  counters->mb_bad_header      = g_stats.bad_header;
+  counters->mb_ack_overflow    = g_stats.ack_overflow;
+  counters->mb_deferred        = g_stats.deferred_command;
+  counters->mb_recovery_cycle  = g_stats.recovery_cycle;
+  counters->mb_recovery_replay = g_stats.recovery_replay;
+  counters->mb_link_ready      = g_stats.link_ready;
+  counters->mb_link_down       = g_stats.link_down;
+  counters->mb_link_state      = (uint8_t)g_link_state;
+  counters->mb_ack_slots_used  = (uint8_t)ack_slots_used();
+  counters->mb_busy            = g_active.busy;
+
+  counters->mb0_rx             = physical.rx_messages;
+  counters->mb0_write_full     = physical.write_full;
+  counters->mb0_write_error    = physical.write_error;
+  counters->mb0_read_error     = physical.read_error;
+  counters->mb0_desc_full      = physical.descriptor_full;
+  counters->mb0_desc_deferred  = physical.descriptor_deferred;
+  counters->mb0_bad_source     = physical.bad_source;
+  counters->mb0_bad_length     = physical.bad_length;
+  counters->mb0_bad_address    = physical.bad_address;
 }
 
 void bk7258_mailbox_dump_stats(void)

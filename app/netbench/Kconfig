@@ -1,0 +1,22 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+config LVX_USE_DEMO_CONTEST2026_264_NETBENCH
+	bool "BK7258 network benchmark with mailbox counters"
+	default n
+	depends on NET_TCP && BK7258_WIFI
+	---help---
+		Enable the netbench NSH command: moves bytes over loopback, TCP,
+		UDP or plain HTTP and reports the throughput together with the
+		inter-core mailbox counters taken either side of the transfer.
+		The AP core owns no radio, so every frame crosses the mailbox to
+		the CP.  That makes "the transfer was slow" and "the mailbox was
+		why" separate claims, and separating them needs the transport's
+		own timeout, FIFO and batching counts rather than an inference
+		from the byte rate.  The loopback mode is the control: it stays
+		inside the stack, so whatever it reports is the ceiling the
+		software imposes without any mailbox or radio involved.
+		Nothing is printed until a run finishes, because the console is
+		itself a mailbox channel and progress output would add traffic
+		to the transport under measurement.

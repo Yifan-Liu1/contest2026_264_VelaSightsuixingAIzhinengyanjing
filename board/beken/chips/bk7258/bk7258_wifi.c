@@ -27,11 +27,84 @@
 #include "bk7258_driver.h"
 #include "hardware/bk7258_mbox.h"
 #include "hardware/bk7258_wifi_ipc.h"
+#include "bk7258_netstats.h"
 #include "bk7258_wifi.h"
 
 #define WIFI_NODE_QUEUE          16u
 #define WIFI_RECYCLE_QUEUE       16u
-#define WIFI_PACKET_QUEUE        4u
+/* How many delivered frames can be held for the upper half at once.
+ *
+ * This is the capacity of a single mailbox transaction rather than a running
+ * buffer, and that is the problem with it.  wifi_handle_data() queues a frame
+ * only while there is room -- "packet_count + packet_added <
+ * WIFI_PACKET_QUEUE" -- and it holds packet_lock and the driver spinlock for
+ * the whole loop, so the upper half cannot free a single slot while the loop
+ * runs.  Frames past the limit are dropped in silence: the CP has already
+ * been told the list was taken, nothing retries them, and rx_queue_full is
+ * the only record that it happened.
+ *
+ * Four against a BK7258_WIFI_MAX_LIST of sixty is a real mismatch, and it
+ * does cost frames: a measured 15-second download lost 32 of them here,
+ * roughly four percent, while the sender sat at a congestion window of one.
+ *
+ * It stays at four all the same, for two measured reasons.  Sixty costs 91 KB
+ * because every entry carries a whole frame, and even ten costs 9 KB, which
+ * took this build to 97.5% of RAM and left the AP core failing to start --
+ * the early SRAM heap is what runs out, before PSRAM is folded in and before
+ * anything can print.  And the size of the prize does not justify it: the
+ * same run showed 264 retransmissions against those 32 dropped frames, so
+ * most of the loss is happening somewhere this queue cannot explain.
+ *
+ * Pacing a sender so that no transaction carried more than three frames moved
+ * 63.6 KB/s over the same link with nothing dropped and nothing
+ * retransmitted, which is what identified the queue rather than the radio.
+ *
+ * Sixty is affordable only because a slot now holds a netpkt pointer rather
+ * than a 1514-byte copy: 60 slots cost 480 bytes where 4 slots of frame cost
+ * 6080.  Copying whole frames is what forced the queue to be small, and an
+ * attempt to keep the copies while growing the queue to ten took RAM to 97.5%
+ * and left the AP core failing to boot.
+ *
+ * Slots are deliberately cheaper than the thing that really limits how many
+ * frames can be outstanding, which is the read-ahead pool.  With sixty of them
+ * a full chain always has somewhere to go, so rx_queue_full stays at zero and
+ * a shortage shows up as rx_alloc_fail instead -- an unambiguous distinction
+ * between "no slot" and "no buffer" that a single number could not give.
+ */
+
+#define WIFI_PACKET_QUEUE        BK7258_WIFI_MAX_LIST
+
+/* How many receive netpkts may be outstanding, published to the upper half as
+ * this device's RX quota.
+ *
+ * It cannot just be WIFI_PACKET_QUEUE.  netdev_lower_register() refuses a
+ * device whose quotas outrun the buffer pool: quota_is_valid() requires
+ * quota[TX] + quota[RX] <= NETPKT_BUFNUM, and NETPKT_BUFNUM is
+ * CONFIG_IOB_NBUFFERS.  Eight TX slots against sixty RX came to 68 against a
+ * pool of 40, registration returned -EINVAL, and the board came up with no
+ * wlan0 at all -- "Wi-Fi initialization failed, error=-22".
+ *
+ * The value is chosen against the second thing quota_is_valid() looks at:
+ * beyond NETPKT_BUFNUM / 2 it warns that one device may take more than half
+ * the buffers.  With eight TX slots and a pool of 60, twenty keeps the pair at
+ * 28 against a half of 30.  That warning is worth respecting because its
+ * reason is the one that matters here -- TCP's advertised window comes out of
+ * the same pool, since tcp_get_recvwindow() offers iob_navail(true) *
+ * CONFIG_IOB_BUFSIZE, so every buffer parked in this driver is one the window
+ * has already surrendered.
+ *
+ * Twenty is five times the four frames that used to fit and comfortably over
+ * the longest chain measured on this link, which was ten.
+ *
+ * The result is the backpressure the vendor's firmware assembles by hand.
+ * There the AP grants the CP a credit of buffers and the CP cannot deliver
+ * past it (wdrv_attach_rx_buffer(), wdrv_main.c, rx_win starting at
+ * INIT_NUM_RX_BUFFERS).  Here the pool shrinks the window first, so a sender
+ * eases off before anything has to be dropped.
+ */
+
+#define WIFI_RX_QUOTA            20
+
 #define WIFI_COMMAND_TIMEOUT     MSEC2TICK(2000)
 #define WIFI_ROLE_STOP_TIMEOUT   MSEC2TICK(3000)
 #define WIFI_WORK_INTERVAL       MSEC2TICK(20)
@@ -84,10 +157,22 @@ struct wifi_tx_slot
   uint8_t chain_next;
 } __attribute__((aligned(32)));
 
+/* A received frame on its way to the stack.
+ *
+ * The netpkt is allocated and filled in wifi_handle_data(), so this holds a
+ * pointer rather than a copy of the frame and wifi_receive() has nothing left
+ * to do but hand it over.  That removes the second copy the frame used to
+ * make and, more to the point, lets the queue be as deep as the CP is allowed
+ * to be generous.
+ *
+ * role_epoch travels with the packet because the role can change while it
+ * waits: a frame belonging to a role that has since gone away must be freed
+ * rather than delivered.
+ */
+
 struct wifi_rx_packet
 {
-  uint8_t frame[BK7258_WIFI_MAX_FRAME];
-  uint16_t length;
+  netpkt_t *packet;
   uint32_t role_epoch;
 };
 
@@ -186,14 +271,47 @@ struct wifi_driver
   /* How well the batching actually works, which is not something the shape of
    * the code can tell you: it depends on whether frames arrive while a
    * transaction is already in flight.  Mirrors the vendor's tx_list_num and
-   * ipc_txc_cnt, and is read through the wlan0 procfs entry so a measurement
-   * does not have to go out over the console -- console traffic shares the
-   * mailbox and would perturb the thing being measured.
+   * ipc_txc_cnt, and is read through bk7258_net_get_counters() so that a
+   * measurement does not have to go out over the console -- console traffic
+   * shares the mailbox and would perturb the thing being measured.
    */
 
   uint32_t tx_batches;
   uint32_t tx_batched_frames;
   uint8_t tx_batch_max;
+
+  /* The same question in the receive direction, which is the one a download
+   * depends on.  The CP chains arriving frames and one transaction can carry
+   * up to BK7258_WIFI_MAX_LIST of them, so rx_listed_frames / rx_lists says
+   * whether the mailbox is delivering full batches or one frame at a time.
+   * A slow transfer whose ratio sits near 1 was not waiting on the mailbox.
+   *
+   * Only frames the peer sent are counted in rx_listed_frames.  A channel 2
+   * list also carries our own transmitted buffers coming back, which is what
+   * tx_completions counts; lumping the two together overstates the receive
+   * side by roughly one frame per segment acknowledged.
+   *
+   * rx_queue_full is a frame the CP delivered that would not fit in the
+   * queue the upper half drains.  Nothing else reports it.
+   */
+
+  uint32_t rx_lists;
+  uint32_t rx_listed_frames;
+  uint32_t tx_completions;
+  uint32_t rx_queue_full;
+  uint32_t rx_alloc_fail;
+  uint8_t rx_list_max;
+
+  /* Frames the stack handed down that never reached the air.  Every one of
+   * these paths is otherwise silent: the refusals return an errno the upper
+   * half discards, and the rejected ones are freed by
+   * wifi_collect_rejected_tx() without a word.  Only slot exhaustion prints,
+   * and it has never been seen.
+   */
+
+  uint32_t tx_enetdown;
+  uint32_t tx_slots_full;
+  uint32_t tx_rejected;
 
   uint8_t node_head;
   uint8_t node_tail;
@@ -651,9 +769,52 @@ static void wifi_tx_pending_drop_locked(void)
   g_wifi.tx_pend_num = 0;
 }
 
+/* Empty the receive queue into the caller's array.
+ *
+ * The queue used to be emptied by zeroing its indices, which was free when a
+ * slot was a frame copy in static storage.  A slot now owns a netpkt, so
+ * abandoning it leaks an IOB and a unit of the RX quota.  They cannot be freed
+ * here either: netpkt_free() belongs off the driver spinlock, the same reason
+ * wifi_tx_pending_drop_locked() marks slots instead of freeing them.  So the
+ * pointers come out under the lock and the caller frees them once it is gone.
+ *
+ * Caller holds packet_lock and the driver spinlock.  'out' must have room for
+ * WIFI_PACKET_QUEUE entries.
+ */
+
+static uint8_t wifi_rx_queue_take_locked(netpkt_t **out)
+{
+  uint8_t taken = 0;
+
+  while (g_wifi.packet_count != 0)
+    {
+      out[taken++] = g_wifi.packets[g_wifi.packet_head].packet;
+      g_wifi.packets[g_wifi.packet_head].packet = NULL;
+      g_wifi.packet_head = (g_wifi.packet_head + 1) % WIFI_PACKET_QUEUE;
+      g_wifi.packet_count--;
+    }
+
+  g_wifi.packet_head = 0;
+  g_wifi.packet_tail = 0;
+  return taken;
+}
+
+static void wifi_rx_queue_free(netpkt_t **packets, uint8_t count)
+{
+  while (count-- != 0)
+    {
+      if (packets[count] != NULL)
+        {
+          netpkt_free(&g_wifi.lower, packets[count], NETPKT_RX);
+        }
+    }
+}
+
 static void wifi_role_deactivate(enum wifi_role role)
 {
   enum wifi_role deactivated_role = WIFI_ROLE_NONE;
+  netpkt_t *orphans[WIFI_PACKET_QUEUE];
+  uint8_t orphan_count = 0;
   bool deactivated = false;
   irqstate_t flags;
 
@@ -668,13 +829,12 @@ static void wifi_role_deactivate(enum wifi_role role)
       g_wifi.ap_started = false;
       g_wifi.ap_client_count = 0;
       g_wifi.role_epoch++;
-      g_wifi.packet_head = 0;
-      g_wifi.packet_tail = 0;
-      g_wifi.packet_count = 0;
+      orphan_count = wifi_rx_queue_take_locked(orphans);
       deactivated = true;
     }
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_rx_queue_free(orphans, orphan_count);
   if (deactivated)
     {
       nxsem_post(&g_wifi.role_sem);
@@ -688,6 +848,8 @@ static void wifi_role_deactivate(enum wifi_role role)
 
 static void wifi_sta_event(bool connected, unsigned int reason)
 {
+  netpkt_t *orphans[WIFI_PACKET_QUEUE];
+  uint8_t orphan_count = 0;
   bool carrier = false;
   bool handled = false;
   bool stopped = false;
@@ -708,9 +870,7 @@ static void wifi_sta_event(bool connected, unsigned int reason)
         {
           g_wifi.tx_gate = false;
           g_wifi.role_epoch++;
-          g_wifi.packet_head = 0;
-          g_wifi.packet_tail = 0;
-          g_wifi.packet_count = 0;
+          orphan_count = wifi_rx_queue_take_locked(orphans);
           if (g_wifi.role_state == WIFI_ROLE_STOPPING)
             {
               g_wifi.active_role = WIFI_ROLE_NONE;
@@ -733,6 +893,7 @@ static void wifi_sta_event(bool connected, unsigned int reason)
     }
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_rx_queue_free(orphans, orphan_count);
   if (stopped)
     {
       nxsem_post(&g_wifi.role_sem);
@@ -748,6 +909,8 @@ static void wifi_sta_event(bool connected, unsigned int reason)
 
 static void wifi_ap_start_event(bool started)
 {
+  netpkt_t *orphans[WIFI_PACKET_QUEUE];
+  uint8_t orphan_count = 0;
   bool carrier = false;
   bool handled = false;
   bool stopped = false;
@@ -780,14 +943,13 @@ static void wifi_ap_start_event(bool started)
           g_wifi.ap_client_count = 0;
           g_wifi.tx_gate = false;
           g_wifi.role_epoch++;
-          g_wifi.packet_head = 0;
-          g_wifi.packet_tail = 0;
-          g_wifi.packet_count = 0;
+          orphan_count = wifi_rx_queue_take_locked(orphans);
           stopped = true;
         }
     }
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_rx_queue_free(orphans, orphan_count);
   if (stopped)
     {
       nxsem_post(&g_wifi.role_sem);
@@ -870,6 +1032,8 @@ static bool wifi_sync_reset_generation(void)
 {
   struct wifi_pending_node nodes[WIFI_NODE_QUEUE];
   uint32_t generation = bk7258_mailbox_peer_reset_generation();
+  netpkt_t *orphans[WIFI_PACKET_QUEUE];
+  uint8_t orphan_count = 0;
   bool wake_command = false;
   unsigned int kept = 0;
   unsigned int i;
@@ -941,9 +1105,7 @@ static bool wifi_sync_reset_generation(void)
   g_wifi.node_head = 0;
   g_wifi.node_tail = kept % WIFI_NODE_QUEUE;
   g_wifi.node_count = kept;
-  g_wifi.packet_head = 0;
-  g_wifi.packet_tail = 0;
-  g_wifi.packet_count = 0;
+  orphan_count = wifi_rx_queue_take_locked(orphans);
   for (i = 0; i < WIFI_RECYCLE_QUEUE; i++)
     {
       if (g_wifi.recycle[i].state != WIFI_RECYCLE_FREE &&
@@ -954,6 +1116,7 @@ static bool wifi_sync_reset_generation(void)
     }
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
+  wifi_rx_queue_free(orphans, orphan_count);
   nxsem_post(&g_wifi.work_sem);
   return true;
 }
@@ -1607,6 +1770,11 @@ static void wifi_collect_rejected_tx(
 
       if (tx->active && tx->transport_rejected)
         {
+          /* Counted at the one place every rejected frame passes through,
+           * whether the CP refused it or a reset dropped it while queued.
+           */
+
+          g_wifi.tx_rejected++;
           notifications->tx_packets[notifications->tx_count++] = tx->packet;
           tx->packet = NULL;
           tx->active = false;
@@ -1617,9 +1785,20 @@ static void wifi_collect_rejected_tx(
   nxmutex_unlock(&g_wifi.packet_lock);
 }
 
-static bool wifi_copy_rx_frame(uint32_t cpdu_address,
-                               struct wifi_rx_packet *packet,
-                               uint8_t *vif)
+/* Validate a frame the CP has handed over and report where its payload is.
+ *
+ * It used to copy the payload into the caller's queue slot.  It only locates
+ * it now, because the copy has to happen with the driver spinlock dropped:
+ * netpkt_copyin() reaches iob_trycopyin(), which will take further buffers
+ * from the IOB pool if it needs them, and that is not work for a section with
+ * interrupts disabled.  The caller re-checks the reset generation after
+ * copying, so a CP that restarts mid-copy costs one dropped frame rather than
+ * a corrupt one.
+ */
+
+static bool wifi_locate_rx_frame(uint32_t cpdu_address,
+                                 uint32_t *payload, uint16_t *length,
+                                 uint8_t *vif)
 {
   struct bk7258_wifi_cpdu cpdu;
   struct bk7258_wifi_pbuf pbuf;
@@ -1647,15 +1826,21 @@ static bool wifi_copy_rx_frame(uint32_t cpdu_address,
       return false;
     }
 
-  if (packet != NULL)
+  if (payload != NULL)
     {
-      memcpy(packet->frame, (const void *)(uintptr_t)pbuf.payload, pbuf.len);
-      packet->length = pbuf.len;
+      *payload = pbuf.payload;
     }
+
+  if (length != NULL)
+    {
+      *length = (uint16_t)pbuf.len;
+    }
+
   if (vif != NULL)
     {
       *vif = bk7258_wifi_cpdu_get_vif(cpdu.flags);
     }
+
   return true;
 }
 
@@ -1779,6 +1964,7 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
   struct wifi_recycle_entry *recycle;
   uint32_t address = node->head;
   uint8_t packet_added = 0;
+  unsigned int received = 0;
   unsigned int count;
   irqstate_t flags;
 
@@ -1857,7 +2043,7 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
           if (pending->generation !=
                 bk7258_mailbox_peer_reset_generation() ||
               !wifi_cp_pointer(address, sizeof(cpdu)) ||
-              !wifi_copy_rx_frame(address, NULL, NULL))
+              !wifi_locate_rx_frame(address, NULL, NULL, NULL))
             {
               rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
               goto invalid;
@@ -1877,38 +2063,124 @@ static void wifi_handle_data(const struct wifi_pending_node *pending,
       goto invalid;
     }
 
+  /* A channel 2 list mixes both directions: an entry that resolves to one of
+   * our own TX slots is that buffer coming back, and only the rest are
+   * frames the peer sent.  Counting the whole list as received would inflate
+   * it by however many frames were transmitted, which on a download is very
+   * nearly one per segment acknowledged.
+   */
+
   for (count = 0; count < node->num; count++)
     {
-      if (cp_owned[count] &&
-          g_wifi.packet_count + packet_added < WIFI_PACKET_QUEUE)
+      if (cp_owned[count])
+        {
+          received++;
+        }
+    }
+
+  g_wifi.rx_lists++;
+  g_wifi.rx_listed_frames += received;
+  g_wifi.tx_completions += node->num - received;
+  if (received > g_wifi.rx_list_max)
+    {
+      g_wifi.rx_list_max = (uint8_t)received;
+    }
+
+  for (count = 0; count < node->num; count++)
+    {
+      uint32_t payload = 0;
+      uint16_t length = 0;
+      uint8_t vif = 0;
+      netpkt_t *pkt;
+      bool usable;
+
+      if (!cp_owned[count])
+        {
+          continue;
+        }
+
+      /* packet_count is stable here: every function that changes it holds
+       * packet_lock, which this one holds for its whole length.
+       */
+
+      if (g_wifi.packet_count + packet_added >= WIFI_PACKET_QUEUE)
+        {
+          /* Nowhere to put it, and the CP has already been told the list was
+           * taken, so this is a frame lost where nothing else would say so.
+           */
+
+          g_wifi.rx_queue_full++;
+          continue;
+        }
+
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      usable = pending->generation ==
+                 bk7258_mailbox_peer_reset_generation() &&
+               pending->role_epoch == g_wifi.role_epoch &&
+               g_wifi.role_state == WIFI_ROLE_ACTIVE &&
+               g_wifi.active_role != WIFI_ROLE_NONE &&
+               wifi_locate_rx_frame(addresses[count], &payload, &length,
+                                    &vif) &&
+               vif == wifi_role_vif(g_wifi.active_role);
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      if (!usable)
+        {
+          continue;
+        }
+
+      pkt = netpkt_alloc(&g_wifi.lower, NETPKT_RX);
+      if (pkt == NULL)
+        {
+          /* Out of read-ahead buffers or out of RX quota.  Nothing is wrong
+           * with the frame; the window advertised through
+           * tcp_get_recvwindow() shrinks with the same IOB count, so a
+           * sender should already be easing off before this becomes common.
+           */
+
+          g_wifi.rx_alloc_fail++;
+          continue;
+        }
+
+      if (netpkt_copyin(&g_wifi.lower, pkt,
+                        (const uint8_t *)(uintptr_t)payload, length, 0) < 0)
+        {
+          netpkt_free(&g_wifi.lower, pkt, NETPKT_RX);
+          g_wifi.rx_alloc_fail++;
+          continue;
+        }
+
+      if (g_wifi_rx_trace < 16)
+        {
+          const uint8_t *frame = (const uint8_t *)(uintptr_t)payload;
+          uint16_t type = length >= 14 ?
+                          ((uint16_t)frame[12] << 8) | frame[13] : 0;
+
+          printf("bk7258_wifi: AP RX vif=%u len=%u eth=0x%04x\n",
+                 vif, length, type);
+          g_wifi_rx_trace++;
+        }
+
+      /* The copy ran with the spinlock dropped, so the source is only known
+       * to have been the validated one if nothing has reset since.
+       */
+
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      if (pending->generation == bk7258_mailbox_peer_reset_generation() &&
+          pending->role_epoch == g_wifi.role_epoch)
         {
           unsigned int index = (g_wifi.packet_tail + packet_added) %
                                WIFI_PACKET_QUEUE;
-          uint8_t vif;
 
-          flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
-          if (pending->generation ==
-                bk7258_mailbox_peer_reset_generation() &&
-              pending->role_epoch == g_wifi.role_epoch &&
-              g_wifi.role_state == WIFI_ROLE_ACTIVE &&
-              g_wifi.active_role != WIFI_ROLE_NONE &&
-              wifi_copy_rx_frame(addresses[count], &g_wifi.packets[index],
-                                 &vif) &&
-              vif == wifi_role_vif(g_wifi.active_role))
-            {
-              if (g_wifi_rx_trace < 16)
-                {
-                  const uint8_t *frame = g_wifi.packets[index].frame;
-                  uint16_t type = ((uint16_t)frame[12] << 8) | frame[13];
+          g_wifi.packets[index].packet = pkt;
+          g_wifi.packets[index].role_epoch = pending->role_epoch;
+          packet_added++;
+          pkt = NULL;
+        }
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
 
-                  printf("bk7258_wifi: AP RX vif=%u len=%u eth=0x%04x\n",
-                         vif, g_wifi.packets[index].length, type);
-                  g_wifi_rx_trace++;
-                }
-              g_wifi.packets[index].role_epoch = pending->role_epoch;
-              packet_added++;
-            }
-          rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      if (pkt != NULL)
+        {
+          netpkt_free(&g_wifi.lower, pkt, NETPKT_RX);
         }
     }
 
@@ -2273,6 +2545,7 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
       g_wifi.active_role == WIFI_ROLE_NONE ||
       !bk7258_mailbox_link_ready())
     {
+      g_wifi.tx_enetdown++;
       nxmutex_unlock(&g_wifi.packet_lock);
       return -ENETDOWN;
     }
@@ -2292,6 +2565,7 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
     }
   if (tx == NULL)
     {
+      g_wifi.tx_slots_full++;
       printf("bk7258_wifi: AP TX slots exhausted\n");
       nxmutex_unlock(&g_wifi.packet_lock);
       return -EBUSY;
@@ -2380,49 +2654,65 @@ static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
   return OK;
 }
 
+/* Hand the upper half the packet at the head of the queue.
+ *
+ * There is nothing to allocate or copy here any more: wifi_handle_data() has
+ * already put the frame in a netpkt, so this only dequeues one.  Packets left
+ * behind by a role that has since changed are freed as they are passed over,
+ * which is why the loop runs at all.
+ */
+
 static netpkt_t *wifi_receive(struct netdev_lowerhalf_s *lower)
 {
-  struct wifi_rx_packet *rx;
-  netpkt_t *packet;
+  netpkt_t *packet = NULL;
   irqstate_t flags;
 
-  packet = netpkt_alloc(lower, NETPKT_RX);
-  if (packet == NULL)
-    {
-      return NULL;
-    }
-
   nxmutex_lock(&g_wifi.packet_lock);
-  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
-  while (g_wifi.packet_count != 0 &&
-         g_wifi.packets[g_wifi.packet_head].role_epoch != g_wifi.role_epoch)
+
+  for (; ; )
     {
+      netpkt_t *stale = NULL;
+
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      if (g_wifi.packet_count == 0)
+        {
+          rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+          break;
+        }
+
+      if (g_wifi.packets[g_wifi.packet_head].role_epoch !=
+          g_wifi.role_epoch)
+        {
+          stale = g_wifi.packets[g_wifi.packet_head].packet;
+        }
+      else if (g_wifi.active_role == WIFI_ROLE_NONE ||
+               g_wifi.role_state != WIFI_ROLE_ACTIVE)
+        {
+          /* The head is current but the interface is not carrying traffic;
+           * leave it queued rather than dropping it, exactly as before.
+           */
+
+          rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+          break;
+        }
+      else
+        {
+          packet = g_wifi.packets[g_wifi.packet_head].packet;
+        }
+
+      g_wifi.packets[g_wifi.packet_head].packet = NULL;
       g_wifi.packet_head = (g_wifi.packet_head + 1) % WIFI_PACKET_QUEUE;
       g_wifi.packet_count--;
-    }
-  if (g_wifi.packet_count == 0 ||
-      g_wifi.active_role == WIFI_ROLE_NONE ||
-      g_wifi.role_state != WIFI_ROLE_ACTIVE)
-    {
       rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
-      nxmutex_unlock(&g_wifi.packet_lock);
-      netpkt_free(lower, packet, NETPKT_RX);
-      return NULL;
-    }
-  rx = &g_wifi.packets[g_wifi.packet_head];
-  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
 
-  if (netpkt_copyin(lower, packet, rx->frame, rx->length, 0) < 0)
-    {
-      nxmutex_unlock(&g_wifi.packet_lock);
-      netpkt_free(lower, packet, NETPKT_RX);
-      return NULL;
+      if (stale == NULL)
+        {
+          break;
+        }
+
+      netpkt_free(lower, stale, NETPKT_RX);
     }
 
-  flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
-  g_wifi.packet_head = (g_wifi.packet_head + 1) % WIFI_PACKET_QUEUE;
-  g_wifi.packet_count--;
-  rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
   return packet;
 }
@@ -3134,7 +3424,7 @@ int bk7258_wifi_initialize(void)
   g_wifi.lower.iw_ops = &g_wifi_ops;
 #endif
   g_wifi.lower.quota[NETPKT_TX] = CONFIG_BK7258_WIFI_TX_SLOTS;
-  g_wifi.lower.quota[NETPKT_RX] = WIFI_PACKET_QUEUE;
+  g_wifi.lower.quota[NETPKT_RX] = WIFI_RX_QUOTA;
   g_wifi.lower.rxtype = NETDEV_RX_WORK;
   g_wifi.lower.netdev.d_pktsize = BK7258_WIFI_MAX_FRAME;
   g_wifi.configured_role = WIFI_ROLE_STA;
@@ -3222,6 +3512,49 @@ void bk7258_wifi_unregister_event_callback(bk7258_wifi_event_cb_t callback,
     }
 
   nxmutex_unlock(&g_wifi.event_lock);
+}
+
+/****************************************************************************
+ * Name: bk7258_net_get_counters
+ *
+ * Description:
+ *   Snapshot of the whole path between a socket and the antenna: this
+ *   driver's own frame accounting plus the mailbox layers underneath it.
+ *
+ *   No lock is taken.  Every field is a word-sized counter that only ever
+ *   increases, and the callers of this measure rates over seconds, so the
+ *   worst a concurrent update can do is attribute one event to the
+ *   neighbouring interval.  Taking packet_lock here would instead stall the
+ *   transmit path at the moment the measurement is trying hardest not to
+ *   disturb it.
+ *
+ ****************************************************************************/
+
+void bk7258_net_get_counters(struct bk7258_net_counters *counters)
+{
+  if (counters == NULL)
+    {
+      return;
+    }
+
+  memset(counters, 0, sizeof(*counters));
+
+  bk7258_mailbox_fill_counters(counters);
+
+  counters->wifi_tx_batches      = g_wifi.tx_batches;
+  counters->wifi_tx_frames       = g_wifi.tx_batched_frames;
+  counters->wifi_tx_batch_max    = g_wifi.tx_batch_max;
+  counters->wifi_tx_enetdown     = g_wifi.tx_enetdown;
+  counters->wifi_tx_slots_full   = g_wifi.tx_slots_full;
+  counters->wifi_tx_rejected     = g_wifi.tx_rejected;
+
+  counters->wifi_rx_lists        = g_wifi.rx_lists;
+  counters->wifi_rx_frames       = g_wifi.rx_listed_frames;
+  counters->wifi_tx_completions  = g_wifi.tx_completions;
+  counters->wifi_rx_queue_full   = g_wifi.rx_queue_full;
+  counters->wifi_rx_alloc_fail   = g_wifi.rx_alloc_fail;
+  counters->wifi_rx_list_max     = g_wifi.rx_list_max;
+  counters->wifi_rx_list_ceiling = BK7258_WIFI_MAX_LIST;
 }
 
 #endif /* CONFIG_BK7258_WIFI */
