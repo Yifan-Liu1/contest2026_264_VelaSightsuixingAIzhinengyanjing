@@ -13,7 +13,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
 MANIFEST="$SCRIPT_DIR/manifest.tsv"
-EXPECTED_MANAGED=56
+EXPECTED_MANAGED=58
 MODE=check
 OPENVELA_ROOT=${OPENVELA_ROOT:-}
 BK_AVDK_ROOT=${BK_AVDK_ROOT:-}
@@ -28,7 +28,7 @@ options:
   --bk-avdk-root PATH   Beken bk_avdk_smp checkout
   -h, --help            Show this help
 
-check is read-only. install validates the complete 56-file overlay first, then
+check is read-only. install validates the complete 58-file overlay first, then
 uses a same-directory temporary file and atomic rename for each changed path.
 Unknown modifications abort before the first managed file is written.
 EOF
@@ -128,8 +128,8 @@ if ! awk -F '\t' '
         if ($3 != "nuttx" || $4 != "nuttx" || $7 != "1")
           fail("nuttx mapping/count must be nuttx -> nuttx with 1 file")
       } else if ($2 == "packages_ai_agent") {
-        if ($3 != "packages/ai_agent" || $4 != "packages/ai_agent" || $7 != "15")
-          fail("packages_ai_agent mapping/count must be packages/ai_agent with 15 files")
+        if ($3 != "packages/ai_agent" || $4 != "packages/ai_agent" || $7 != "17")
+          fail("packages_ai_agent mapping/count must be packages/ai_agent with 17 files")
       } else if ($2 == "bk_avdk_smp") {
         if ($3 != "bk_avdk_smp" || $4 != "bk_avdk_smp" || $7 != "39")
           fail("bk_avdk_smp mapping/count must contain 39 files")
