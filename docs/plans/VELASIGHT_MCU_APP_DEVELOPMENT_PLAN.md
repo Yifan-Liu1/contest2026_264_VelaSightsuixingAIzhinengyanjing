@@ -904,7 +904,7 @@ SoftAP 页面由 `vs_network` 负责调用 WAPI、IPv4 和 DHCP；服务器、SS
 修改 Kconfig 后先 clean，再按项目门禁构建：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake distclean
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8
 ```

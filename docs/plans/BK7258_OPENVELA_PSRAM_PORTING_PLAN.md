@@ -1283,7 +1283,7 @@ cacheable PSRAM是再后一阶段，不与首次 16 MB启用同时提交。
 OpenVela构建：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh \
   vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
@@ -1300,10 +1300,10 @@ cd /home/mi/vela_competition/contest
 
 ```bash
 cp \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin
 
-cd /home/mi/vela_competition/bk_avdk_smp
+cd /home/mi/vela_competition_continue/bk_avdk_smp
 
 make -C projects/app_ab clean
 

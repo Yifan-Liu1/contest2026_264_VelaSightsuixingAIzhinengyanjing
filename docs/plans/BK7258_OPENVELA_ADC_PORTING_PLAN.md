@@ -26,19 +26,19 @@
 正式代码仓库为：
 
 ```text
-/home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+/home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ```
 
 NuttX/OpenVela 源码为：
 
 ```text
-/home/mi/vela_competition/contest/nuttx
+/home/mi/vela_competition_continue/contest/nuttx
 ```
 
 原厂 BK7258 参考源码为：
 
 ```text
-/home/mi/vela_competition/bk_avdk_smp
+/home/mi/vela_competition_continue/bk_avdk_smp
 ```
 
 仓库内的 `external/bk_avdk_smp/` 只是 CP 侧裁剪镜像，**不含任何 ADC 文件**；
@@ -752,7 +752,7 @@ board 层 `src/CMakeLists.txt` 中加入 `bk7258_adc_dev.c`。bring-up 调用位
 必须先 `distclean`：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/nsh --cmake distclean
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/nsh --cmake -j8

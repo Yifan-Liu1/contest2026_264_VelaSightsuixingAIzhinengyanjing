@@ -31,7 +31,7 @@ localhost/bekencorp/armino-idk  1.5
 确认待链接的OpenVela AP固件存在：
 
 ```bash
-cd "/home/mi/vela_competition/bk_avdk_smp"
+cd "/home/mi/vela_competition_continue/bk_avdk_smp"
 ls -lh build/openvela-ap.bin
 ```
 
@@ -59,7 +59,7 @@ podman run --rm --userns=keep-id -v "$PWD:/armino" -w /armino localhost/bekencor
 宿主机和容器内的路径对应关系：
 
 ```text
-宿主机：/home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+宿主机：/home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin
 容器内：/armino/build/openvela-ap.bin
 ```
 
@@ -92,5 +92,5 @@ projects/app_ab/build/bk7258/app_ab/package/all-app.bin
   -p 0 \
   -b 115200 \
   -s 0 \
-  -i "/home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin"
+  -i "/home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/all-app.bin"
 ```

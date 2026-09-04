@@ -857,7 +857,7 @@ S2/S3分别替换上述fail-stop和IPI占位实现后才允许烧录启动。
 安装并只读验证全部受管完整文件：
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ./external/prepare.sh install
 ./external/prepare.sh check
 ```
@@ -866,15 +866,15 @@ cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengya
 一键入口；命令本身不改写：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/nsh --cmake distclean
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
   -e -Werror --cmake -j8
 
 cp cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin
 
-cd /home/mi/vela_competition/bk_avdk_smp
+cd /home/mi/vela_competition_continue/bk_avdk_smp
 make -C projects/app_ab clean
 podman run --rm --userns=keep-id \
   -v "$PWD:/armino" -w /armino \
@@ -887,7 +887,7 @@ podman run --rm --userns=keep-id \
 
 ```bash
 rg 'CONFIG_(SMP|SMP_NCPUS|SYSTEM_TIME64|TIMER_ARCH|USEC_PER_TICK|BK7258_CPU_FREQ_HZ|LIBC_ATOMIC)' \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/.config
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/.config
 
 rg 'CONFIG_OPENVELA_AP_480M|CONFIG_CPU_DEFAULT_FREQ_60M|CONFIG_CLK_FORCE_MAX_CPU_FREQ_320M' \
   projects/app_ab/cp/config/bk7258/config \
@@ -915,9 +915,9 @@ rg 'CONFIG_OPENVELA_AP_480M|CONFIG_CPU_DEFAULT_FREQ_60M|CONFIG_CLK_FORCE_MAX_CPU
 
 ```bash
 sha256sum \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 ```
 
 不得复用早于当前source的CP object。当前曾出现CP source晚于heartbeat object的情况，

@@ -30,9 +30,9 @@
 
 ```text
 工作区根目录：       /home/mi/vela_competition
-正式代码仓库：       /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
-OpenVela/NuttX 源码： /home/mi/vela_competition/contest/nuttx
-ai_agent 包：        /home/mi/vela_competition/contest/apps/packages/ai_agent
+正式代码仓库：       /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+OpenVela/NuttX 源码： /home/mi/vela_competition_continue/contest/nuttx
+ai_agent 包：        /home/mi/vela_competition_continue/contest/apps/packages/ai_agent
 ```
 
 本文相对路径均相对正式代码仓库根目录。
@@ -155,7 +155,7 @@ vs_social.c（新增）编排层
 ### 1.3 工作区状态记录
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 git status --short
 git log -1 --oneline
 ```
@@ -921,7 +921,7 @@ endif()
 ### 6.3 构建与打包
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake distclean
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8

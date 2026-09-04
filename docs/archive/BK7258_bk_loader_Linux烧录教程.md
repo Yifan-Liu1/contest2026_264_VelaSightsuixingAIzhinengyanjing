@@ -85,13 +85,13 @@ build/bk7258/app/package/all-app.bin
 本教程使用的固件路径为：
 
 ```text
-/home/mi/vela_competition/bk_avdk_smp/build/bk7258/app/package/all-app.bin
+/home/mi/vela_competition_continue/bk_avdk_smp/build/bk7258/app/package/all-app.bin
 ```
 
 先确认固件存在：
 
 ```bash
-ls -lh "/home/mi/vela_competition/bk_avdk_smp/build/bk7258/app/package/all-app.bin"
+ls -lh "/home/mi/vela_competition_continue/bk_avdk_smp/build/bk7258/app/package/all-app.bin"
 ```
 
 如果找不到该文件，需要先完成工程配置和编译。不要把 SDK 工程目录或其他单独的 bin 文件误作为 `all-app.bin` 烧录，除非工程文档明确要求使用其他镜像。
@@ -148,7 +148,7 @@ cd ~/下载
   -p 0 \
   -b 115200 \
   -s 0 \
-  -i '/home/mi/vela_competition/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
+  -i '/home/mi/vela_competition_continue/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
 ```
 
 参数说明：
@@ -166,7 +166,7 @@ cd ~/下载
   -p 0 \
   -b 115200 \
   -s 0 \
-  -i '/home/mi/vela_competition/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
+  -i '/home/mi/vela_competition_continue/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
 ```
 
 ### 7.2 使用整片擦除
@@ -179,7 +179,7 @@ cd ~/下载
   -b 115200 \
   -s 0 \
   -c \
-  -i '/home/mi/vela_competition/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
+  -i '/home/mi/vela_competition_continue/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
 ```
 
 整片擦除会删除 Flash 中已有的内容，可能包括设备配置、校准数据、密钥或其他用户数据。非必要时不要使用 `-c`。
@@ -238,7 +238,7 @@ sudo ./bk_loader download \
   -p 0 \
   -b 115200 \
   -s 0 \
-  -i '/home/mi/vela_competition/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
+  -i '/home/mi/vela_competition_continue/bk_avdk_smp/build/bk7258/app/package/all-app.bin'
 ```
 
 ### 9.2 卡在 `Getting Bus...` 或连接失败

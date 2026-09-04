@@ -65,7 +65,7 @@ autoflash.sh                 BK7258 固件自动烧录脚本
 本项目需要比赛仓、OpenVela 工作树和 Beken AVDK SMP 工程：
 
 ```text
-/home/mi/vela_competition/
+/home/mi/vela_competition_continue/
 ├── contest/
 │   └── contest2026_264_VelaSightsuixingAIzhinengyanjing/
 └── bk_avdk_smp/
@@ -89,7 +89,7 @@ autoflash.sh                 BK7258 固件自动烧录脚本
 最终产品推荐从比赛仓根使用统一入口：
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ./build_and_flash.sh --prepare-overlay
 ```
 
@@ -114,7 +114,7 @@ LVGL 双屏界面和 `packages/ai_agent` 的产品配置。需要调查 AP 构�
 ### 4.4 烧录和控制台
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ./autoflash.sh -p /dev/ttyUSB1 -n 1
 ```
 

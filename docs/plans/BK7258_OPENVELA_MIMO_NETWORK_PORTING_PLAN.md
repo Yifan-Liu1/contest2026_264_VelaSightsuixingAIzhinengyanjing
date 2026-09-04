@@ -162,7 +162,7 @@ manifest/overlay，而不能恢复旧的差分应用旁路。所有公共仓修�
 构建/烧录总流程（各阶段共用，详见 `docs/固件构建步骤.md`）：
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 
 # 安装四棵完整文件 overlay 后构建 ai_agent、打包 all-app.bin
 ./build_and_flash.sh --prepare-overlay

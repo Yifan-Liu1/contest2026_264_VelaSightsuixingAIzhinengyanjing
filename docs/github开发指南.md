@@ -5,7 +5,7 @@
 工作区：
 
 ```text
-~/vela_competition/contest/
+~/vela_competition_continue/contest/
 ├── .repo/                                      # repo 元数据，不提交
 ├── nuttx/ apps/ packages/ vendor/              # openvela 公共仓库
 └── contest2026_264_VelaSightsuixingAIzhinengyanjing/
@@ -24,8 +24,8 @@
 在新的工作区根目录执行，不要在比赛仓子目录中执行 `repo init`：
 
 ```bash
-mkdir -p ~/vela_competition/contest
-cd ~/vela_competition/contest
+mkdir -p ~/vela_competition_continue/contest
+cd ~/vela_competition_continue/contest
 
 repo init \
   -u https://github.com/open-vela/contest2026_264_VelaSightsuixingAIzhinengyanjing \
@@ -39,13 +39,13 @@ repo status
 比赛仓路径：
 
 ```text
-~/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/
+~/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing/
 ```
 
 ## 3. 使用开发分支
 
 ```bash
-cd ~/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd ~/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 git switch dev-ai-contest-2026
 git branch --show-current
 git status --short --branch
@@ -69,7 +69,7 @@ git status --short --branch
 日常操作：
 
 ```bash
-cd ~/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd ~/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 
 # 切换到开发分支
 git switch dev-ai-contest-2026
@@ -255,7 +255,7 @@ contest/packages/
 如果新增源码目录，必须同时在比赛仓 manifest 中增加对应的 `<linkfile>`，然后同步并检查映射：
 
 ```bash
-cd ~/vela_competition/contest
+cd ~/vela_competition_continue/contest
 repo sync -c
 ls -ld vendor/beken/chips/bk7258
 readlink vendor/beken/chips/bk7258
@@ -264,7 +264,7 @@ readlink vendor/beken/chips/bk7258
 ## 5. 正确提交
 
 ```bash
-cd ~/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd ~/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 
 git status --short
 git diff --check
@@ -301,7 +301,7 @@ git push origin dev-ai-contest-2026
 ## 6. 检查公共仓库
 
 ```bash
-cd ~/vela_competition/contest
+cd ~/vela_competition_continue/contest
 repo status
 git -C nuttx status
 git -C vendor/beken status
@@ -321,7 +321,7 @@ git -C apps status
 同步前先检查：
 
 ```bash
-cd ~/vela_competition/contest
+cd ~/vela_competition_continue/contest
 repo status
 ```
 
@@ -344,7 +344,7 @@ repo sync --force-sync
 比赛仓的 fork 分支必须定期与上游 `open-vela` 保持同步。同步时只能使用 rebase，不能使用 merge：
 
 ```bash
-cd ~/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd ~/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 
 # 获取上游最新
 git fetch openvela
@@ -406,7 +406,7 @@ This branch cannot be rebased due to conflicts
 将 fork 分支重建为目标分支之上只保留有效新增提交：
 
 ```bash
-cd ~/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd ~/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 
 # 确认远端最新
 git fetch --all --prune

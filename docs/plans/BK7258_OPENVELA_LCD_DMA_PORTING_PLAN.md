@@ -39,23 +39,26 @@
 正式代码仓库为：
 
 ```text
-/home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+/home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ```
 
 NuttX/OpenVela 源码为：
 
 ```text
-/home/mi/vela_competition/contest/nuttx
+/home/mi/vela_competition_continue/contest/nuttx
 ```
 
-（等价于 `/home/mi/vela_competition/openvela`，两者内容不同但都被工作区
-引用；chip 层 `Make.defs`/`CMakeLists.txt` 使用的是 `contest/nuttx` 这一份，
+（原文这里写的是"等价于 `/home/mi/vela_competition_continue/openvela`，两者内容不同
+但都被工作区引用"——**实测该路径在当前工作区不存在**，`ls /home/mi/vela_competition_continue/`
+下没有 `openvela` 目录，这一句已过时/或从未准确，不要再依赖它。`nuttx`/`apps`/
+`packages`/`vendor` 这些公共仓直接在 `contest/` 下，没有独立的 `openvela/` 子目录；
+chip 层 `Make.defs`/`CMakeLists.txt` 使用的是 `contest/nuttx` 这一份，
 后续所有 NuttX 框架代码引用以它为准。）
 
 原厂 BK7258 参考源码为：
 
 ```text
-/home/mi/vela_competition/bk_avdk_smp
+/home/mi/vela_competition_continue/bk_avdk_smp
 ```
 
 仓库内的 `external/bk_avdk_smp/` 只是 CP 侧裁剪镜像，**不含 LCD/QSPI/DMA
@@ -907,7 +910,7 @@ board/beken/boards/bk7258/bk7258-ap/src/bk7258_gc9d01.c         不改动
 5. **取证实际 SCK 频率**（第 1.3.1 节的前置条件）：`clk_rate = 0` 是
    "不再分频（SCK = 60MHz）"还是"再除以 2（SCK = 30MHz）"。可用的手段
    按可靠性排序：接逻辑分析仪/示波器直接量 SCL 周期；或查工作区根目录
-   `/home/mi/vela_competition` 下的 BK7258 数据手册 PDF 的 QSPI 时钟章节
+   `/home/mi/vela_competition_continue` 下的 BK7258 数据手册 PDF 的 QSPI 时钟章节
    （注意该文件名里"BK7258"与"Datasheet"之间是一个 **不换行空格**
    U+00A0，不是普通空格，用普通空格拼路径会找不到文件，建议用
    `find . -maxdepth 1 -iname '*Datasheet*'` 定位）；或推 N 帧测总时间

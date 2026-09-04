@@ -1213,7 +1213,7 @@ packager从`bk_package.json`的`firmware`字段读取输入文件：
 当前仓库尚未实现名为`bk7258_openvela`的统一make target。实际命令分为两步：先构建OpenVela AP，再用Podman运行ARMINO官方镜像构建`app_ab`并注入外部AP：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh \
   vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
@@ -1222,9 +1222,9 @@ cd /home/mi/vela_competition/contest
   -j8
 
 cp cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin
 
-cd /home/mi/vela_competition/bk_avdk_smp
+cd /home/mi/vela_competition_continue/bk_avdk_smp
 make -C projects/app_ab clean
 podman run --rm \
   --userns=keep-id \

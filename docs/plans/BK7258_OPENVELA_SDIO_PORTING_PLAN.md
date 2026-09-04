@@ -20,19 +20,23 @@
 正式代码仓库为：
 
 ```text
-/home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+/home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ```
 
 NuttX/OpenVela 源码为：
 
 ```text
-/home/mi/vela_competition/openvela
+/home/mi/vela_competition_continue/contest/nuttx
 ```
+
+（原文这里写的是 `/home/mi/vela_competition_continue/openvela`，该路径实测不存在；
+`nuttx`/`apps`/`packages`/`vendor` 等公共仓直接在 `contest/` 下，没有独立的
+`openvela/` 子目录。）
 
 原厂 BK7258 参考源码为：
 
 ```text
-/home/mi/vela_competition/bk_avdk_smp
+/home/mi/vela_competition_continue/bk_avdk_smp
 ```
 
 目标板原理图已经确认板载 SD-NAND 使用 GPIO14 至 GPIO19；因此该引脚组是本
@@ -548,12 +552,12 @@ chip 层负责寄存器、IRQ、clock、command、FIFO、PIO 和 `sdio_dev_s`；
 host 侧只读备份示例，设备名必须由实际探测结果替换：
 
 ```bash
-mkdir -p /home/mi/vela_competition/artifacts/sdio-golden
+mkdir -p /home/mi/vela_competition_continue/artifacts/sdio-golden
 dd if=/dev/<original-block-device> \
-   of=/home/mi/vela_competition/artifacts/sdio-golden/sector0-lba1.bin \
+   of=/home/mi/vela_competition_continue/artifacts/sdio-golden/sector0-lba1.bin \
    bs=512 count=2 iflag=direct status=progress
-sha256sum /home/mi/vela_competition/artifacts/sdio-golden/sector0-lba1.bin
-xxd -g1 -l 1024 /home/mi/vela_competition/artifacts/sdio-golden/sector0-lba1.bin
+sha256sum /home/mi/vela_competition_continue/artifacts/sdio-golden/sector0-lba1.bin
+xxd -g1 -l 1024 /home/mi/vela_competition_continue/artifacts/sdio-golden/sector0-lba1.bin
 ```
 
 sector 0/LBA1 解析规则：
@@ -807,7 +811,7 @@ SDIO 初始化失败只应打印错误并保留 NSH/日志，不应注册虚假�
 进入正式仓库：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 ```
 
 首次构建或修改 Kconfig/defconfig 后，先清理 CMake 配置：
@@ -1108,7 +1112,7 @@ SDK 更新后重新执行 P0 取证。
 ## 12. 2026-08-14 实板调试记录与当前结论
 
 本节记录本轮及前序 BK7258 SD-NAND/OpenVela SDIO 调试的实际结果。记录以
-`/home/mi/vela_competition` 工作区、目标板 `/dev/ttyUSB1` 和当前比赛仓库为准。
+`/home/mi/vela_competition_continue` 工作区、目标板 `/dev/ttyUSB1` 和当前比赛仓库为准。
 
 ### 12.1 已完成的移植内容
 

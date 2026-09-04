@@ -37,19 +37,19 @@
 正式代码仓库：
 
 ```text
-/home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+/home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ```
 
 OpenVela/NuttX 源码：
 
 ```text
-/home/mi/vela_competition/contest/nuttx
+/home/mi/vela_competition_continue/contest/nuttx
 ```
 
 `ai_agent` 包（本方案依赖的 ASR/TTS/LLM 实现）：
 
 ```text
-/home/mi/vela_competition/contest/apps/packages/ai_agent
+/home/mi/vela_competition_continue/contest/apps/packages/ai_agent
 ```
 
 本文中相对路径若不带前缀，均相对正式代码仓库根目录。
@@ -170,10 +170,10 @@ voice_channel_speak(answer) -> volc_tts 流式 -> audio_playback
 在开始任何阶段之前执行并记录：
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 git status --short
 git log -1 --oneline
-git -C /home/mi/vela_competition/contest/packages/ai_agent log -1 --oneline
+git -C /home/mi/vela_competition_continue/contest/packages/ai_agent log -1 --oneline
 ```
 
 若 `packages/ai_agent` 有产品所需的本地修改，必须先在真实目标仓实现和测试，再把
@@ -970,7 +970,7 @@ endif()
 改过 `Kconfig` 或 `defconfig` 后必须先 `distclean`：
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake distclean
 ./build.sh vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent --cmake -j8

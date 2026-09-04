@@ -3,6 +3,30 @@
 > 测量日期：2026-08-31　测量方式：主机侧对照实验（方案 1）
 > 结论：**云端服务无问题，故障在设备侧。** 同时查实两处客户端缺陷。
 
+> **2026-09 更新：本文档第 4.1 节已修复，第 7 节的假说已被证伪，字节量已被排除为
+> 卡顿原因。** 三条后续证据：
+>
+> 1. **4.1 节的终止帧缺陷已修**（`ae8146c fix(ai_agent): recognise the zero-payload
+>    TTS terminator frame`）：现在先解析 `sequence` 再判断 payload 长度，12 字节的
+>    零载荷终止帧不再被当作"过短"丢弃，负序列号能正常触发 `ended = "final sequence"`。
+> 2. **第 7 节「H2：IOB 池打满」的假说已被证伪**（`1a4a79c feat(ai_agent): fetch TTS
+>    audio as 32 kb/s MP3 and decode it on the board`）：TTS 传输格式已从 PCM
+>    （256 kb/s）改为 MP3（32 kb/s），实测网络缓冲池最低点从 14/40 提升到
+>    33/40 空闲，**IOB 池不再吃紧，但卡顿现象原样存在**——`arrival is still 0.48x
+>    realtime and playback still starved twice`。提交信息原话："byte volume is
+>    ruled out as the cause of the stall"（字节量已被排除为卡顿原因）。
+> 3. **同一次改动里也实测过 ogg_opus，结论是无效**：码率 261 kb/s，与 PCM 的
+>    256 kb/s 几乎没有差别（"no better"）；解析确认该服务的 Opus 实现只产出
+>    CELT-only wideband 20ms 包，且请求里的 `bitrate` 字段被证实对 Opus 不生效
+>    （"there is no way down"）。**这意味着本仓库此前任何"改用 ogg_opus 能通过降低
+>    数据量缓解 TTS 卡顿"的判断都已作废** —— 该路径已被真实测量堵死，不要再投入
+>    Ogg 拆包解析的开发工作量。
+>
+> 真正的卡顿根因仍未定位。排查方向需要转向传输时序本身（到达速率 0.48x 实时）而不是
+> 字节总量，第 7 节原文保留作历史记录，不代表当前有效结论。
+
+
+
 ## 1. 起因
 
 板上闲时语音助手播报时只发出少量破碎声音。设备日志（2026-08-31 20:53 一轮）：

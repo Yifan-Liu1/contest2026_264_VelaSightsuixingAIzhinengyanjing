@@ -1,5 +1,22 @@
 # Wi-Fi 使用说明
 
+> **本文档的 `kvdb` 配网流程只对 `nsh` 板级配置有效，对 `ai_agent`（VelaSight 产品配置）已经失效。**
+> `board/beken/boards/bk7258/bk7258-ap/src/bk7258_net_autostart.c` 里
+> `bk7258_kvdb_apply_wifi()` 的调用已被硬编码为直接返回 `-ENOENT`，代码注释写明：
+> "VelaSight uses vs_network.c and the unified vela.cfg record. This legacy console
+> autostart path is retained only for non-product configurations."
+> `ai_agent` 的 defconfig 编译了 `CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT=y`，
+> `nsh` 没有。也就是说：
+>
+> - **`nsh` 配置**：本文档的 `kvdb set wifi.ssid` / `wapi` 手工配网流程仍然真实有效。
+> - **`ai_agent` 配置（产品）**：配网走 SoftAP + 网页表单，统一写入
+>   `/mnt/sdnand/prov/vela.cfg`（同一文件还存 MiMo key、Volcengine 凭据、社交云端点）。
+>   完整流程、HTTP 表面、记录格式见 `app/provisioning_web/README.md`。旧的 `kvdb`
+>   命令和 AP flash KVDB 代码在产品链路里仅作历史/诊断兼容保留，不应再新增调用。
+>
+> 下面手工配网（STA/SoftAP 的 `wapi`/`ifconfig`/`renew` 部分）与固件配置无关，两种
+> 板级配置都适用，可以照常参考。
+
 当前固件使用单个 `wlan0`，STA 和 SoftAP 模式互斥运行。连接开发板 UART0 后，
 在 CP 控制台执行 `ap_console open` 进入 NSH。
 
@@ -15,8 +32,10 @@ renew wlan0                        # 首次 DHCP 可能需要重试一次
 ```
 
 凭据存在 AP 自己的 flash 分区里（`CONFIG_BK7258_KVDB_FLASH`，见
-`使用说明-camera-display-ai_agent.md`），复位和掉电都不丢。当前 ai_agent 固件开机会
-自动关联并申请地址；上面的 `kvdb wifi` / `renew wlan0` 用于修改凭据后立即生效或手工救援。
+`使用说明-camera-display-ai_agent.md`），复位和掉电都不丢。**这条自动关联仅对 `nsh`
+配置成立**：`ai_agent` 固件里这条开机自动关联的调用已被代码短路（见文首说明），实际
+不会执行，配网请走 `app/provisioning_web`。在 `nsh` 上，上面的 `kvdb wifi` /
+`renew wlan0` 用于修改凭据后立即生效或手工救援。
 
 ### 手工配网（不用 kvdb 时）
 

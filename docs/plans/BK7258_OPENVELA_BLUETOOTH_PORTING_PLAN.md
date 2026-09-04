@@ -11,7 +11,7 @@
 正式 OpenVela 移植代码只能维护在：
 
 ```text
-/home/mi/vela_competition/contest/
+/home/mi/vela_competition_continue/contest/
 └── contest2026_264_VelaSightsuixingAIzhinengyanjing/board/beken/
     ├── chips/bk7258/
     └── boards/bk7258/bk7258-ap/
@@ -747,17 +747,17 @@ CP -> AP ACL被Host释放后，必须观察到 NuttX发送
 
 ```bash
 sha256sum \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/app.bin \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/app.map \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/config/sdkconfig.h \
-  /home/mi/vela_competition/bk_avdk_smp/cp/components/bk_bluetooth/ipc/src/bt_ipc_core.c \
-  /home/mi/vela_competition/bk_avdk_smp/cp/middleware/driver/mailbox/mailbox_channel.c
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/app.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/app.map \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/config/sdkconfig.h \
+  /home/mi/vela_competition_continue/bk_avdk_smp/cp/components/bk_bluetooth/ipc/src/bt_ipc_core.c \
+  /home/mi/vela_competition_continue/bk_avdk_smp/cp/middleware/driver/mailbox/mailbox_channel.c
 
 grep -m1 'libbluetooth_controller.*\.a' \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/app.map
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/app.map
 
 grep -E 'CONFIG_(BLUETOOTH|BLE|BTDM_5_2|BTDM_CONTROLLER_ONLY|BLUETOOTH_SUPPORT_IPC|MEM_DEBUG|PSRAM_AS_SYS_MEMORY)' \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/config/sdkconfig.h
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/bk7258/config/sdkconfig.h
 ```
 
 如果 `app.bin/app.map/sdkconfig.h` 不存在，先按 `docs/固件构建步骤.md` clean构建CP；不能
@@ -766,7 +766,7 @@ grep -E 'CONFIG_(BLUETOOTH|BLE|BTDM_5_2|BTDM_CONTROLLER_ONLY|BLUETOOTH_SUPPORT_I
 ### 9.2 构建OpenVela AP
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh \
   vendor/beken/boards/bk7258/bk7258-ap/configs/nsh \
@@ -783,10 +783,10 @@ cd /home/mi/vela_competition/contest
 
 ```bash
 grep -E 'CONFIG_(ALLOW_BSD_COMPONENTS|NET_BLUETOOTH|WIRELESS=|WIRELESS_BLUETOOTH|BTSAK|BK7258_BLUETOOTH)' \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/.config
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/.config
 
 grep -E 'bk7258_bt_|bt_netdev_register|bt_initialize' \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/System.map
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/System.map
 ```
 
 检查raw ABI的 `_Static_assert` 已编译，并用 `size`/map核对新增BSS、thread stack和
@@ -798,10 +798,10 @@ pool没有使 AP SRAM越界。
 
 ```bash
 cp \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin
 
-cd /home/mi/vela_competition/bk_avdk_smp
+cd /home/mi/vela_competition_continue/bk_avdk_smp
 
 podman run --rm \
   --userns=keep-id \
@@ -817,13 +817,13 @@ podman run --rm \
 
 ```bash
 sha256sum \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 
 cmp -s \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_nsh/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 ```
 
 最终烧录文件：

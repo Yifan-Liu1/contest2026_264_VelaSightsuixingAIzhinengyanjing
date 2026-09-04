@@ -1,7 +1,7 @@
 # BK7258 OpenVela 项目技能规范
 
 > 本文件是比赛仓内的项目级交付规范，路径以
-> `/home/mi/vela_competition` 工作区根目录为基准；它在工作区根通用规则之上补充
+> `/home/mi/vela_competition_continue` 工作区根目录为基准；它在工作区根通用规则之上补充
 > `external` 完整文件 overlay、构建与验收要求，以本副本为比赛仓内权威说明。
 
 本文件是 AI 在本工作区进行 BK7258 OpenVela 移植开发时必须遵守的项目级操作规范。
@@ -212,7 +212,7 @@ CP 侧报 `CPU1 boot timeout` / `OpenVela AP boot failed: -4102`。一个社交�
 任何当前构建命令之前都必须阅读 `external/README.md`，并从比赛仓根执行只读检查：
 
 ```bash
-cd /home/mi/vela_competition/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
+cd /home/mi/vela_competition_continue/contest/contest2026_264_VelaSightsuixingAIzhinengyanjing
 ./external/prepare.sh check
 ```
 
@@ -229,7 +229,7 @@ image ID 与离线包 SHA-256 只以 `external/manifest.tsv` 为准；tag 或历
 `ai_agent`。两者的 `.config`、输出目录和固件内容不能混用。
 
 ```bash
-cd /home/mi/vela_competition/contest
+cd /home/mi/vela_competition_continue/contest
 
 ./build.sh \
   vendor/beken/boards/bk7258/bk7258-ap/configs/ai_agent \
@@ -257,14 +257,14 @@ contest/cmake_out/bk7258-ap_ai_agent/System.map
 
 ```bash
 cp \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin
 ```
 
 ### 7.3 构建 CP 并打包最终固件
 
 ```bash
-cd /home/mi/vela_competition/bk_avdk_smp
+cd /home/mi/vela_competition_continue/bk_avdk_smp
 
 podman run --rm \
   --userns=keep-id \
@@ -306,13 +306,13 @@ bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/app_ab_crc.rbl
 
 ```bash
 sha256sum \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/build/openvela-ap.bin \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/build/openvela-ap.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 
 cmp -s \
-  /home/mi/vela_competition/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
-  /home/mi/vela_competition/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
+  /home/mi/vela_competition_continue/contest/cmake_out/bk7258-ap_ai_agent/nuttx.bin \
+  /home/mi/vela_competition_continue/bk_avdk_smp/projects/app_ab/build/bk7258/app_ab/package/tmp/app1.bin
 ```
 
 ## 8. 静态与实板验证
