@@ -2914,7 +2914,7 @@ static void *vs_voice_worker(void *arg)
               ret = have_frame ?
                     llm_chat_vision_raw(
                         prompt, frame.data, frame.len, "image/jpeg",
-                        model_resp, CONFIG_VS_VOICE_RESP_MAX_BYTES, true) :
+                        model_resp, CONFIG_VS_VOICE_RESP_MAX_BYTES) :
                     -ENODATA;
             }
         }
