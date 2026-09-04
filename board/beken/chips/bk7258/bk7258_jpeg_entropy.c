@@ -579,7 +579,28 @@ int bk7258_jpeg_realign_entropy_prefix(FAR uint8_t *buf, FAR size_t *len,
             }
 
           outlen = jpeg_shifted_size(buf, scanlen, shift);
-          if (outlen == 0 || *len > capacity - outlen)
+
+          /* Both sides subtracted from capacity, and only one of them is safe
+           * to.  The test is "does *len + outlen fit", but written as
+           * "*len > capacity - outlen" it subtracts a value with no upper
+           * bound: outlen is the shifted stream plus a stuffed 0x00 after
+           * every 0xff, so it can exceed capacity, and size_t arithmetic then
+           * wraps to something no *len can be greater than.  The guard passes,
+           * jpeg_write_shifted() writes outlen bytes at buf + *len, and the
+           * overflow is as large as the stream.
+           *
+           * Subtracting *len instead cannot wrap, because *len <= capacity was
+           * checked on entry.  Same comparison, same rejections -- both forms
+           * are *len + outlen > capacity whenever the arithmetic holds.
+           *
+           * Reached on 2026-09-03 by a caller that passed capacity == *len to
+           * validate a prefix in place: correct in intent, and every nonzero
+           * shift then overflowed the buffer by its whole length.  A caller
+           * that wants validation without rewriting can pass capacity == *len
+           * and rely on this returning -ENOSPC, which it now does.
+           */
+
+          if (outlen == 0 || outlen > capacity - *len)
             {
               return -ENOSPC;
             }
