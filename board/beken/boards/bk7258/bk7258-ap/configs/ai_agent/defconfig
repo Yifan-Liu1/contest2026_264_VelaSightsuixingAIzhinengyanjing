@@ -235,7 +235,19 @@ CONFIG_PWM=y
 CONFIG_RAM_SIZE=344064
 CONFIG_RAM_START=0x28010000
 CONFIG_RAW_BINARY=y
-CONFIG_RR_INTERVAL=200
+# Was 200, which is far too coarse for an interactive single-core build.
+# CONFIG_SMP_NCPUS is 1 and four things sit at priority 100 during a social
+# session: lpwork (the camera's JPEG entropy validator, measured 252 ms per
+# frame), the velasight UI main loop, nsh_main, and one velasight pthread.
+# Round robin only rotates among equal priorities, so a 200 ms slice made one
+# full rotation 800 ms, and the UI's own 200 ms key-highlight window could
+# expire before the loop came back to push a frame.  Measured symptom
+# (2026-08-31): "ps" printed one line per ~1.75 s during a session against
+# ~7.8 ms per line when idle, and key presses produced no visible feedback.
+# 20 ms brings a rotation to 80 ms, which fits inside the highlight window.
+# Context switches cost a few microseconds here, so ten times as many of them
+# is still well under 1% of the core.
+CONFIG_RR_INTERVAL=20
 CONFIG_SCHED_HPWORK=y
 CONFIG_SCHED_LPWORK=y
 # Default is 4096.  bk7258_mmcsd_worker() tail-calls

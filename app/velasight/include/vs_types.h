@@ -30,6 +30,32 @@
 
 #define VS_PRIORITY_VOICE  (SCHED_PRIORITY_DEFAULT + 5)
 
+/* The four social-session workers, and the one place in this file where a
+ * thread sits *below* the UI rather than above it.
+ *
+ * They were at VS_PRIORITY_VOICE, which put four threads doing continuous
+ * TLS above the UI loop and above nsh_main, both of which run at
+ * SCHED_PRIORITY_DEFAULT.  Round robin does not help there: it only rotates
+ * among equal priorities, so a thread at +5 preempts the UI outright and
+ * runs until it blocks, no matter how small CONFIG_RR_INTERVAL is.  Measured
+ * 2026-08-31 with CONFIG_RR_INTERVAL already reduced to 20: a task at
+ * SCHED_PRIORITY_DEFAULT got a turn every ~1720 ms during a session against
+ * ~80 ms expected from the four-way rotation at that level, and ~7.9 ms when
+ * idle.  VS_RESPONSE_VISIBLE_MS is 200, so the key highlight had no chance.
+ *
+ * The reason the voice worker is above the UI does not carry over.  That one
+ * drains a TTS socket, and IOBs it has not read stay out of the pool with the
+ * sender's window shut, so being late costs throughput elsewhere.  A social
+ * upload has no such coupling: it reads a short JSON reply and writes a JPEG
+ * that was already staged.  Late is just late.
+ *
+ * So the trade is the same one the camera path already takes -- upload later
+ * rather than freeze the screen.  Under load these fall behind and the queue
+ * grows, which social_queue_push() already handles by dropping the oldest.
+ */
+
+#define VS_PRIORITY_SOCIAL (SCHED_PRIORITY_DEFAULT - 5)
+
 /* Key sampling.  Above the UI so a press is timestamped promptly, below the
  * audio path because 5 ms of jitter in a debounce window is invisible.
  */
