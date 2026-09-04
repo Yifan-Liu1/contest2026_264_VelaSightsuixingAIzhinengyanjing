@@ -108,7 +108,11 @@
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES
-#  define CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES 262144
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES 8388608
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_MINUTES_TEXT_MAX_BYTES
+#  define CONFIG_VS_SOCIAL_MINUTES_TEXT_MAX_BYTES 8192
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_CONNECT_TIMEOUT_MS
@@ -306,6 +310,31 @@ struct cloud_state_s
    */
 
   bool mock_url_logged;
+
+  /* One cleartext connection, held across requests, because on this interface
+   * the connection is the routing key.
+   *
+   * Measured 2026-09-03 against staging: the balancer in front of the two
+   * server instances routes per TCP connection, not per request, and session
+   * state lives only on the instance that answered the open.  A fresh
+   * connection per request therefore lands on the wrong instance about half
+   * the time -- 16 failures in 30 uploads -- while twelve requests pinned to
+   * one connection all failed together, and an open plus ten uploads plus the
+   * close on a single connection succeeded 33 times out of 33.
+   *
+   * So this is not a latency optimisation.  Reusing the connection that
+   * created the session is what makes the session findable, and no retry
+   * policy can substitute for it: waiting does not change which instance
+   * answers, only reconnecting does.
+   *
+   * keep_valid rather than a -1 sentinel because g_cloud is zero-initialised
+   * and fd 0 is a real descriptor.
+   */
+
+  int  keep_sock;
+  bool keep_valid;
+  char keep_host[CLOUD_HOST_MAX];
+  char keep_port[CLOUD_PORT_MAX];
 };
 
 /****************************************************************************
@@ -956,6 +985,85 @@ errout:
 }
 
 /****************************************************************************
+ * Name: cloud_keep_drop
+ *
+ * Description:
+ *   Let the held connection go.  Safe to call when there is none.
+ *
+ *   Every caller that abandons a connection has to come through here rather
+ *   than close() directly, because a stale descriptor left in g_cloud would
+ *   be handed to the next request and fail in a way that looks like the
+ *   server refusing it.
+ *
+ ****************************************************************************/
+
+static void cloud_keep_drop(void)
+{
+  if (g_cloud.keep_valid)
+    {
+      close(g_cloud.keep_sock);
+      g_cloud.keep_valid = false;
+      g_cloud.keep_sock  = -1;
+    }
+}
+
+/****************************************************************************
+ * Name: cloud_keep_take
+ *
+ * Description:
+ *   The connection to use for one exchange: the held one when it matches this
+ *   endpoint, otherwise a new one.  *reused says which, because that decides
+ *   whether a failure is worth retrying -- see cloud_plain_http().
+ *
+ ****************************************************************************/
+
+static int cloud_keep_take(const struct cloud_url_s *url, bool *reused)
+{
+  *reused = false;
+
+  if (g_cloud.keep_valid)
+    {
+      if (strcmp(g_cloud.keep_host, url->host) == 0 &&
+          strcmp(g_cloud.keep_port, url->port) == 0)
+        {
+          *reused = true;
+          return g_cloud.keep_sock;
+        }
+
+      /* A different endpoint.  Holding the old connection open would pin this
+       * device to an instance it is no longer talking to.
+       */
+
+      cloud_keep_drop();
+    }
+
+  return cloud_connect(url->host, url->port);
+}
+
+/****************************************************************************
+ * Name: cloud_keep_put
+ *
+ * Description:
+ *   Hold this connection for the next exchange.
+ *
+ ****************************************************************************/
+
+static void cloud_keep_put(int sock, const struct cloud_url_s *url)
+{
+  if (g_cloud.keep_valid && g_cloud.keep_sock == sock)
+    {
+      return;
+    }
+
+  cloud_keep_drop();
+
+  strlcpy(g_cloud.keep_host, url->host, sizeof(g_cloud.keep_host));
+  strlcpy(g_cloud.keep_port, url->port, sizeof(g_cloud.keep_port));
+  g_cloud.keep_sock  = sock;
+  g_cloud.keep_valid = true;
+}
+
+/****************************************************************************
  * Name: cloud_send_all
  ****************************************************************************/
 
@@ -988,13 +1096,27 @@ static int cloud_send_all(int sock, const void *data, size_t len)
  * Name: cloud_plain_http
  *
  * Description:
- *   One cleartext HTTP/1.1 exchange.  Connection: close throughout, which
- *   makes the read loop trivially correct and costs a handshake that is not
- *   worth pooling on a link this cheap -- the TLS path, where a handshake is
- *   expensive, is the one that pools.
+ *   One cleartext HTTP/1.1 exchange on a caller-supplied socket.
+ *
+ *   Keep-alive, not Connection: close.  The framing this needs was already
+ *   here -- Content-Length and chunked are both parsed, and the body loop
+ *   stops at Content-Length rather than at EOF -- so holding the connection
+ *   open costs nothing in this function.  What it buys is in
+ *   cloud_state_s::keep_sock: on this interface the connection decides which
+ *   server instance answers, and the session only exists on one of them.
  *
  *   The response body is left NUL-terminated for the JSON callers and its
  *   true length is reported through resp_len for the binary ones.
+ *
+ * Input Parameters:
+ *   sock     - An already-connected socket.  Not closed here.
+ *   reusable - Set true only when the exchange finished with the response
+ *              fully framed and the peer did not ask to close, which is the
+ *              only case where holding the connection is safe.
+ *   touched  - Set true as soon as one response byte arrives.  A caller may
+ *              only retry an exchange that never touched the wire, since a
+ *              request the server has already acted on would be acted on
+ *              twice -- two msgIds for one image.
  *
  * Returned Value:
  *   The HTTP status code on a complete exchange, otherwise a negative errno.
@@ -1002,12 +1124,17 @@ static int cloud_send_all(int sock, const void *data, size_t len)
  *
  ****************************************************************************/
 
-static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
-                            const vela_header_t *headers,
-                            const void *body, size_t body_len,
-                            char *resp, size_t resp_cap, size_t *resp_len)
+static int cloud_plain_http_once(const struct cloud_url_s *url,
+                                 const char *method,
+                                 const vela_header_t *headers,
+                                 const void *body, size_t body_len,
+                                 char *resp, size_t resp_cap,
+                                 size_t *resp_len, int sock,
+                                 bool *reusable, bool *touched,
+                                 vela_body_sink_t sink, void *sink_arg)
 {
   char *hdr = NULL;
+  bool hdr_psram = false;
   char *body_start;
   size_t hdr_cap = CLOUD_PATH_MAX + 512;
   size_t filled = 0;
@@ -1016,10 +1143,13 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
   long content_length = -1;
   bool chunked = false;
   bool header_done = false;
+  bool peer_close = false;
   int status = 0;
-  int sock = -1;
   int pos = 0;
   int ret;
+
+  *reusable = false;
+  *touched  = false;
 
   if (resp == NULL || resp_cap < 2)
     {
@@ -1032,17 +1162,17 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
       *resp_len = 0;
     }
 
-  hdr = malloc(hdr_cap);
+  /* PSRAM first: hdr_cap is CLOUD_PATH_MAX + 512, about 3.4 KB, and this is
+   * the second of the two per-request allocations on the social path (the
+   * first is struct cloud_url_s in cloud_api_call()).  Only staging lives
+   * here -- the request line and headers on the way out, the response header
+   * block on the way back -- so the slower pool costs nothing that matters.
+   */
+
+  hdr = cloud_alloc(hdr_cap, &hdr_psram);
   if (hdr == NULL)
     {
       return -ENOMEM;
-    }
-
-  sock = cloud_connect(url->host, url->port);
-  if (sock < 0)
-    {
-      ret = sock;
-      goto errout;
     }
 
 #define CLOUD_HDR_APPEND(...)                                             \
@@ -1074,7 +1204,7 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
     }
 
   CLOUD_HDR_APPEND("User-Agent: velasight/1.0\r\n");
-  CLOUD_HDR_APPEND("Connection: close\r\n");
+  CLOUD_HDR_APPEND("Connection: keep-alive\r\n");
   CLOUD_HDR_APPEND("Accept: */*\r\n");
 
   if (headers != NULL)
@@ -1132,6 +1262,7 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
         }
 
       filled += (size_t)n;
+      *touched = true;
       resp[filled] = '\0';
 
       if (strstr(resp, "\r\n\r\n") != NULL)
@@ -1181,6 +1312,23 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
         chunked = eol != NULL && eol <= body_start &&
                   cloud_range_has_token(te, eol, "chunked");
       }
+
+    /* HTTP/1.1 defaults to keep-alive, so only an explicit close counts.  A
+     * peer that says close will drop the socket after this body, and holding
+     * it would hand the next request a descriptor that is already gone.
+     */
+
+    {
+      char *cn = strcasestr(resp, "\r\nConnection:");
+
+      if (cn != NULL && cn < body_start)
+        {
+          const char *eol = strstr(cn + 2, "\r\n");
+
+          peer_close = eol != NULL && eol <= body_start &&
+                       cloud_range_has_token(cn, eol, "close");
+        }
+    }
   }
 
   /* A body the caller cannot hold is refused before it is read.  Truncating
@@ -1200,6 +1348,103 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
     }
 
   moved = filled - header_len;
+
+  /* Streaming: hand the body straight to the sink and keep none of it.
+   *
+   * Only reachable for a download whose URL is cleartext.  The presigned URLs
+   * this device is given are https, so in the deployed configuration the
+   * streaming download runs through vela_https_request_stream() instead and
+   * this branch is what covers a mock or intranet endpoint.
+   *
+   * Chunked is refused rather than handled here.  The incremental decoder that
+   * would be needed lives in vela_tls.c, serving the transport that actually
+   * carries these downloads, and a second copy in this file would be a second
+   * thing to keep correct for a case that has not been observed.  Saying so is
+   * better than a partial WAV: an object store answering a GET for a static
+   * object sends Content-Length.
+   */
+
+  if (sink != NULL)
+    {
+      size_t delivered = 0;
+
+      if (chunked)
+        {
+          printf("%s: cleartext streaming does not decode chunked bodies\n",
+                 CLOUD_TAG);
+          ret = -EPROTO;
+          goto errout;
+        }
+
+      if (moved > 0 && sink(sink_arg, body_start, moved) < 0)
+        {
+          ret = -EIO;
+          goto errout;
+        }
+
+      delivered = moved;
+
+      for (; ; )
+        {
+          size_t want = resp_cap - 1;
+          ssize_t n;
+
+          if (content_length >= 0)
+            {
+              if ((long)delivered >= content_length)
+                {
+                  break;
+                }
+
+              if ((size_t)(content_length - (long)delivered) < want)
+                {
+                  want = (size_t)(content_length - (long)delivered);
+                }
+            }
+
+          /* resp is scratch here, not an accumulator: each read is consumed
+           * by the sink before the next overwrites it, which is what keeps
+           * this bounded by the buffer rather than by the body.
+           */
+
+          n = recv(sock, resp, want, 0);
+          if (n < 0 && errno == EINTR)
+            {
+              continue;
+            }
+
+          if (n <= 0)
+            {
+              break;
+            }
+
+          if (sink(sink_arg, resp, (size_t)n) < 0)
+            {
+              ret = -EIO;
+              goto errout;
+            }
+
+          delivered += (size_t)n;
+        }
+
+      if (content_length >= 0 && (long)delivered < content_length)
+        {
+          printf("%s: body ended at %zu of %ld bytes\n", CLOUD_TAG, delivered,
+                 content_length);
+          ret = -EIO;
+          goto errout;
+        }
+
+      if (resp_len != NULL)
+        {
+          *resp_len = delivered;
+        }
+
+      *reusable = !peer_close && content_length >= 0;
+      ret = status;
+      goto errout;
+    }
+
   memmove(resp, body_start, moved);
   filled = moved;
 
@@ -1263,15 +1508,95 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
       *resp_len = filled;
     }
 
+  /* Only a body whose end was known can be held.  Content-Length told us
+   * exactly where it stopped, and a decoded chunked body ended at its
+   * terminator; a body that ran to EOF did not, and reusing that socket would
+   * read the tail of this response as the head of the next.
+   */
+
+  *reusable = !peer_close && (chunked || content_length >= 0);
+
   ret = status;
 
 errout:
-  if (sock >= 0)
+  cloud_free(hdr, hdr_psram);
+  return ret;
+}
+
+/****************************************************************************
+ * Name: cloud_plain_http
+ *
+ * Description:
+ *   One cleartext exchange over the connection this device holds, taking a
+ *   new one when there is none and giving it up when it cannot be kept.
+ *
+ *   The retry exists because a held connection has one failure mode a fresh
+ *   one does not: the server may have closed it while it sat idle, and the
+ *   device only finds out when it writes.  Retrying that on a new connection
+ *   turns an invisible timeout into a normal request.
+ *
+ *   It retries only when nothing came back.  Once a response byte has
+ *   arrived the server has acted on the request, and sending it again would
+ *   mean two msgIds for one image or two close messages for one session --
+ *   which is a bug this interface already has on its own and does not need
+ *   help reproducing.
+ *
+ ****************************************************************************/
+
+static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
+                            const vela_header_t *headers,
+                            const void *body, size_t body_len,
+                            char *resp, size_t resp_cap, size_t *resp_len,
+                            vela_body_sink_t sink, void *sink_arg)
+{
+  int attempt;
+  int ret = -EIO;
+
+  for (attempt = 0; attempt < 2; attempt++)
     {
-      close(sock);
+      bool reused = false;
+      bool reusable = false;
+      bool touched = false;
+      int sock = cloud_keep_take(url, &reused);
+
+      if (sock < 0)
+        {
+          return sock;
+        }
+
+      ret = cloud_plain_http_once(url, method, headers, body, body_len,
+                                  resp, resp_cap, resp_len, sock,
+                                  &reusable, &touched, sink, sink_arg);
+
+      if (ret >= 0 && reusable)
+        {
+          cloud_keep_put(sock, url);
+          return ret;
+        }
+
+      /* Not held: either it failed, or its body ran to EOF so the socket's
+       * position is no longer known.
+       */
+
+      if (reused)
+        {
+          cloud_keep_drop();
+        }
+      else
+        {
+          close(sock);
+        }
+
+      if (ret >= 0 || !reused || touched)
+        {
+          return ret;
+        }
+
+      /* A held connection that produced nothing.  One more try, on a
+       * connection this device just opened.
+       */
     }
 
-  free(hdr);
   return ret;
 }
 
@@ -1285,22 +1610,32 @@ errout:
  *
  ****************************************************************************/
 
-static int cloud_http(const struct cloud_url_s *url, const char *method,
-                      const vela_header_t *headers,
-                      const void *body, size_t body_len,
-                      char *resp, size_t resp_cap, size_t *resp_len)
+static int cloud_http_ex(const struct cloud_url_s *url, const char *method,
+                         const vela_header_t *headers,
+                         const void *body, size_t body_len,
+                         char *resp, size_t resp_cap, size_t *resp_len,
+                         vela_body_sink_t sink, void *sink_arg)
 {
   int ret;
 
   if (!url->tls)
     {
       return cloud_plain_http(url, method, headers, body, body_len,
-                              resp, resp_cap, resp_len);
+                              resp, resp_cap, resp_len, sink, sink_arg);
     }
 
-  ret = vela_https_request(url->host, url->port, method, url->path, headers,
-                           (const char *)body, body_len, resp, resp_cap,
-                           resp_len);
+  if (sink != NULL)
+    {
+      ret = vela_https_request_stream(url->host, url->port, method, url->path,
+                                      headers, (const char *)body, body_len,
+                                      sink, sink_arg, resp_len);
+    }
+  else
+    {
+      ret = vela_https_request(url->host, url->port, method, url->path,
+                               headers, (const char *)body, body_len, resp,
+                               resp_cap, resp_len);
+    }
   if (ret > 0)
     {
       return ret;
@@ -1327,9 +1662,39 @@ static int cloud_http(const struct cloud_url_s *url, const char *method,
       case VELA_TLS_ERR_OVERFLOW:
         return -E2BIG;
 
+      /* The sink refused.  For the download-to-file path that means the file
+       * would have outgrown its budget or the write failed, and the sink has
+       * already said which; keeping the distinction here lets the caller tell
+       * it apart from a transport fault.
+       */
+
+      case VELA_TLS_ERR_SINK:
+        return -EFBIG;
+
+      case VELA_TLS_ERR_PROTOCOL:
+        return -EPROTO;
+
       default:
         return ret < 0 ? ret : -EIO;
     }
+}
+
+/****************************************************************************
+ * Name: cloud_http
+ *
+ * Description:
+ *   cloud_http_ex() for the callers that want the body in a buffer, which is
+ *   all of them except the download that goes to a file.
+ *
+ ****************************************************************************/
+
+static int cloud_http(const struct cloud_url_s *url, const char *method,
+                      const vela_header_t *headers,
+                      const void *body, size_t body_len,
+                      char *resp, size_t resp_cap, size_t *resp_len)
+{
+  return cloud_http_ex(url, method, headers, body, body_len, resp, resp_cap,
+                       resp_len, NULL, NULL);
 }
 
 /****************************************************************************
@@ -1349,6 +1714,7 @@ static int cloud_api_call(const char *method, const char *path_and_query,
                           const char *json_body, char *resp, size_t resp_cap)
 {
   struct cloud_url_s *url;
+  bool url_psram = false;
   vela_header_t headers[2];
   int ret;
 
@@ -1357,7 +1723,15 @@ static int cloud_api_call(const char *method, const char *path_and_query,
       return -ENODATA;
     }
 
-  url = malloc(sizeof(*url));
+  /* PSRAM first.  struct cloud_url_s is about 3 KB because of its
+   * CLOUD_PATH_MAX path member, and this runs on every session, upload
+   * registration and getResult call, so it is one of the two allocations the
+   * social path asks for per HTTP request.  cloud_get_result_call() has the
+   * measurement showing the internal heap cannot be relied on for that size
+   * once a session's worker stacks and TLS contexts are live.
+   */
+
+  url = cloud_alloc(sizeof(*url), &url_psram);
   if (url == NULL)
     {
       return -ENOMEM;
@@ -1382,7 +1756,7 @@ static int cloud_api_call(const char *method, const char *path_and_query,
   if (snprintf(url->path, sizeof(url->path), "%s%s", g_cloud.base_path,
                path_and_query) >= (int)sizeof(url->path))
     {
-      free(url);
+      cloud_free(url, url_psram);
       return -E2BIG;
     }
 
@@ -1395,7 +1769,7 @@ static int cloud_api_call(const char *method, const char *path_and_query,
                    json_body != NULL ? strlen(json_body) : 0,
                    resp, resp_cap, NULL);
 
-  free(url);
+  cloud_free(url, url_psram);
   return ret;
 }
 
@@ -2077,6 +2451,7 @@ int vs_cloud_init(void)
 
   memset(&g_cloud, 0, sizeof(g_cloud));
   g_cloud.initialized = true;
+  g_cloud.keep_sock   = -1;
 
   /* Deliberately no vp_store read here.  This runs on vs_app_run()'s startup
    * path, which the SD-NAND rule (docs/SD-NAND使用说明.md) forbids for
@@ -2481,6 +2856,7 @@ int vs_cloud_social_upload(const char *session_id,
   char presigned[CLOUD_PRESIGNED_PATH_MAX];
   char *resp = NULL;
   bool from_psram = false;
+  bool url_psram = false;
   cJSON *root = NULL;
   cJSON *value = NULL;
   struct cloud_url_s *url = NULL;
@@ -2551,6 +2927,18 @@ int vs_cloud_social_upload(const char *session_id,
   /* 10 (image accepted) and 11 (audio accepted) are the documented success
    * codes; 0 is what the document's own response example shows for the same
    * case, so all three are accepted.  30 is the only failure.
+   *
+   * 30 comes back as -ENOTCONN rather than -EIO, because the caller has to be
+   * able to tell it apart.  Everything else that fails here is per-item and
+   * worth another try: a timed-out connect, a malformed reply, an HTTP error.
+   * A 30 is the cloud saying it has no session to attach the message to --
+   * "session not found or closed", measured continuously through a 2026-08-31
+   * session -- and asking again with the same sessionId cannot change that
+   * answer.  The cloud interface document's own known-issues section explains
+   * why it happens: two server instances behind a 50/50 balancer with session
+   * state held locally, so the instance that answers may never have seen the
+   * open.  Retrying still costs a full TLS round trip per attempt, which is
+   * exactly the bill this split exists to stop paying.
    */
 
   if (status != 0 && status != 10 && status != 11)
@@ -2560,7 +2948,7 @@ int vs_cloud_social_upload(const char *session_id,
       cloud_value_log(value, root, log, sizeof(log));
       printf("%s: upload refused, status %d%s%s\n", CLOUD_TAG, status,
              log[0] != '\0' ? ": " : "", log);
-      ret = -EIO;
+      ret = status == 30 ? -ENOTCONN : -EIO;
       goto out;
     }
 
@@ -2582,9 +2970,14 @@ int vs_cloud_social_upload(const char *session_id,
 
   /* Step two: the bytes.  A bare PUT -- no multipart framing, which is what
    * the registration-plus-presigned-URL shape means.
+   *
+   * PSRAM first, like resp above.  struct cloud_url_s carries a
+   * CLOUD_PATH_MAX path, which puts it around 3 KB, and the internal heap is
+   * the wrong pool to ask for that during a session -- see
+   * cloud_get_result_call() for the measurement that motivated this.
    */
 
-  url = malloc(sizeof(*url));
+  url = cloud_alloc(sizeof(*url), &url_psram);
   if (url == NULL)
     {
       ret = -ENOMEM;
@@ -2661,7 +3054,7 @@ int vs_cloud_social_upload(const char *session_id,
   ret = 0;
 
 out:
-  free(url);
+  cloud_free(url, url_psram);
   cJSON_Delete(root);
   cloud_free(resp, from_psram);
   return ret;
@@ -2833,6 +3226,7 @@ static int cloud_get_result_call(const char *session_id,
                                  cJSON **value)
 {
   char *scratch = NULL;
+  bool from_psram = false;
   char *request;
   char *query;
   int prefix;
@@ -2863,9 +3257,20 @@ static int cloud_get_result_call(const char *session_id,
    * "?data=" prefix inside query rather than into a buffer of its own.  That
    * also keeps the two snprintf() destinations from being provably-disjoint
    * halves of one object, which -Wrestrict cannot see and warns about.
+   *
+   * cloud_alloc(), not malloc(), for the same reason the response buffers use
+   * it: PSRAM first, internal RAM only as a fallback.  This is about 3.5 KB
+   * (CLOUD_POLL_MAX_IDS * (VS_CLOUD_MSG_ID_MAX + 4) plus the three-times
+   * expansion the URL encoding can need), and plain malloc() of that much was
+   * observed failing on every single poll -- "vs_social: poll failed: -12"
+   * once per VS_SOCIAL_POLL_INTERVAL_MS for the whole session, measured
+   * 2026-08-31, which means no result was ever retrieved even when the
+   * uploads themselves succeeded.  CONFIG_RAM_SIZE is 344064 and a session
+   * holds four worker stacks (16K + 16K + 8K + 32K) plus live mbedtls
+   * contexts in there, so the internal heap is the wrong pool to ask.
    */
 
-  scratch = malloc(CLOUD_QUERY_REQ_MAX + CLOUD_QUERY_MAX);
+  scratch = cloud_alloc(CLOUD_QUERY_REQ_MAX + CLOUD_QUERY_MAX, &from_psram);
   if (scratch == NULL)
     {
       return -ENOMEM;
@@ -2929,7 +3334,7 @@ static int cloud_get_result_call(const char *session_id,
    * call and has no reason to overlap with this one.
    */
 
-  free(scratch);
+  cloud_free(scratch, from_psram);
   scratch = NULL;
 
   if (http < 0)
@@ -2963,7 +3368,7 @@ static int cloud_get_result_call(const char *session_id,
   return 0;
 
 errout:
-  free(scratch);
+  cloud_free(scratch, from_psram);
   return ret;
 }
 
@@ -3270,6 +3675,203 @@ static void cloud_summarize_timeline(cJSON *timeline,
   }
 }
 
+/****************************************************************************
+ * Name: cloud_field_is_url
+ *
+ * Description:
+ *   Decide whether a result field carries a link or the value itself.
+ *
+ *   txtMinutes needs this.  The interface document's examples show it holding
+ *   the summary text inline ("txtMinutes": "本次会话纪要...") and the AI-facing
+ *   section has the cloud hand the AI an upload URL for a .txt file instead,
+ *   so both readings are defensible and the two ends of this integration read
+ *   it differently.  Measured 2026-09-04 the staging cloud sends a presigned
+ *   FDS URL, 219 characters.  Rather than pick a side, tell them apart.
+ *
+ *   Deliberately narrow.  A scheme separator, or a leading slash for the
+ *   relative form the document's own ttsMinutes example uses.  Summary prose
+ *   containing "://" would be misread, which is a sentence no summariser
+ *   writes; prose beginning with '/' likewise.
+ *
+ ****************************************************************************/
+
+static bool cloud_field_is_url(const char *value)
+{
+  if (value == NULL || value[0] == '\0')
+    {
+      return false;
+    }
+
+  return value[0] == '/' || strstr(value, "://") != NULL;
+}
+
+/****************************************************************************
+ * Name: cloud_minutes_text_body
+ *
+ * Description:
+ *   Strip the AI端's file header off the downloaded text minutes.
+ *
+ *   The .txt at txtMinutes is a file written for a human reading it on a
+ *   desktop, not a field written for this screen.  Measured shape:
+ *
+ *     会话ID: session_20260904_111541_1788491741
+ *     生成时间: 2026-09-04 11:15:42
+ *     ==================================================
+ *     会话中未检测到情感数据
+ *
+ *   Three lines of provenance, a rule, then the summary.  The session id and
+ *   the generation time are already known here -- they are what was just
+ *   polled for -- so keeping them would spend the result page's 128 bytes
+ *   restating them and truncate away the one line that says anything.
+ *
+ *   Everything after the last rule of '=' is the body.  No rule means no
+ *   header, so the whole thing is the body: that is the case for a cloud that
+ *   sends the text inline as the document describes, and for any future
+ *   change to the file format that drops the preamble.
+ *
+ * Returned Value:
+ *   A pointer into text, never NULL.
+ *
+ ****************************************************************************/
+
+static const char *cloud_minutes_text_body(const char *text)
+{
+  const char *body = text;
+  const char *scan = text;
+
+  while (*scan != '\0')
+    {
+      const char *line = scan;
+      size_t rule = 0;
+
+      while (scan[rule] == '=')
+        {
+          rule++;
+        }
+
+      /* A rule is a line of nothing but '=', and long enough not to be a
+       * summary that happens to start with one.  The observed separator is
+       * fifty characters; four is a floor that no prose reaches.
+       */
+
+      if (rule >= 4 && (line[rule] == '\n' || line[rule] == '\r' ||
+                        line[rule] == '\0'))
+        {
+          scan = line + rule;
+          while (*scan == '\r' || *scan == '\n')
+            {
+              scan++;
+            }
+
+          body = scan;
+          continue;
+        }
+
+      while (*scan != '\0' && *scan != '\n')
+        {
+          scan++;
+        }
+
+      if (*scan == '\n')
+        {
+          scan++;
+        }
+    }
+
+  while (*body == '\r' || *body == '\n' || *body == ' ' || *body == '\t')
+    {
+      body++;
+    }
+
+  /* An all-header file, or one ending in its own rule, would leave nothing.
+   * The untouched text is more use than an empty string, and the caller's
+   * "no summary" fallback stays reserved for the cloud actually saying
+   * nothing.
+   */
+
+  return body[0] != '\0' ? body : text;
+}
+
+/****************************************************************************
+ * Name: cloud_resolve_text_minutes
+ *
+ * Description:
+ *   Turn a txtMinutes that is a URL into a txtMinutes that is the text, in
+ *   place, before the record is serialized.
+ *
+ *   Doing it here rather than in the caller is what keeps one shape on disk.
+ *   vs_history.c stores the msgEvent-2 payload verbatim and its seeded
+ *   records carry prose in this field; vs_voice.c reads the same field as
+ *   chat context.  Both would get a presigned URL that expires in an hour,
+ *   and the history page would show a truncated link where the summary goes.
+ *   Substituting the node ahead of cJSON_PrintUnformatted() means every
+ *   consumer downstream -- the record, the summary, the Web page, the
+ *   assistant -- sees text without knowing this happened.
+ *
+ *   Failure is not fatal and not silent.  The node is left as the URL, so
+ *   the session still completes with a link on screen instead of a summary;
+ *   that is worse than text and much better than discarding minutes the
+ *   cloud did produce.
+ *
+ ****************************************************************************/
+
+static void cloud_resolve_text_minutes(cJSON *response,
+                                       struct vs_cloud_minutes_s *minutes)
+{
+  unsigned char *text = NULL;
+  bool text_psram = false;
+  size_t len = 0;
+  cJSON *item;
+  cJSON *body;
+  int ret;
+
+  item = cJSON_GetObjectItem(response, "txtMinutes");
+  if (item == NULL || !cJSON_IsString(item) ||
+      !cloud_field_is_url(item->valuestring))
+    {
+      return;
+    }
+
+  if (minutes != NULL)
+    {
+      strlcpy(minutes->txt_url, item->valuestring,
+              sizeof(minutes->txt_url));
+    }
+
+  ret = vs_cloud_download(item->valuestring, &text, &len, &text_psram,
+                          CONFIG_VS_SOCIAL_MINUTES_TEXT_MAX_BYTES);
+  if (ret < 0)
+    {
+      printf("%s: text minutes fetch failed: %d\n", CLOUD_TAG, ret);
+      return;
+    }
+
+  /* cloud_http() NUL-terminates past the payload, and the budget above
+   * reserved room for it, so the buffer is a usable C string.  Assert the
+   * terminator anyway rather than trust a transport detail from here.
+   */
+
+  text[len] = '\0';
+
+  body = cJSON_CreateString(cloud_minutes_text_body((const char *)text));
+  if (body == NULL)
+    {
+      printf("%s: text minutes substitution out of memory\n", CLOUD_TAG);
+    }
+  else if (!cJSON_ReplaceItemInObjectCaseSensitive(response, "txtMinutes",
+                                                  body))
+    {
+      cJSON_Delete(body);
+      printf("%s: text minutes substitution refused\n", CLOUD_TAG);
+    }
+  else
+    {
+      printf("%s: text minutes fetched, %zu bytes\n", CLOUD_TAG, len);
+    }
+
+  vs_cloud_release(text, text_psram);
+}
+
 int vs_cloud_social_get_result(const char *session_id, const char *msg_id,
                                struct vs_cloud_minutes_s *minutes,
                                char *full_json, size_t full_cap)
@@ -3428,6 +4030,20 @@ int vs_cloud_social_get_result(const char *session_id, const char *msg_id,
       goto out;
     }
 
+  /* Resolve txtMinutes before anything reads it.  It has to happen ahead of
+   * the serialize below -- that is the whole point, so the persisted record
+   * holds text rather than a link that dies in an hour -- and ahead of the
+   * cloud_json_str() into minutes->summary further down, which then needs no
+   * knowledge of where the text came from.
+   *
+   * This is the one place in the polling loop that touches the network, and
+   * it is reached only on the call that is about to return success: every
+   * -EAGAIN path above has already returned.  The single-shot property the
+   * caller's loop depends on is preserved for the polls that matter.
+   */
+
+  cloud_resolve_text_minutes(response, minutes);
+
   /* Serialize first, so a full_json buffer too small for the record fails
    * before minutes is touched.  Filling minutes and only then returning
    * -E2BIG contradicted the header's "filled only on success" and left the
@@ -3502,6 +4118,14 @@ out:
   if (ret != -EAGAIN)
     {
       g_cloud.session_live = false;
+
+      /* Let the pinned connection go with the session it belonged to.  Held
+       * across sessions it would be an instance chosen by whichever session
+       * happened to be first, and the next open would be answered by that
+       * instance whether or not it is the one still standing.
+       */
+
+      cloud_keep_drop();
     }
 
   cJSON_Delete(root);
@@ -3523,16 +4147,18 @@ int vs_cloud_social_ack(const char *session_id)
 }
 
 int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
-                      bool *from_psram)
+                      bool *from_psram, size_t max_bytes)
 {
   struct cloud_url_s *parsed = NULL;
   unsigned char *buf = NULL;
   bool psram = false;
+  bool parsed_psram = false;
   size_t got = 0;
   int http;
   int ret;
 
-  if (url == NULL || data == NULL || len == NULL || from_psram == NULL)
+  if (url == NULL || data == NULL || len == NULL || from_psram == NULL ||
+      max_bytes == 0)
     {
       return -EINVAL;
     }
@@ -3541,7 +4167,12 @@ int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
   *len = 0;
   *from_psram = false;
 
-  parsed = malloc(sizeof(*parsed));
+  /* PSRAM first, same 3 KB struct cloud_url_s as the upload path.  This one
+   * runs at finalize, while the session's getResult buffer is still live, so
+   * it is asking the internal heap at its most pressured moment.
+   */
+
+  parsed = cloud_alloc(sizeof(*parsed), &parsed_psram);
   if (parsed == NULL)
     {
       return -ENOMEM;
@@ -3565,7 +4196,7 @@ int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
    * byte more than the budget allows, and the check below sees it.
    */
 
-  buf = cloud_alloc(CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES + 2, &psram);
+  buf = cloud_alloc(max_bytes + 2, &psram);
   if (buf == NULL)
     {
       ret = -ENOMEM;
@@ -3573,7 +4204,7 @@ int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
     }
 
   http = cloud_http(parsed, "GET", NULL, NULL, 0, (char *)buf,
-                    CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES + 2, &got);
+                    max_bytes + 2, &got);
   if (http < 0)
     {
       ret = http;
@@ -3593,10 +4224,10 @@ int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
       goto out;
     }
 
-  if (got > CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES)
+  if (got > max_bytes)
     {
-      printf("%s: download of %zu bytes exceeds the %d byte budget\n",
-             CLOUD_TAG, got, CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES);
+      printf("%s: download of %zu bytes exceeds the %zu byte budget\n",
+             CLOUD_TAG, got, max_bytes);
       ret = -EFBIG;
       goto out;
     }
@@ -3609,7 +4240,241 @@ int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
 
 out:
   cloud_free(buf, psram);
-  free(parsed);
+  cloud_free(parsed, parsed_psram);
+  return ret;
+}
+
+/****************************************************************************
+ * Name: cloud_file_sink
+ *
+ * Description:
+ *   Body sink for vs_cloud_download_to_file(): write through to the file and
+ *   stop at the budget.
+ *
+ *   The reason for a failure is recorded in the state rather than returned,
+ *   because the transport collapses every sink refusal into one code on its
+ *   way back out.  Without this the caller could not tell a file that grew too
+ *   large from a filesystem that filled, and those want different answers.
+ *
+ ****************************************************************************/
+
+/* One progress line every this many bytes.  A 500 KB download becomes four
+ * lines, which is the difference between "stalled at 128 KB" and "silent for
+ * twenty seconds and then failed" -- two things that look the same in a log
+ * that only reports the outcome.
+ */
+
+#define CLOUD_DOWNLOAD_REPORT_STRIDE (128 * 1024)
+
+struct cloud_file_sink_s
+{
+  int fd;
+  size_t written;
+  size_t max_bytes;
+  size_t next_report;
+  bool over;   /* refused because the budget was reached */
+  int err;     /* errno from write(), 0 when there was none */
+};
+
+static int cloud_file_sink(void *arg, const void *data, size_t len)
+{
+  struct cloud_file_sink_s *sink = arg;
+  const unsigned char *p = data;
+  size_t off = 0;
+
+  /* Checked before writing, not after.  Stopping once the file is already too
+   * large would still have spent the storage.
+   */
+
+  if (sink->written + len > sink->max_bytes)
+    {
+      sink->over = true;
+      return -1;
+    }
+
+  while (off < len)
+    {
+      ssize_t n = write(sink->fd, p + off, len - off);
+
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          sink->err = errno;
+          return -1;
+        }
+
+      if (n == 0)
+        {
+          /* A short write of nothing is how a full filesystem shows up on
+           * some drivers, and looping on it would spin forever.
+           */
+
+          sink->err = ENOSPC;
+          return -1;
+        }
+
+      off += (size_t)n;
+    }
+
+  sink->written += len;
+
+  if (sink->written >= sink->next_report)
+    {
+      printf("%s: download %zu bytes\n", CLOUD_TAG, sink->written);
+      sink->next_report = sink->written + CLOUD_DOWNLOAD_REPORT_STRIDE;
+    }
+
+  return 0;
+}
+
+int vs_cloud_download_to_file(const char *url, const char *path,
+                              size_t max_bytes, size_t *len)
+{
+  struct cloud_url_s *parsed = NULL;
+  struct cloud_file_sink_s sink;
+  char *scratch = NULL;
+  bool parsed_psram = false;
+  bool scratch_psram = false;
+  int http;
+  int ret;
+
+  if (url == NULL || url[0] == '\0' || path == NULL || max_bytes == 0)
+    {
+      return -EINVAL;
+    }
+
+  if (len != NULL)
+    {
+      *len = 0;
+    }
+
+  memset(&sink, 0, sizeof(sink));
+  sink.fd = -1;
+  sink.max_bytes = max_bytes;
+  sink.next_report = CLOUD_DOWNLOAD_REPORT_STRIDE;
+
+  parsed = cloud_alloc(sizeof(*parsed), &parsed_psram);
+  if (parsed == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  ret = cloud_url_parse(url, parsed);
+  if (ret < 0)
+    {
+      if (ret == -EPROTONOSUPPORT)
+        {
+          printf("%s: cannot download %s, unsupported scheme\n", CLOUD_TAG,
+                 url);
+        }
+
+      goto out;
+    }
+
+  /* Holds the response header block, and on the cleartext path doubles as the
+   * read buffer the sink is fed from.  The TLS path uses its own 8 KB staging
+   * buffer and ignores this one.  Either way it is the whole memory cost of
+   * the transfer, which is the point of this function.
+   */
+
+  scratch = cloud_alloc(CONFIG_VS_SOCIAL_REG_RESP_BYTES, &scratch_psram);
+  if (scratch == NULL)
+    {
+      ret = -ENOMEM;
+      goto out;
+    }
+
+  sink.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (sink.fd < 0)
+    {
+      ret = -errno;
+      printf("%s: cannot create %s: %d\n", CLOUD_TAG, path, ret);
+      goto out;
+    }
+
+  http = cloud_http_ex(parsed, "GET", NULL, NULL, 0, scratch,
+                       CONFIG_VS_SOCIAL_REG_RESP_BYTES, NULL,
+                       cloud_file_sink, &sink);
+
+  close(sink.fd);
+  sink.fd = -1;
+
+  /* The sink's own reason wins over the transport's, which has collapsed it
+   * into one code by now.
+   */
+
+  if (sink.over)
+    {
+      printf("%s: download exceeds the %zu byte budget\n", CLOUD_TAG,
+             max_bytes);
+      ret = -EFBIG;
+      goto unlink_out;
+    }
+
+  if (sink.err != 0)
+    {
+      printf("%s: writing %s failed: %d\n", CLOUD_TAG, path, sink.err);
+      ret = -sink.err;
+      goto unlink_out;
+    }
+
+  if (http < 0)
+    {
+      /* How far it got is the whole diagnosis.  Zero means the request never
+       * produced a body -- a refused connection, a bad URL, an expired
+       * signature.  A partial count means the transfer started and then the
+       * peer or the link gave up, which is a different problem with a
+       * different fix, and without the number here the two look identical.
+       */
+
+      printf("%s: download of %s failed after %zu bytes: %d\n", CLOUD_TAG,
+             path, sink.written, http);
+      ret = http;
+      goto unlink_out;
+    }
+
+  if (http < 200 || http >= 300)
+    {
+      printf("%s: download returned HTTP %d after %zu bytes\n", CLOUD_TAG,
+             http, sink.written);
+      ret = -EIO;
+      goto unlink_out;
+    }
+
+  if (sink.written == 0)
+    {
+      ret = -ENODATA;
+      goto unlink_out;
+    }
+
+  if (len != NULL)
+    {
+      *len = sink.written;
+    }
+
+  ret = 0;
+  goto out;
+
+unlink_out:
+
+  /* Leave nothing playable behind.  A partial WAV on disk would be picked up
+   * by the next attempt to play one and sound like a hardware fault.
+   */
+
+  unlink(path);
+
+out:
+  if (sink.fd >= 0)
+    {
+      close(sink.fd);
+    }
+
+  cloud_free(scratch, scratch_psram);
+  cloud_free(parsed, parsed_psram);
   return ret;
 }
 

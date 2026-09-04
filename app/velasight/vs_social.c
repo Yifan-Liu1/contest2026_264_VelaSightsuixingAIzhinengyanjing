@@ -30,11 +30,13 @@
 #include <nuttx/config.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -105,8 +107,39 @@
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS
-#  define CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS 30000
+#  define CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS 60000
 #endif
+
+#ifndef CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES 8388608
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_MINUTES_AUDIO_PATH
+#  define CONFIG_VS_SOCIAL_MINUTES_AUDIO_PATH \
+     "/mnt/sdnand/ai_agent/minutes.wav"
+#endif
+
+/* One read from storage and one write to the DAC ring per iteration.
+ *
+ * 8 KB is 170 ms of 24 kHz 16-bit mono, which is short enough that a request
+ * to stop speaking is acted on promptly and long enough that the file is read
+ * in a few dozen syscalls rather than a few thousand.  It is also the whole
+ * per-transfer memory cost of playback, so it is deliberately not generous.
+ */
+
+#define SOCIAL_PLAY_CHUNK 8192
+
+/* How the two progress lines are throttled.
+ *
+ * Uploads are regular, so a count stride suits them: one line per ten
+ * transfers is four or five lines in a typical session.  Drops are not
+ * regular -- a session may lose two frames or fifty in one stall -- so those
+ * are throttled by time instead, which reports a lone drop immediately and
+ * still collapses a burst into a single line.
+ */
+
+#define SOCIAL_UPLOAD_REPORT_EVERY 10
+#define SOCIAL_DROP_REPORT_MS      5000
 
 #ifndef CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
 #  define CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS 3
@@ -122,6 +155,18 @@
 
 #ifndef CONFIG_VS_SOCIAL_INFLIGHT_MAX
 #  define CONFIG_VS_SOCIAL_INFLIGHT_MAX 16
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS
+#  define CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS 250
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MAX_MS
+#  define CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MAX_MS 8000
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_DEAD_SESSION_STRIKES
+#  define CONFIG_VS_SOCIAL_DEAD_SESSION_STRIKES 12
 #endif
 
 
@@ -258,6 +303,18 @@ struct social_state_s
   uint32_t dropped;
   uint32_t uploaded;
   uint32_t upload_failed;
+
+  /* Progress reporting for the two things that used to be visible only in the
+   * end-of-session totals.  A count alone says how many; these say when, which
+   * is what distinguishes a queue that is steadily behind from one that stalled
+   * for a moment.  Both are coalesced -- see social_queue_push() and the upload
+   * worker -- because at three frames a second a line each would bury the log.
+   */
+
+  uint32_t drop_reported;    /* value of dropped when the last line printed */
+  uint64_t drop_report_ms;   /* when that was, 0 for never */
+  uint32_t upload_reported;  /* value of uploaded when the last line printed */
+  uint64_t upload_window_ms; /* total upload time since that line */
 
   /* Messages awaiting results. */
 
@@ -466,6 +523,9 @@ static void social_queue_push(enum vs_cloud_media_e type,
   struct social_slot_s *slot;
   unsigned char *evicted = NULL;
   bool evicted_psram = false;
+  bool report = false;
+  uint32_t drop_total = 0;
+  uint32_t drop_since = 0;
 
   pthread_mutex_lock(&g_social.lock);
 
@@ -482,6 +542,28 @@ static void social_queue_push(enum vs_cloud_media_e type,
                                 CONFIG_VS_SOCIAL_QUEUE_SLOTS);
       g_social.count--;
       g_social.dropped++;
+
+      /* Rate limited by time rather than by count, which is what suits an
+       * event this uneven.  A first drop after a quiet stretch prints at once
+       * -- that timestamp is the point, it says when the queue started losing
+       * -- and a burst collapses into one line carrying the count, instead of
+       * fifty lines that push the cause off the screen.
+       */
+
+      {
+        uint64_t now = social_now_ms();
+
+        if (g_social.drop_report_ms == 0 ||
+            now - g_social.drop_report_ms >= SOCIAL_DROP_REPORT_MS)
+          {
+            report     = true;
+            drop_total = g_social.dropped;
+            drop_since = g_social.dropped - g_social.drop_reported;
+
+            g_social.drop_reported  = g_social.dropped;
+            g_social.drop_report_ms = now;
+          }
+      }
     }
 
   slot = &g_social.slot[g_social.write];
@@ -497,6 +579,18 @@ static void social_queue_push(enum vs_cloud_media_e type,
   g_social.count++;
   pthread_cond_broadcast(&g_social.cond);
   pthread_mutex_unlock(&g_social.lock);
+
+  /* Printed outside the lock, for the same reason the eviction is freed
+   * outside it: this runs on the capture threads, and the console is a
+   * mailbox channel that can block.
+   */
+
+  if (report)
+    {
+      printf("%s: queue full, dropped %lu (+%lu since the last line)\n",
+             SOCIAL_TAG, (unsigned long)drop_total,
+             (unsigned long)drop_since);
+    }
 
   social_free(evicted, evicted_psram);
 }
@@ -918,6 +1012,9 @@ out:
 
 static void *social_upload_worker(void *arg)
 {
+  uint32_t backoff_ms = 0;
+  unsigned int dead_strikes = 0;
+
   (void)arg;
 
   for (; ; )
@@ -925,7 +1022,23 @@ static void *social_upload_worker(void *arg)
       struct social_slot_s slot;
       struct vs_cloud_media_packet_s packet;
       struct vs_cloud_upload_s result;
+      uint64_t began_ms;
+      uint64_t spent_ms;
       int ret;
+
+      /* The backoff earned by the previous iteration's failure, paid here
+       * rather than around the pop below.  Paying it before the pop means a
+       * queue that has gone quiet (capture paused, session ending) is not
+       * held up by it -- social_queue_pop() already blocks on the condvar in
+       * that case, and there is nothing to slow down.  It only matters when
+       * there is a next item ready immediately, which is exactly the case
+       * this exists for.
+       */
+
+      if (backoff_ms != 0)
+        {
+          usleep(backoff_ms * 1000);
+        }
 
       if (!social_queue_pop(&slot))
         {
@@ -939,8 +1052,10 @@ static void *social_upload_worker(void *arg)
       packet.sequence = slot.sequence;
 
       memset(&result, 0, sizeof(result));
+      began_ms = social_now_ms();
       ret = vs_cloud_social_upload(g_social.session.session_id, &packet,
                                    &result);
+      spent_ms = social_now_ms() - began_ms;
 
       /* Released as soon as the transfer is over, success or not.  Holding it
        * any longer would keep a 160 KB frame in PSRAM for no reason, and the
@@ -971,13 +1086,123 @@ static void *social_upload_worker(void *arg)
               break;
             }
 
+          /* -ENOTCONN is status 30: the cloud has no session for this id.
+            * Unlike the failures below it does not get better by waiting, so
+            * counting instead of backing off forever.  A strike limit rather
+            * than an immediate stop because the document lists 30 as the
+            * generic failure code, not a session-specific one, and one
+            * transient 30 should not end a conversation the user is having.
+            * Consecutive is the point: any success resets the count.
+            */
+
+          if (ret == -ENOTCONN)
+            {
+              if (++dead_strikes >= CONFIG_VS_SOCIAL_DEAD_SESSION_STRIKES)
+                {
+                  printf("%s: cloud has no session after %u refusals, "
+                         "stopping uploads\n", SOCIAL_TAG, dead_strikes);
+                  pthread_mutex_lock(&g_social.lock);
+                  g_social.stop_capture = true;
+                  pthread_cond_broadcast(&g_social.cond);
+                  pthread_mutex_unlock(&g_social.lock);
+                  break;
+                }
+            }
+
+          /* Doubled from whatever it last was, starting from the floor on the
+           * first failure after a success.  vs_cloud_social_upload() folds
+           * every failure mode into one negative return -- a register call
+           * refused outright, a presigned PUT the object store 403s on a
+           * signature mismatch, a connect that times out, a malformed
+           * response -- and this backoff does not need to tell them apart to
+           * do its job: none of them are fixed by asking again immediately.
+           *
+           * Measured 2026-09-01: without this, a store that answers 403 on
+           * every attempt (a real case, not hypothetical -- signature
+           * mismatch is deterministic per request shape) turns this loop into
+           * one bounded only by round-trip latency, at up to five uploads a
+           * second.  That is not a transfer problem, since nothing is
+           * transferring; it is priority-105 CPU time taken from every lower-
+           * priority task including input polling, for as long as the queue
+           * keeps handing this thread work.
+           *
+           * The floor stays close to the 340 ms image sampling interval so an
+           * isolated failure -- one bad frame, one dropped packet -- costs
+           * about one sample period, not a visible stall.  The ceiling is a
+           * few seconds: long enough that a store stuck failing every request
+           * spends most of its time asleep rather than retrying into a wall,
+           * short enough that a real recovery is felt within a few attempts
+           * rather than after however long capping at the floor would have
+           * taken to notice on its own.
+           */
+
+          backoff_ms = backoff_ms == 0 ? CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS
+                                       : backoff_ms * 2;
+          if (backoff_ms > CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MAX_MS)
+            {
+              backoff_ms = CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MAX_MS;
+            }
+
           continue;
         }
 
-      pthread_mutex_lock(&g_social.lock);
-      g_social.uploaded++;
-      social_inflight_add(result.msg_id, slot.alert_gen);
-      pthread_mutex_unlock(&g_social.lock);
+      /* Back to no backoff the moment the cloud answers something other than
+       * failure, so a transient stall does not keep taxing the next item once
+       * whatever caused it has passed.  The strike count goes with it: what
+       * ends a session is a run of refusals, not a total.
+       */
+
+      backoff_ms = 0;
+      dead_strikes = 0;
+
+      {
+        bool report = false;
+        uint32_t total = 0;
+        uint32_t since = 0;
+        uint64_t window = 0;
+        uint8_t queued = 0;
+        uint8_t inflight = 0;
+
+        pthread_mutex_lock(&g_social.lock);
+        g_social.uploaded++;
+        g_social.upload_window_ms += spent_ms;
+        social_inflight_add(result.msg_id, slot.alert_gen);
+
+        /* Every SOCIAL_UPLOAD_REPORT_EVERY rather than every upload: at three
+         * frames a second a line each would be most of the log.  What the line
+         * carries is what the totals cannot -- the average time a transfer took
+         * over this window, and how full the queue and the inflight table were
+         * as it finished.  A rising average next to a rising drop count is the
+         * signature of uploads being the bottleneck; a flat average next to
+         * drops means the producers are simply faster than the link.
+         */
+
+        if (g_social.uploaded - g_social.upload_reported >=
+            SOCIAL_UPLOAD_REPORT_EVERY)
+          {
+            report   = true;
+            total    = g_social.uploaded;
+            since    = g_social.uploaded - g_social.upload_reported;
+            window   = g_social.upload_window_ms;
+            queued   = g_social.count;
+            inflight = g_social.inflight_count;
+
+            g_social.upload_reported  = g_social.uploaded;
+            g_social.upload_window_ms = 0;
+          }
+
+        pthread_mutex_unlock(&g_social.lock);
+
+        if (report)
+          {
+            printf("%s: uploaded %lu, last %lu averaged %lu ms, "
+                   "queue %u/%u, inflight %u\n", SOCIAL_TAG,
+                   (unsigned long)total, (unsigned long)since,
+                   (unsigned long)(since > 0 ? window / since : 0),
+                   (unsigned)queued, (unsigned)CONFIG_VS_SOCIAL_QUEUE_SLOTS,
+                   (unsigned)inflight);
+          }
+      }
     }
 
   return NULL;
@@ -1432,6 +1657,469 @@ static int social_persist_minutes(const struct vs_cloud_minutes_s *minutes,
 }
 
 /****************************************************************************
+ * Name: social_wav_le16 / social_wav_le32
+ *
+ * Description:
+ *   Read a little-endian field out of a RIFF header without assuming the
+ *   host's byte order or that the field is aligned.  Both hold on this chip,
+ *   and neither is worth depending on for eight lines of code.
+ *
+ ****************************************************************************/
+
+static uint16_t social_wav_le16(const unsigned char *p)
+{
+  return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t social_wav_le32(const unsigned char *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/****************************************************************************
+ * Name: social_read_exact
+ *
+ * Description:
+ *   read() that either fills the buffer or says why it could not.  Short
+ *   reads are normal on a file and a header parser that treated one as an
+ *   error would fail on a perfectly good WAV.
+ *
+ ****************************************************************************/
+
+static int social_read_exact(int fd, void *buf, size_t len)
+{
+  unsigned char *p = buf;
+  size_t off = 0;
+
+  while (off < len)
+    {
+      ssize_t n = read(fd, p + off, len - off);
+
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          return -errno;
+        }
+
+      if (n == 0)
+        {
+          return -ENODATA;
+        }
+
+      off += (size_t)n;
+    }
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name: social_minutes_dir
+ *
+ * Description:
+ *   Make sure the directory holding the spoken minutes exists.
+ *
+ *   vs_history_open() already creates /mnt/sdnand/ai_agent at startup, so on
+ *   a healthy boot this finds it there.  It is done again here because the
+ *   path is a configuration value that may point elsewhere, and because a
+ *   failed history init should not silently take the audio down with it.
+ *
+ ****************************************************************************/
+
+static void social_minutes_dir(const char *path)
+{
+  char dir[128];
+  const char *slash = strrchr(path, '/');
+  size_t len;
+
+  if (slash == NULL || slash == path)
+    {
+      return;
+    }
+
+  len = (size_t)(slash - path);
+  if (len >= sizeof(dir))
+    {
+      return;
+    }
+
+  memcpy(dir, path, len);
+  dir[len] = '\0';
+
+  /* Errors are not reported: EEXIST is the expected case, and any other
+   * failure shows up immediately as the open() below failing with a message
+   * that names the actual path.
+   */
+
+  (void)mkdir(dir, 0700);
+}
+
+/****************************************************************************
+ * Name: social_wav_open
+ *
+ * Description:
+ *   Open a WAV file and leave it positioned at the first PCM sample.
+ *
+ *   Walks the chunk list rather than assuming the canonical 44-byte header: a
+ *   writer is free to put LIST or fact ahead of data, and one that does would
+ *   otherwise have its metadata played as audio.
+ *
+ *   Reading the format from the bytes rather than from Content-Type is not
+ *   fastidiousness -- FDS answers application/octet-stream for everything, so
+ *   the header is the only description of the file there is.  Measured
+ *   2026-09-04: RIFF/WAVE, PCM, 24 kHz, 16-bit, mono.
+ *
+ * Input Parameters:
+ *   file_len - the file's size, used to clamp a data chunk that claims more
+ *              than arrived.  A writer's size field and the bytes on disk are
+ *              independent claims and only the smaller one is safe to read.
+ *
+ * Returned Value:
+ *   0 with *fd_out open and seeked to the data, or a negative errno with
+ *   nothing left open.
+ *
+ ****************************************************************************/
+
+static int social_wav_open(const char *path, size_t file_len, int *fd_out,
+                          unsigned int *rate, unsigned int *channels,
+                          unsigned int *bits, size_t *data_len)
+{
+  unsigned char head[16];
+  bool have_fmt = false;
+  int guard;
+  int fd;
+  int ret;
+
+  *rate = *channels = *bits = 0;
+  *data_len = 0;
+
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    {
+      return -errno;
+    }
+
+  ret = social_read_exact(fd, head, 12);
+  if (ret < 0)
+    {
+      goto err;
+    }
+
+  if (memcmp(head, "RIFF", 4) != 0 || memcmp(head + 8, "WAVE", 4) != 0)
+    {
+      printf("%s: spoken minutes are not RIFF/WAVE\n", SOCIAL_TAG);
+      ret = -EINVAL;
+      goto err;
+    }
+
+  /* Bounded rather than "until the data chunk".  A file whose size fields are
+   * garbage -- an HTML error page saved with a .wav name, a truncated
+   * download -- would otherwise be walked forever.
+   */
+
+  for (guard = 0; guard < 64; guard++)
+    {
+      uint32_t size;
+      size_t skip;
+
+      ret = social_read_exact(fd, head, 8);
+      if (ret < 0)
+        {
+          /* Ran off the end without finding data. */
+
+          ret = -EINVAL;
+          goto err;
+        }
+
+      size = social_wav_le32(head + 4);
+      skip = (size_t)size + (size & 1u); /* chunks are word aligned */
+
+      if (memcmp(head, "data", 4) == 0)
+        {
+          off_t here;
+          size_t avail;
+
+          if (!have_fmt)
+            {
+              printf("%s: spoken minutes have data before fmt\n", SOCIAL_TAG);
+              ret = -EINVAL;
+              goto err;
+            }
+
+          /* Ask the descriptor where it is rather than tracking it alongside.
+           * A parallel counter has to be adjusted at every read and every
+           * seek, and the one place it was missed -- the sixteen fmt bytes
+           * read below -- made this overstate what the file held.
+           */
+
+          here = lseek(fd, 0, SEEK_CUR);
+          if (here < 0)
+            {
+              ret = -errno;
+              goto err;
+            }
+
+          /* Trust the smaller of what the writer declared and what is
+           * actually there.  They are independent claims, and reading past
+           * the end of a truncated download would play whatever follows.
+           */
+
+          avail = file_len > (size_t)here ? file_len - (size_t)here : 0;
+          *data_len = (size_t)size < avail ? (size_t)size : avail;
+
+          if (*data_len == 0)
+            {
+              ret = -ENODATA;
+              goto err;
+            }
+
+          *fd_out = fd;
+          return 0;
+        }
+
+      if (memcmp(head, "fmt ", 4) == 0 && size >= 16)
+        {
+          unsigned char fmt[16];
+
+          ret = social_read_exact(fd, fmt, sizeof(fmt));
+          if (ret < 0)
+            {
+              goto err;
+            }
+
+          if (social_wav_le16(fmt) != 1)
+            {
+              printf("%s: spoken minutes are compressed, format %u\n",
+                     SOCIAL_TAG, social_wav_le16(fmt));
+              ret = -ENOTSUP;
+              goto err;
+            }
+
+          *channels = social_wav_le16(fmt + 2);
+          *rate     = social_wav_le32(fmt + 4);
+          *bits     = social_wav_le16(fmt + 14);
+          have_fmt  = true;
+          skip -= sizeof(fmt);
+        }
+
+      if (skip > 0 && lseek(fd, (off_t)skip, SEEK_CUR) < 0)
+        {
+          ret = -errno;
+          goto err;
+        }
+    }
+
+  ret = -EINVAL;
+
+err:
+  close(fd);
+  return ret;
+}
+
+/****************************************************************************
+ * Name: social_play_minutes_audio
+ *
+ * Description:
+ *   Fetch ttsMinutes to storage and speak it from there.
+ *
+ *   This is the step the interface document describes and the firmware never
+ *   took: the download existed with no caller, so tts_url was logged and
+ *   dropped.  The AI端 confirmed it is the only way to get the voice --
+ *   "你要语音是必须要走url下载的" -- and it is a separate file from the text,
+ *   not a spoken copy of it.
+ *
+ *   Through storage rather than through memory, and that is the whole design.
+ *   The spoken minutes are not a bounded object: measured 2026-09-04 the
+ *   shortest one this cloud can produce -- a session that detected no emotion
+ *   at all -- was already 585 KB, 12.5 seconds at 48000 bytes a second.
+ *   Buffering that put a ceiling on session length in the shape of a heap
+ *   allocation, and the 768 KB it wanted bought sixteen seconds of speech.
+ *   Streaming to a file costs one 8 KB buffer whatever the length, so what is
+ *   left is a limit on the filesystem, which is a place a limit can live.
+ *
+ *   Everything here is best effort and reported rather than propagated.  By
+ *   the time this runs the summary is on screen and the record is on disk;
+ *   failing the session because the speaker could not be fed would throw away
+ *   the part the user actually asked for.
+ *
+ *   The file is left in place afterwards.  It is one fixed path, so it cannot
+ *   accumulate, and having the last session's audio on disk is what makes a
+ *   complaint about the voice something that can be investigated rather than
+ *   reproduced.
+ *
+ ****************************************************************************/
+
+static void social_play_minutes_audio(const char *url)
+{
+  const char *path = CONFIG_VS_SOCIAL_MINUTES_AUDIO_PATH;
+  struct vs_audio_pb_s *pb = NULL;
+  unsigned char *buf = NULL;
+  bool buf_psram = false;
+  size_t file_len = 0;
+  size_t data_len = 0;
+  size_t done = 0;
+  unsigned int rate = 0;
+  unsigned int channels = 0;
+  unsigned int bits = 0;
+  int fd = -1;
+  int ret;
+
+  if (url == NULL || url[0] == '\0')
+    {
+      return;
+    }
+
+  social_minutes_dir(path);
+
+  ret = vs_cloud_download_to_file(url, path,
+                                  CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES,
+                                  &file_len);
+  if (ret < 0)
+    {
+      /* -EFBIG is the interesting one: it means the spoken minutes outgrew
+       * CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES, which is a number to raise
+       * rather than a fault to chase.  Say so specifically.
+       */
+
+      printf("%s: spoken minutes not fetched: %d%s\n", SOCIAL_TAG, ret,
+             ret == -EFBIG ? " (raise VS_SOCIAL_DOWNLOAD_MAX_BYTES)" : "");
+      return;
+    }
+
+  printf("%s: spoken minutes saved to %s, %zu bytes\n", SOCIAL_TAG, path,
+         file_len);
+
+  ret = social_wav_open(path, file_len, &fd, &rate, &channels, &bits,
+                        &data_len);
+  if (ret < 0)
+    {
+      printf("%s: spoken minutes unplayable: %d\n", SOCIAL_TAG, ret);
+      return;
+    }
+
+  if (bits != 16)
+    {
+      printf("%s: spoken minutes are %u-bit, only 16 is supported\n",
+             SOCIAL_TAG, bits);
+      goto out;
+    }
+
+  printf("%s: spoken minutes %zu bytes, %u Hz %u ch %u-bit, %.1f s\n",
+         SOCIAL_TAG, data_len, rate, channels, bits,
+         rate * channels > 0 ?
+           (double)data_len / (double)(rate * channels * 2u) : 0.0);
+
+  /* From PSRAM, not the stack.  CONFIG_VS_SOCIAL_STACKSIZE_SESSION is 16 KB
+   * and this thread has already been through a TLS handshake and a JSON parse
+   * on it.
+   */
+
+  buf = social_alloc(SOCIAL_PLAY_CHUNK, &buf_psram);
+  if (buf == NULL)
+    {
+      printf("%s: spoken minutes: no buffer\n", SOCIAL_TAG);
+      goto out;
+    }
+
+  pb = vs_audio_playback_open(AGENT_AUDIO_PLAYBACK_DEV, rate, channels, bits);
+  if (pb == NULL)
+    {
+      printf("%s: spoken minutes: playback open failed\n", SOCIAL_TAG);
+      goto out;
+    }
+
+  /* A chunk at a time rather than the whole file, which is now the only option
+   * anyway: an abandon while speaking is acted on within a chunk instead of
+   * after the file, and the ring absorbs the writes without pacing, so the
+   * size only bounds the reaction time.
+   *
+   * Reading from storage in the same loop that feeds the DAC is what makes an
+   * underrun conceivable here, so the count is reported below.  At 48000 bytes
+   * a second a chunk lasts 170 ms, which is a long time for an 8 KB read from
+   * SD-NAND to take.
+   */
+
+  while (done < data_len)
+    {
+      size_t want = data_len - done;
+      bool aborting;
+      ssize_t n;
+
+      if (want > SOCIAL_PLAY_CHUNK)
+        {
+          want = SOCIAL_PLAY_CHUNK;
+        }
+
+      pthread_mutex_lock(&g_social.lock);
+      aborting = g_social.abort;
+      pthread_mutex_unlock(&g_social.lock);
+
+      if (aborting)
+        {
+          vs_audio_playback_stop(pb);
+          break;
+        }
+
+      n = read(fd, buf, want);
+      if (n < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          printf("%s: spoken minutes read failed: %d\n", SOCIAL_TAG, errno);
+          break;
+        }
+
+      if (n == 0)
+        {
+          /* Shorter than the header claimed even after clamping to the file
+           * size.  Nothing to do about it but stop; what played, played.
+           */
+
+          break;
+        }
+
+      ret = vs_audio_playback_write(pb, buf, (size_t)n);
+      if (ret < 0)
+        {
+          if (ret != -ECANCELED)
+            {
+              printf("%s: spoken minutes write failed: %d\n", SOCIAL_TAG,
+                     ret);
+            }
+
+          break;
+        }
+
+      done += (size_t)n;
+    }
+
+  vs_audio_playback_drain(pb);
+
+  if (vs_audio_playback_underruns(pb) > 0)
+    {
+      printf("%s: spoken minutes underran %u times\n", SOCIAL_TAG,
+             vs_audio_playback_underruns(pb));
+    }
+
+  vs_audio_playback_close(pb);
+
+out:
+  social_free(buf, buf_psram);
+
+  if (fd >= 0)
+    {
+      close(fd);
+    }
+}
+
+/****************************************************************************
  * Name: social_finalize_sequence
  *
  * Description:
@@ -1519,9 +2207,11 @@ static void social_finalize_sequence(void)
     }
 
   printf("%s: minutes: calm %u happy %u tense %u, %u emotion / %u audio "
-         "samples, tts %s\n", SOCIAL_TAG, minutes.calm, minutes.happy,
-         minutes.tense, minutes.emotion_samples, minutes.audio_samples,
-         minutes.tts_url[0] != '\0' ? minutes.tts_url : "(none)");
+         "samples, text %s, tts %s\n", SOCIAL_TAG, minutes.calm,
+         minutes.happy, minutes.tense, minutes.emotion_samples,
+         minutes.audio_samples,
+         minutes.txt_url[0] != '\0' ? "downloaded" : "inline",
+         minutes.tts_url[0] != '\0' ? "available" : "(none)");
 
   ret = social_persist_minutes(&minutes, body);
   social_free((unsigned char *)body, body_psram);
@@ -1544,6 +2234,20 @@ static void social_finalize_sequence(void)
                                            "本次没有生成摘要");
 
   (void)vs_cloud_social_ack(g_social.session.session_id);
+
+  /* Speak the minutes last, deliberately.
+   *
+   * The order is what the UI discussion asked for -- show the text, then talk
+   * over it -- and it is also the safe order: the record is written and the
+   * result page is up before a 585 KB fetch and a DAC open are attempted, so
+   * neither can cost the user the summary.
+   *
+   * It has to happen before the caller releases the devices, and it has to
+   * happen inside this session's lifetime: the presigned URL is good for one
+   * hour, so there is no later.
+   */
+
+  social_play_minutes_audio(minutes.tts_url);
 }
 
 /****************************************************************************
@@ -1568,11 +2272,13 @@ static int social_spawn(pthread_t *thread, void *(*entry)(void *),
 
   pthread_attr_setstacksize(&attr, stacksize);
 
-  /* Above the UI, below the network stack, matching the layout vs_types.h
-   * describes: these threads move media and must not be held off by a redraw.
+  /* Below the UI.  The comment here used to say "above the UI ... must not be
+   * held off by a redraw", which had it backwards: with four of these threads
+   * doing continuous TLS at VS_PRIORITY_VOICE, it was the redraw that never
+   * happened.  See VS_PRIORITY_SOCIAL in vs_types.h for the measurement.
    */
 
-  param.sched_priority = VS_PRIORITY_VOICE;
+  param.sched_priority = VS_PRIORITY_SOCIAL;
   pthread_attr_setschedparam(&attr, &param);
 
   ret = pthread_create(thread, &attr, entry, NULL);
@@ -1841,6 +2547,17 @@ int vs_social_start(uint32_t request_id)
   g_social.dropped        = 0;
   g_social.uploaded       = 0;
   g_social.upload_failed  = 0;
+
+  /* Cleared with the counters they throttle.  Carried over, drop_report_ms
+   * would suppress the first drop of a new session for as long as the gap
+   * between sessions was short, and the two "reported" marks would make the
+   * first line of the new session report a delta against the old one.
+   */
+
+  g_social.drop_reported    = 0;
+  g_social.drop_report_ms   = 0;
+  g_social.upload_reported  = 0;
+  g_social.upload_window_ms = 0;
   g_social.inflight_count = 0;
   g_social.inflight_retired = 0;
   g_social.alert_gen      = 1;

@@ -52,13 +52,38 @@
  * and only a back-press to escape, and STARTING did not even offer that on the
  * confirm key.
  *
- * Long enough not to pre-empt a slow but working cloud: the finalize path alone
- * is allowed CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS, and an upload sits behind
- * CONFIG_VS_SOCIAL_IO_TIMEOUT_MS.  This is the outer bound on all of it, after
- * which the UI stops waiting and says so.
+ * Long enough not to pre-empt a slow but working cloud: an upload sits behind
+ * CONFIG_VS_SOCIAL_IO_TIMEOUT_MS.  This is the outer bound, after which the UI
+ * stops waiting and says so.
  */
 
 #define VS_SOCIAL_STAGE_TIMEOUT_MS 40000
+
+#ifndef CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS
+#  define CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS 60000
+#endif
+
+/* Finalizing is the exception, and its bound has to be derived rather than
+ * chosen.  That page's worker is allowed CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS
+ * to poll for minutes, so a fixed number here silently becomes the inner bound
+ * the moment the worker's is raised past it.
+ *
+ * Which is exactly what happened.  The worker's budget went from 30 s to 60 s
+ * to cover a cloud measured taking 24 s to produce minutes; this stayed at 40 s.
+ * Measured 2026-09-04, a session that closed at t+213.6 was aborted by this
+ * timer at t+249.8 -- 40 s after entering the page -- while the worker was
+ * still polling and had 20 s of its own budget left.  The user got "社交记录
+ * 整理无响应" for a cloud that was merely slow, the minutes never arrived, and
+ * the worker's own specific failure was unreachable by construction.
+ *
+ * Expressed as the worker's budget plus a margin, the ordering is a property of
+ * the code rather than a note asking the next person to remember it.  The margin
+ * covers the poll interval plus the two downloads that follow a successful
+ * poll, which happen before the page is left.
+ */
+
+#define VS_SOCIAL_FINALIZE_STAGE_TIMEOUT_MS \
+  (CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS + 20000)
 #define VS_WIFI_RETRY_MS 20000
 
 #define VS_APP_EVENT_QUEUE_SIZE 8
@@ -874,6 +899,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
                   runtime->emotion == VS_EMOTION_TENSE ? "情绪升高" : "观察中");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "采集中");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "暂停");
+        vs_key_set(snapshot, VS_KEY_BACK, "按住结束");
         break;
 
       case VS_PAGE_SOCIAL_ALERT:
@@ -887,6 +913,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "请留意");
         snapshot->emotion = runtime->emotion;
         vs_key_set(snapshot, VS_KEY_CONFIRM, "暂停");
+        vs_key_set(snapshot, VS_KEY_BACK, "按住结束");
         break;
 
       case VS_PAGE_SOCIAL_PAUSING:
@@ -909,6 +936,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "暂停");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "已暂停");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "继续");
+        vs_key_set(snapshot, VS_KEY_BACK, "按住结束");
         break;
 
       case VS_PAGE_SOCIAL_RESUMING:
@@ -1318,6 +1346,28 @@ static bool vs_social_stage_is_waiting(enum vs_page_e page)
          page == VS_PAGE_SOCIAL_PAUSING ||
          page == VS_PAGE_SOCIAL_RESUMING ||
          page == VS_PAGE_SOCIAL_FINALIZING;
+}
+
+/****************************************************************************
+ * Name: vs_social_stage_budget_ms
+ *
+ * Description:
+ *   How long this page may wait for its answer.
+ *
+ *   Per page rather than one number, because the pages are not waiting for
+ *   comparable things.  A pause is a local state change and an unanswered one
+ *   is a lost notification; finalizing waits on the cloud producing minutes,
+ *   which was measured at anywhere from 12 to over 36 seconds.  Giving the
+ *   pause the finalize budget would leave a dropped notification sitting on
+ *   screen for over a minute, and giving finalizing the pause budget is the
+ *   bug this exists to prevent.
+ *
+ ****************************************************************************/
+
+static uint32_t vs_social_stage_budget_ms(enum vs_page_e page)
+{
+  return page == VS_PAGE_SOCIAL_FINALIZING ?
+           VS_SOCIAL_FINALIZE_STAGE_TIMEOUT_MS : VS_SOCIAL_STAGE_TIMEOUT_MS;
 }
 
 /****************************************************************************
@@ -1738,10 +1788,24 @@ static void vs_handle_event(struct vs_display_s *display,
        runtime->page == VS_PAGE_SOCIAL_ALERT ||
        runtime->page == VS_PAGE_SOCIAL_EXITING))
     {
-      if (runtime->page != VS_PAGE_SOCIAL_EXITING)
+      bool entering = runtime->page != VS_PAGE_SOCIAL_EXITING;
+
+      if (entering)
         runtime->social_exit_return_page = runtime->page;
       runtime->page = VS_PAGE_SOCIAL_EXITING;
       runtime->progress = event->progress;
+
+      /* Only the tick that arrives on this page pushes synchronously.  What
+       * needs to be immediate is the answer to "did my hold register", and
+       * that is this one transition; the ticks after it only grow the ring,
+       * which the loop's own vs_display_tick() animates.  Flushing every tick
+       * would cost a full rasterise and two panel writes each time, for a
+       * ring that is already being redrawn.
+       */
+
+      if (entering)
+        vs_render_now(display, runtime);
+
       return;
     }
 
@@ -2078,7 +2142,26 @@ static void vs_handle_event(struct vs_display_s *display,
                  */
 
                 if (vs_social_pause() == 0)
-                  runtime->page = VS_PAGE_SOCIAL_PAUSING;
+                  {
+                    runtime->page = VS_PAGE_SOCIAL_PAUSING;
+
+                    /* Pushed here rather than left to the bottom of the loop.
+                     * vs_acknowledge() above has already put the highlight in
+                     * runtime, but vs_display_render() only writes LVGL object
+                     * state -- the pixels reach the panels when
+                     * vs_display_tick() next runs lv_timer_handler().  During
+                     * a session that is too late: the camera's entropy
+                     * validator shares priority 100 with this loop and holds
+                     * the core for 252 ms at a time, so the next iteration's
+                     * vs_expire_response() can clear the highlight before it
+                     * was ever rasterised.  LVGL renders current object state,
+                     * not a queue of frames, so what was never rasterised is
+                     * simply lost.  Measured 2026-08-31: no highlight and no
+                     * page change visible for either key.
+                     */
+
+                    vs_render_now(display, runtime);
+                  }
               }
             break;
 
@@ -2115,7 +2198,13 @@ static void vs_handle_event(struct vs_display_s *display,
             if (event->key == VS_KEY_CONFIRM)
               {
                 if (vs_social_resume() == 0)
-                  runtime->page = VS_PAGE_SOCIAL_RESUMING;
+                  {
+                    runtime->page = VS_PAGE_SOCIAL_RESUMING;
+
+                    /* Same reason as the pause path above. */
+
+                    vs_render_now(display, runtime);
+                  }
               }
             break;
 
@@ -2284,6 +2373,16 @@ static void vs_handle_event(struct vs_display_s *display,
           else
             {
               runtime->page = VS_PAGE_SOCIAL_STARTING;
+
+              /* Pushed before the camera brings itself up.  Sensor init alone
+               * measured 1.4 s (2026-08-31 log: imgsensor entry to "stream
+               * open"), and it runs 585 register writes plus two IRQ blocks
+               * with the loop unable to reach vs_display_tick() meanwhile, so
+               * without this the starting page appears only after the wait it
+               * exists to explain.
+               */
+
+              vs_render_now(display, runtime);
             }
         }
       else if ((runtime->page == VS_PAGE_SOCIAL_RUNNING ||
@@ -2302,6 +2401,15 @@ static void vs_handle_event(struct vs_display_s *display,
             {
               runtime->page = VS_PAGE_SOCIAL_FINALIZING;
               runtime->progress = 0;
+
+              /* One-shot, and the session is still capturing at this point --
+               * finalize runs on its own thread and the camera stops only at
+               * the end of it -- so the loop is still competing with the
+               * entropy validator for the core.  Same reason as the pause
+               * path.
+               */
+
+              vs_render_now(display, runtime);
             }
           else
             {
@@ -2520,13 +2628,14 @@ int vs_app_run(void)
         else if (runtime.social_stage_until_ms == 0)
           {
             runtime.social_stage_until_ms =
-              vs_app_now_ms() + VS_SOCIAL_STAGE_TIMEOUT_MS;
+              vs_app_now_ms() + vs_social_stage_budget_ms(runtime.page);
           }
         else if ((int32_t)(runtime.social_stage_until_ms -
                            vs_app_now_ms()) <= 0)
           {
-            printf("velasight: social stage timed out on page %d\n",
-                   (int)runtime.page);
+            printf("velasight: social stage timed out on page %d after "
+                   "%lu ms\n", (int)runtime.page,
+                   (unsigned long)vs_social_stage_budget_ms(runtime.page));
             vs_social_stage_timeout(&runtime);
             vs_render(display, &runtime);
           }

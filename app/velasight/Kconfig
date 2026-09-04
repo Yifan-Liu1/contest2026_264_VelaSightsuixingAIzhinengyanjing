@@ -555,23 +555,36 @@ config VS_SOCIAL_DEVICE_ID
 
 config VS_SOCIAL_UPLOAD_CONTENT_TYPE
 	bool "Send Content-Type when transferring to the presigned URL"
-	default y
+	default n
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		Whether the PUT that carries the JPEG or Ogg bytes to the
 		presigned URL declares image/jpeg or audio/ogg.
 
-		This exists as an option because it cannot be decided from this
-		side.  Object stores compute the presigned signature over a
-		specific set of headers, and Content-Type is sometimes one of
-		them: if it was signed, omitting it is rejected, and if it was
-		not, sending it is rejected.  Both failures come back as HTTP 403
-		with an XML body.
+		This exists as an option because object stores compute the
+		presigned signature over a specific set of headers, and
+		Content-Type is sometimes one of them: if it was signed, omitting
+		it is rejected, and if it was not, sending it is rejected.  Both
+		failures come back as HTTP 403 with an XML body.
 
-		Default is to send it, which is the more common signing scheme.
-		If uploads fail with 403 while registration succeeds, turn this
-		off before looking anywhere else -- vs_cloud.c names this option
-		in that specific log line for exactly that reason.
+		Default is off, because for this contest it is no longer an open
+		question.  The cloud interface document's FDS upload example
+		(section 7, storage) requires the header to be absent, spelling
+		it as an explicit curl argument:
+
+		  curl -i -X PUT '<presigned URL>' -H 'Content-Type:' \
+		    --data-binary @/home/mi/a.jpg
+
+		The empty -H 'Content-Type:' form is how curl suppresses a header
+		it would otherwise supply, so FDS signs without it.  Sending one
+		was measured (2026-08-31) as "Galaxy FDS Error: Signature Does
+		Not Match" on every transfer while session open and upload
+		registration both succeeded, which is the exact split this option
+		was written to resolve.
+
+		Turn it back on only for an object store known to sign the
+		header; vs_cloud.c names this option in the 403 log line so the
+		reverse case is equally traceable.
 
 config VS_SOCIAL_REG_RESP_BYTES
 	int "VelaSight social cloud registration response buffer (bytes)"
@@ -605,14 +618,77 @@ config VS_SOCIAL_RESP_MAX_BYTES
 		and then fail to parse afterwards. If that happens, raise this.
 
 config VS_SOCIAL_DOWNLOAD_MAX_BYTES
-	int "VelaSight social cloud download budget (bytes)"
-	default 262144
-	range 16384 2097152
+	int "VelaSight spoken minutes size limit (bytes on disk)"
+	default 8388608
+	range 65536 67108864
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		Upper bound on a body fetched by vs_cloud_download(), which in
-		practice means the spoken minutes at ttsMinutes.  The default is
-		a few minutes of Ogg Opus at speech bitrates.
+		Upper bound on the spoken minutes fetched from ttsMinutes and
+		written to CONFIG_VS_SOCIAL_MINUTES_AUDIO_PATH.
+
+		This is a limit on a file, not on an allocation.  The download
+		streams to storage through one 8 KB transport buffer, so raising
+		this costs space on the SD-NAND and nothing in RAM.  That is the
+		difference from how it used to work, and the reason it changed:
+
+		Measured against the staging cloud on 2026-09-04, ttsMinutes is a
+		RIFF/WAVE file of 16-bit signed mono PCM at 24 kHz -- 48000 bytes
+		per second of speech, not the ~2 KB/s an Opus stream would cost.
+		One observed reply was 599084 bytes for 12.48 seconds, and that
+		was the shortest such file this cloud can produce: the session had
+		detected no emotion at all, so its minutes were a single line.
+		Buffering the file in memory therefore capped how long a meeting
+		could be -- the 786432 byte budget it needed bought sixteen
+		seconds of speech -- which is not a limit that belongs in a heap.
+
+		8388608 is about three minutes at that rate.  Divide by 48000 to
+		read the value as seconds.
+
+		Exceeding it is not fatal: the text minutes are already on screen
+		and persisted by then, the partial file is removed, and the audio
+		is skipped with a log line naming this option.
+
+config VS_SOCIAL_MINUTES_AUDIO_PATH
+	string "VelaSight spoken minutes file"
+	default "/mnt/sdnand/ai_agent/minutes.wav"
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Where the spoken minutes are written before being played.
+
+		One fixed path rather than one file per session, so it cannot
+		accumulate: each session truncates the last one's audio.  The file
+		is deliberately left in place after playing -- having the last
+		session's WAV on disk is what makes "the voice sounded wrong"
+		something that can be investigated instead of reproduced.
+
+		The parent directory is created if missing.  The default sits
+		beside the history store, which vs_history.c already creates at
+		startup, so on a healthy boot it is there before this runs.
+
+		Whatever filesystem this names has to hold
+		CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES.
+
+config VS_SOCIAL_MINUTES_TEXT_MAX_BYTES
+	int "VelaSight social text minutes download budget (bytes)"
+	default 8192
+	range 512 65536
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Upper bound on the text minutes fetched from txtMinutes.
+
+		Unlike the spoken minutes above, this one is collected in memory,
+		because the caller needs the whole string at once to substitute it
+		into the result JSON.  That is affordable for prose and is why the
+		two limits are separate rather than shared: a few hundred bytes of
+		summary must not be fetched into a multi-megabyte budget.
+
+		The interface document shows txtMinutes carrying the summary text
+		inline, but the staging cloud sends a presigned FDS URL instead
+		(measured 2026-09-04, 219 characters).  Both shapes are accepted;
+		this budget only applies to the URL case.
+
+		8192 is roughly 2700 Chinese characters, well past anything the
+		result page or a history card can show.
 
 config VS_SOCIAL_CONNECT_TIMEOUT_MS
 	int "VelaSight social cloud connect timeout (ms)"
@@ -646,26 +722,60 @@ config VS_SOCIAL_IO_TIMEOUT_MS
 
 config VS_SOCIAL_IMAGE_INTERVAL_MS
 	int "VelaSight social image sampling interval (ms)"
-	default 340
+	default 500
 	range 200 2000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		Target gap between captured frames.
+		Target gap between captured frames.  The cloud interface document
+		asks for 200 ms.
 
-		The cloud interface document asks for 200 ms.  This board cannot
-		hold that: a JPEG frame measures about 316 ms end to end, so the
-		default is set just above the measured cost rather than at the
-		documented rate.  Asking for 200 ms would not produce 5 FPS, it
-		would produce the same ~3 FPS with the interval permanently
-		overrun and no slack for a frame that takes longer than usual.
+		What limits this is no longer the camera.  Earlier values here
+		were sized against "252 ms per delivered frame", read from
+		stop_capture's validator average, and that number was wrong in
+		kind: it came from clock_systime_ticks() around work that ran at
+		a contended priority, so it measured wall time including
+		preemption rather than cost.  CONFIG_USEC_PER_TICK is 1000, too
+		coarse to see the real figure at all.  With the DWT cycle counter
+		(CONFIG_ARCH_PERF_EVENTS) a whole-frame entropy walk measures
+		about 35 ms, and CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS brings
+		that to 1-4 ms by settling alignment on a 128-macroblock prefix.
+		The driver now delivers 17.39-17.87 fps at 480x480.
 
-		Lower this only after the hardware JPEG path is enabled and
-		re-measured.  The number to watch is the "sampled N frames" line
-		at the end of a session against the session's duration.
+		The limit moved to the cloud round trip.  Each image is two of
+		them -- register for a msgId and presigned URL, then PUT the
+		bytes -- and one measured about 135 ms on a pooled connection.
+		At 2 fps that is roughly 540 ms of round-trip time per second of
+		session, which one worker can carry.  5 fps would need about
+		1350 ms per second, so the document's rate needs the upload path
+		to overlap requests before it means anything.
+
+		Overshooting is no longer dangerous, only wasteful: the social
+		workers run at VS_PRIORITY_SOCIAL, below the UI, so a backlog
+		costs dropped frames rather than a frozen screen.  And the cloud
+		stamps every emotionTimeline entry with its own timestamp, making
+		no assumption about spacing, so a sparser timeline is a smaller
+		timeline and not a broken one.
+
+		Keep this equal to 1000 / VS_SOCIAL_CAPTURE_FPS.  The two knobs
+		gate different stages and a mismatch wastes whole frames of
+		validation on frames this application never reads -- see that
+		option's help text.
+
+		Keep this equal to 1000 / VS_SOCIAL_CAPTURE_FPS.  The two knobs
+		gate different stages and a mismatch spends whole frames of
+		validation on frames this application never reads -- see that
+		option's help text.
+
+		The numbers to watch are the "sampled N frames" line at the end
+		of a session against the session's duration, and hw_busy against
+		sampler_skipped in the driver's stop_capture line.  hw_busy above
+		sampler_skipped means the pipeline is saturating rather than
+		pacing, which is the signal that this value is too low for what
+		the rest of the session can carry.
 
 config VS_SOCIAL_CAPTURE_FPS
 	int "VelaSight social camera delivery rate (fps)"
-	default 5
+	default 2
 	range 1 30
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
@@ -680,12 +790,33 @@ config VS_SOCIAL_CAPTURE_FPS
 		drain ring plus a full 4:2:2 Huffman validation over
 		non-cacheable PSRAM, in interrupt and work-queue context,
 		alongside the microphone and the mailbox.  A session that reads
-		three frames a second has no use for the other fourteen.
+		two frames a second has no use for the other fifteen.
 
-		Deliberately above the rate the interval implies (340 ms is about
-		2.94 fps).  The headroom is what keeps a fresh frame waiting when
-		the capture thread comes back, instead of making it wait out the
-		remainder of a driver period.
+		Keep this equal to 1000 / VS_SOCIAL_IMAGE_INTERVAL_MS.  An
+		earlier default deliberately ran this above the rate the interval
+		implied, on the reasoning that the headroom keeps a fresh frame
+		waiting when the capture thread comes back.  Match them instead:
+		validation happens in the EOF path on everything the driver
+		delivers, before this application ever looks at it, so a headroom
+		frame is validated and then discarded.  At 5 delivered against
+		2.94 read, about 40% of the driver's validation work was spent on
+		images nobody read.
+
+		Two.  The cost of a delivered frame is now 1-4 ms of entropy
+		validation (CONFIG_BK7258_CAMERA_JPEG_VALIDATE_MCUS settles bit
+		alignment on a 128-macroblock prefix instead of the whole scan),
+		so the camera is no longer what sets this.  The upload path is:
+		two cloud round trips per image at about 135 ms each, which is
+		roughly 540 ms per second of session at 2 fps.  Earlier defaults
+		of 1 and 2 were chosen against a "252 ms per frame" figure that
+		turned out to be wall time including preemption rather than cost
+		-- see VS_SOCIAL_IMAGE_INTERVAL_MS for what replaced it.
+
+		Overshooting is wasteful rather than dangerous.  This work runs
+		at BK7258_CAMERA_JPEG_PRIORITY and the cloud workers at
+		VS_PRIORITY_SOCIAL, both below the UI, so a rate the session
+		cannot carry shows up as jpeg_hw_busy and a growing upload queue,
+		not as a screen that stops repainting.
 
 		Set it to 0 to ask for nothing and take the driver's own rate.
 		A rate the driver will not accept is not fatal -- the session
@@ -755,7 +886,7 @@ config VS_SOCIAL_POLL_INTERVAL_MS
 
 config VS_SOCIAL_FINALIZE_TIMEOUT_MS
 	int "VelaSight social finalize timeout (ms)"
-	default 30000
+	default 60000
 	range 5000 120000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
@@ -768,6 +899,19 @@ config VS_SOCIAL_FINALIZE_TIMEOUT_MS
 		because that work grows with the length of the conversation, and
 		the alternative to waiting is showing the user a session that
 		produced nothing.
+
+		This was 30000, which measurement showed was not generous at all.
+		Two runs against the staging cloud: 19.8 s on 2026-09-03 (from the
+		AI端 server log) and 24.4 s on 2026-09-04 (measured end to end
+		from the DELETE).  Both are the same trivial session -- a handful
+		of frames, no faces found, so the summary was one sentence -- and
+		they differ by nearly five seconds.  A real conversation has more
+		to summarise and a voice to synthesise, and the jitter was already
+		inside the old 5.6 s of headroom.
+
+		60000 is chosen against the observed spread rather than the
+		observed maximum.  Waiting costs a spinner; timing out early
+		discards minutes the cloud did produce.
 
 config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
 	int "VelaSight social alert confirmation windows"
@@ -814,6 +958,103 @@ config VS_SOCIAL_QUEUE_SLOTS
 
 		The "dropped" count in the end-of-session log is how to tell
 		whether this was ever reached.
+
+config VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS
+	int "VelaSight social upload backoff floor (ms)"
+	default 250
+	range 50 5000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long the upload thread sleeps after the first upload failure
+		in a row, before trying the next queued item.  Doubles on each
+		further consecutive failure up to
+		VS_SOCIAL_UPLOAD_BACKOFF_MAX_MS, and resets to no wait the moment
+		an upload succeeds.
+
+		vs_cloud_social_upload() folds every failure into one negative
+		return -- a refused register call, a presigned PUT the object
+		store 403s on a signature mismatch, a timed-out connect, a
+		malformed response -- and this does not distinguish them: none is
+		fixed by asking again with no delay.
+
+		Without this the upload thread is a loop with no wait of its own,
+		bounded only by round-trip latency.  It ran at VS_PRIORITY_VOICE
+		when this was written, above the UI; it now runs at
+		VS_PRIORITY_SOCIAL, below it, so the starvation described next
+		can no longer reach the renderer -- but the wasted round trips
+		are still wasted.  Measured 2026-09-01: a store that
+		403s every attempt (signature mismatch is deterministic per
+		request shape, so this is not a rare transient) drove that loop
+		at up to five attempts a second, which is CPU time taken from
+		every lower-priority task for as long as the queue kept handing
+		it work -- including input polling, so key presses stopped
+		registering while the session kept running and logging.
+
+		Kept close to VS_SOCIAL_IMAGE_INTERVAL_MS so one isolated failure
+		costs about one sample period rather than a visible stall.
+
+config VS_SOCIAL_UPLOAD_BACKOFF_MAX_MS
+	int "VelaSight social upload backoff ceiling (ms)"
+	default 8000
+	range 1000 300000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Upper bound the doubling in VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS's
+		help text stops at.  A store stuck failing every request then
+		spends most of its time asleep rather than retrying into a wall.
+
+		Raised from 8000 after measuring what the old ceiling actually
+		bought.  Observed 2026-08-31 with the ceiling at 8 s: refusals
+		arrived about every 3.4 s for the whole session, because the
+		doubling starts over on any answer that is not a failure and each
+		attempt costs a TLS round trip before it can fail.  8 s was never
+		reached often enough to matter; the loop stayed at a few seconds
+		indefinitely.
+
+		It was briefly 60000, on the reading that the refusals were a
+		destination that had genuinely gone away.  That reading was
+		wrong: they were the load balancer answering from the instance
+		that did not hold the session, which vs_cloud.c now avoids by
+		keeping the connection that opened it.  Waiting a minute for a
+		routing decision to change would have been a minute spent on
+		nothing, so this is back to a few seconds -- long enough for a
+		transient network or store problem, which is what it is for.
+
+config VS_SOCIAL_DEAD_SESSION_STRIKES
+	int "VelaSight social consecutive session-gone refusals before stopping"
+	default 12
+	range 1 64
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many upload attempts in a row may come back as status 30 --
+		"session not found or closed" -- before the upload thread stops
+		and asks the session to shut down.
+
+		This was 3, chosen while status 30 was believed to mean the
+		session had genuinely gone.  It does not.  Measured 2026-09-03
+		with curl from a host, so nothing to do with this device: a fresh
+		connection per request failed 16 times in 30 because the balancer
+		routes per connection and only one of the two instances holds the
+		session, while an open plus ten uploads plus the close on a single
+		connection succeeded 33 times out of 33.
+
+		At that failure rate a run of three arrived about every seven
+		uploads, so a threshold of 3 ended essentially every session
+		within the first few seconds -- which is what the board did.  No
+		threshold fixes that: the events are independent, so any value
+		low enough to detect a real closure is also low enough to trip on
+		the routing.  vs_cloud.c holds the connection that opened the
+		session instead, which removes the refusals rather than counting
+		them.
+
+		12 is therefore a backstop rather than a detector.  With the
+		connection held, a status 30 means something genuinely changed on
+		the far side -- the instance restarted, or another open superseded
+		this session -- and twelve in a row is unambiguous.  It is not
+		load-bearing for the routing problem any more.
+
+		Any successful upload resets the count: what ends a session is a
+		run of refusals, not a total across it.
 
 config VS_SOCIAL_INFLIGHT_MAX
 	int "VelaSight social in-flight message tracking"

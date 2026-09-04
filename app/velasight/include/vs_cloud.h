@@ -398,9 +398,27 @@ struct vs_social_event_s
 
 struct vs_cloud_minutes_s
 {
-  /* ttsMinutes.  A download URL; fetch it with vs_cloud_download(). */
+  /* ttsMinutes.  Always a download URL; fetch it with vs_cloud_download().
+   * Measured 2026-09-04 the body is RIFF/WAVE, 16-bit signed mono PCM at
+   * 24 kHz, and the response carries Content-Type: application/octet-stream
+   * -- so the format has to be read from the bytes, not the header.
+   *
+   * Presigned for one hour.  Persisting it and fetching later does not work;
+   * whatever is wanted from it has to be taken during finalize.
+   */
 
   char tts_url[VS_CLOUD_URL_MAX];
+
+  /* txtMinutes when it arrived as a URL rather than as the text, which is
+   * what the staging cloud does.  Empty when the field carried the text
+   * inline, which is the shape the interface document's examples show.
+   *
+   * Informational only by the time the caller sees it: the fetch and the
+   * substitution have already happened, and summary below holds the result
+   * either way.  Kept so a log line can say where the text came from.
+   */
+
+  char txt_url[VS_CLOUD_URL_MAX];
 
   /* txtMinutes, truncated on a UTF-8 boundary for the result page.  The
    * untruncated text is in the full JSON, which is what gets persisted.
@@ -689,34 +707,82 @@ int vs_cloud_social_ack(const char *session_id);
  * Name: vs_cloud_download
  *
  * Description:
- *   GET an absolute URL and return its body.  Used for ttsMinutes, whose
- *   payload is Ogg audio rather than JSON, so the body is returned as bytes
- *   with an explicit length instead of a string.
+ *   GET an absolute URL and return its body as bytes with an explicit length
+ *   rather than as a string, because neither of the two things this fetches
+ *   is text the transport could NUL-terminate safely: ttsMinutes is a WAV
+ *   file and txtMinutes is UTF-8 that may not be.
  *
  *   A relative URL -- which is what the document's example ttsMinutes looks
  *   like -- is resolved against the configured cloud host.
  *
  * Input Parameters:
+ *   max_bytes  - budget for this fetch, and the size of the allocation it
+ *                makes.  Explicit rather than compiled in so that a caller
+ *                fetching a few hundred bytes of summary
+ *                (CONFIG_VS_SOCIAL_MINUTES_TEXT_MAX_BYTES) does not pay for
+ *                the largest thing this interface can return.  The spoken
+ *                minutes do not come through here at all -- they have no
+ *                bounded size, so they go to storage through
+ *                vs_cloud_download_to_file() instead.
  *   data       - receives a buffer the caller owns
  *   len        - receives its length
  *   from_psram - receives which allocator to release it with; pass the whole
  *                triple back to vs_cloud_release()
  *
  * Returned Value:
- *   0 on success.  -EFBIG when the body is larger than
- *   CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES; a body of exactly that many bytes is
- *   accepted.  -EIO when the peer closed before Content-Length was reached,
- *   which matters here because a partial Ogg file would otherwise be handed
- *   back as complete and played.
+ *   0 on success.  -EFBIG when the body is larger than max_bytes; a body of
+ *   exactly that many bytes is accepted.  -EIO when the peer closed before
+ *   Content-Length was reached, which matters here because a partial WAV
+ *   would otherwise be handed back as complete and played.
  *
  ****************************************************************************/
 
 int vs_cloud_download(const char *url, unsigned char **data, size_t *len,
-                      bool *from_psram);
+                      bool *from_psram, size_t max_bytes);
 
 /* Release a buffer from vs_cloud_download(). */
 
 void vs_cloud_release(unsigned char *data, bool from_psram);
+
+/****************************************************************************
+ * Name: vs_cloud_download_to_file
+ *
+ * Description:
+ *   GET an absolute URL and write its body to a file as it arrives.
+ *
+ *   The counterpart to vs_cloud_download() for a body that must not be held.
+ *   Memory here is one transport read buffer -- 8 KB on the TLS path, the
+ *   scratch buffer below on the cleartext one -- whatever the body's size, so
+ *   max_bytes is a limit on the file rather than on an allocation.
+ *
+ *   This exists because the spoken minutes are not a bounded object.  Measured
+ *   2026-09-04 the shortest possible one -- a session that detected no emotion
+ *   at all, whose text was a single line -- was already 585 KB of 24 kHz 16-bit
+ *   mono PCM, 12.5 seconds at 48000 bytes a second.  Collecting that in RAM
+ *   put a ceiling on session length in the shape of a heap allocation: the
+ *   768 KB budget it needed bought 16 seconds of speech, and a real meeting's
+ *   minutes are longer than that.  Streaming to storage removes the ceiling
+ *   from memory and leaves it where it can be raised.
+ *
+ * Input Parameters:
+ *   path      - file to create or truncate.  Its directory must exist.
+ *   max_bytes - refuse a body larger than this, leaving no file behind.  This
+ *               is CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES for the spoken minutes.
+ *   len       - optional; receives the bytes written.
+ *
+ * Returned Value:
+ *   0 on success, and only then does a file exist at path: every failure path
+ *   unlinks the partial one, so a caller cannot play half a download it
+ *   thought had failed.
+ *
+ *   -EFBIG when the body exceeded max_bytes, -ENOSPC when the filesystem
+ *   filled, -EIO when the peer closed before Content-Length was reached,
+ *   -EPROTO for a chunked body on the cleartext path, which is not decoded.
+ *
+ ****************************************************************************/
+
+int vs_cloud_download_to_file(const char *url, const char *path,
+                              size_t max_bytes, size_t *len);
 
 /****************************************************************************
  * Name: vs_cloud_server_to_peer
