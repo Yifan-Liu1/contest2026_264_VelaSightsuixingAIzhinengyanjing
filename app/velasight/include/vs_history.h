@@ -88,13 +88,45 @@ int vs_history_read_full(enum vs_history_kind_e kind, const char *record_key,
 
 /* Atomically append one full JSON object.  The module generates record_key,
  * writes the body, commits a replacement index, then removes the evicted
- * oldest body (if capacity was full).  A failed index commit leaves the old
- * index and old body intact and returns an error.  Capacity is per kind.
+ * oldest body and its audio sidecar (if capacity was full).  A failed index
+ * commit leaves the old index and old body intact and returns an error.
+ * Capacity is per kind.
+ *
+ * On success *index carries the generated record_key back, which is what a
+ * caller needs to name anything else it wants to file alongside the record --
+ * see vs_history_audio_path().
  */
 
 int vs_history_append(enum vs_history_kind_e kind,
                       struct vs_history_index_s *index,
                       const char *full_json);
+
+/****************************************************************************
+ * Name: vs_history_audio_path
+ *
+ * Description:
+ *   Where this record's spoken minutes belong: the record's own stem with a
+ *   .WAV extension, in the same per-kind directory as its body.
+ *
+ *   The store owns the naming rather than exposing its directory, because the
+ *   two things that must stay true are its business: the name has to remain
+ *   8.3-safe on this VFAT volume ("R" plus seven digits is exactly eight
+ *   characters), and the file has to be removed when the record it belongs to
+ *   is evicted -- which vs_history_append() does, and which no caller could do
+ *   because eviction is not reported to anyone.
+ *
+ *   Formatting a path says nothing about whether the file exists.  A record
+ *   whose session never produced audio, or whose download failed, simply has
+ *   no file here; the seed records are all in that state.
+ *
+ * Returned Value:
+ *   0 with path filled, -EINVAL for a bad kind or a malformed key, or
+ *   -ENAMETOOLONG when len is too small.
+ *
+ ****************************************************************************/
+
+int vs_history_audio_path(enum vs_history_kind_e kind,
+                          const char *record_key, char *path, size_t len);
 
 void vs_history_close(void);
 

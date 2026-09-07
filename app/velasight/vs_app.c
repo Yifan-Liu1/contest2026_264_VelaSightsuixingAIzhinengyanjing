@@ -22,6 +22,7 @@
 #include "include/vs_network.h"
 #include "include/vs_settings.h"
 #include "include/vs_social.h"
+#include "include/vs_tts.h"
 #include "include/vs_voice.h"
 
 /* Shown on the listening page, so it has to agree with the value vs_voice.c
@@ -84,7 +85,42 @@
 
 #define VS_SOCIAL_FINALIZE_STAGE_TIMEOUT_MS \
   (CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS + 20000)
-#define VS_WIFI_RETRY_MS 20000
+
+#ifndef CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS
+#  define CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS 90000
+#endif
+
+/* The spoken-minutes download, derived from the worker's own budget for the
+ * same reason as the poll above: raising one without the other would make this
+ * the inner bound and cut off a transfer that was still allowed to run.
+ */
+
+#define VS_SOCIAL_FETCH_STAGE_TIMEOUT_MS \
+  (CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS + 20000)
+
+/* How long a browsed record has to stay on screen before its spoken minutes
+ * start playing.
+ *
+ * Long enough that holding the browse key through several records is silent --
+ * each press restarts this -- and short enough to feel like a consequence of
+ * stopping rather than a separate action.
+ */
+
+#ifndef CONFIG_VS_HISTORY_TTS_DWELL_MS
+#  define CONFIG_VS_HISTORY_TTS_DWELL_MS 2000
+#endif
+
+/* How long after a failed STA association the next attempt is made.
+ *
+ * Every retry is a full scan, authenticate and DHCP cycle on the CP, so the
+ * interval is a floor on how often that work is repeated rather than a delay
+ * added to it.  Shortened from 20 s to 10 s: the common failure this recovers
+ * from is an access point that is not up yet at boot, and 20 s meant a device
+ * powered on beside a rebooting router could sit unconnected for most of a
+ * minute with nothing on screen to suggest it was still trying.
+ */
+
+#define VS_WIFI_RETRY_MS 10000
 
 #define VS_APP_EVENT_QUEUE_SIZE 8
 
@@ -210,6 +246,21 @@ static uint32_t vs_app_now_ms(void)
   return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
 }
 
+/* What the error page's confirm key does.  See vs_runtime_s::error_retry. */
+
+enum vs_retry_kind_e
+{
+  VS_RETRY_NONE = 0,
+
+  /* Re-run the network worker towards error_target_mode. */
+
+  VS_RETRY_NETWORK,
+
+  /* Ask the social session to collect its minutes again. */
+
+  VS_RETRY_SOCIAL
+};
+
 struct vs_runtime_s
 {
   enum vs_page_e page;
@@ -256,6 +307,17 @@ struct vs_runtime_s
   int error;
   char error_reason[VS_TEXT_LONG];
   bool error_retryable;
+
+  /* What the retry key on the error page means.
+   *
+   * It used to mean exactly one thing -- re-run the network worker with
+   * error_target_mode -- which is why every social failure had to be reported
+   * as not retryable: offering the key would have switched the network.  With
+   * the kind recorded alongside, a failure can offer a retry that belongs to
+   * it.
+   */
+
+  enum vs_retry_kind_e error_retry;
   enum vs_net_mode_e error_target_mode;
   enum vs_page_e error_return_page;
   bool network_busy;
@@ -286,6 +348,29 @@ struct vs_runtime_s
    */
 
   uint32_t social_stage_until_ms;
+
+  /* Which step of a finalize is running, and the line it puts on screen.
+   *
+   * The stage also chooses the deadline above, which is what turns it from a
+   * caption into a hang detector: each step gets a budget sized for that step,
+   * and every stage event refreshes it.  One deadline for the whole sequence
+   * had to be sized for the sum, which made it useless for catching a single
+   * wedged step -- and it fired on a cloud that was merely slow.
+   */
+
+  enum vs_social_stage_e social_stage;
+  char social_stage_text[VS_TEXT_LONG];
+
+  /* Auto-play of the browsed record's spoken minutes.
+   *
+   * dwell_key is what the browse page is currently showing -- the record key,
+   * or empty when the page is not showing a record at all.  Comparing it each
+   * pass is how a navigation is noticed without every key handler having to
+   * remember to say so, the same reason social_stage_until_ms is decided here.
+   */
+
+  char tts_dwell_key[VS_HISTORY_KEY_MAX];
+  uint32_t tts_dwell_at_ms;
   struct vs_net_status_s network;
   char alert_text[VS_TEXT_LONG];
   char result_text[VS_TEXT_LONG];
@@ -766,10 +851,25 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         break;
 
       case VS_PAGE_HISTORY:
+
+        /* The left panel's three labels are the only text this page puts on
+         * that screen, so "no record" used to mean three empty strings and a
+         * screen with nothing but its dividers on it -- while the right screen,
+         * whose fields here are constants, looked entirely healthy.
+         *
+         * Reaching this page without a readable record is a contradiction:
+         * vs_browse_page() sends anyone with history_blank set to
+         * VS_PAGE_HISTORY_BLANK instead.  It is still worth rendering as words
+         * rather than as nothing, because the failure it now describes -- an
+         * index that outran the store, or a store that could not be reloaded --
+         * is one the user can act on by navigating, and a blank screen is one
+         * they can only reboot.
+         */
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
-                 "%s", have_current ? current.title : "");
+                 "%s", have_current ? current.title : "历史");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
-                 "%s", have_current ? current.summary : "");
+                 "%s", have_current ? current.summary : "记录暂时读不出\n按键翻页重试");
         snprintf(snapshot->content_meta, sizeof(snapshot->content_meta),
                  "%s", have_current ? current.date : "");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "历史");
@@ -965,8 +1065,17 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
       case VS_PAGE_SOCIAL_FINALIZING:
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
                  "整理记录");
-        snprintf(snapshot->content_body, sizeof(snapshot->content_body),
-                 "正在生成建议");
+
+        /* The step that is actually running, falling back to the old fixed
+         * line only for the window before the first stage event lands.  The
+         * page used to say "正在生成建议" for the whole sequence, including
+         * while it was stopping the camera and while it was writing to the
+         * card -- neither of which is generating anything.
+         */
+
+        snprintf(snapshot->content_body, sizeof(snapshot->content_body), "%s",
+                 runtime->social_stage_text[0] != '\0' ?
+                   runtime->social_stage_text : "正在生成建议");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "整理中");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value), "处理中");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "请稍等");
@@ -1349,6 +1458,64 @@ static bool vs_social_stage_is_waiting(enum vs_page_e page)
 }
 
 /****************************************************************************
+ * Name: vs_browse_page
+ *
+ * Description:
+ *   Which of the two browse pages this runtime is currently on.
+ *
+ *   The pair has to be chosen together.  VS_PAGE_HISTORY renders the left
+ *   panel's title, body and meta from the record that history_blank says does
+ *   not exist, so setting the page without consulting the flag produces a page
+ *   that draws three empty strings -- a left screen with nothing on it but the
+ *   dividers, while the right screen looks perfectly normal because its fields
+ *   on that page are constants.
+ *
+ *   Six places already spelled this out inline and the social exits did not,
+ *   which is exactly the bug: returning from a session landed on
+ *   VS_PAGE_HISTORY with history_blank still true from startup, and the left
+ *   panel stayed blank until some later navigation happened to clear the flag.
+ *
+ ****************************************************************************/
+
+static enum vs_page_e vs_browse_page(const struct vs_runtime_s *runtime)
+{
+  return runtime->history_blank ? VS_PAGE_HISTORY_BLANK : VS_PAGE_HISTORY;
+}
+
+/****************************************************************************
+ * Name: vs_show_newest_record
+ *
+ * Description:
+ *   Point the browse pages at the record a finished session just wrote.
+ *
+ *   Called when SOCIAL_RESULT arrives, which is after social_persist_minutes()
+ *   has returned successfully, so the record is in the index by now and index
+ *   zero is it -- vs_history.h fixes index 0 as the newest.
+ *
+ *   This is what the user asked to see.  A session that produced minutes and
+ *   then dropped the user on the photo home, or on a history page pinned to
+ *   whatever record they were reading beforehand, hides the thing they just
+ *   spent a conversation making.
+ *
+ ****************************************************************************/
+
+static void vs_show_newest_record(struct vs_runtime_s *runtime)
+{
+  if (vs_history_count(VS_HISTORY_KIND_SOCIAL) == 0)
+    {
+      /* Nothing in the store: the append is reported to have worked, so this
+       * means the index could not be reloaded.  Leave the flag alone rather
+       * than promising a record that cannot be read.
+       */
+
+      return;
+    }
+
+  runtime->history_blank = false;
+  runtime->index = 0;
+}
+
+/****************************************************************************
  * Name: vs_social_stage_budget_ms
  *
  * Description:
@@ -1364,10 +1531,41 @@ static bool vs_social_stage_is_waiting(enum vs_page_e page)
  *
  ****************************************************************************/
 
-static uint32_t vs_social_stage_budget_ms(enum vs_page_e page)
+static uint32_t vs_social_stage_budget_ms(const struct vs_runtime_s *runtime)
 {
-  return page == VS_PAGE_SOCIAL_FINALIZING ?
-           VS_SOCIAL_FINALIZE_STAGE_TIMEOUT_MS : VS_SOCIAL_STAGE_TIMEOUT_MS;
+  if (runtime->page != VS_PAGE_SOCIAL_FINALIZING)
+    {
+      return VS_SOCIAL_STAGE_TIMEOUT_MS;
+    }
+
+  /* Per step, because the steps are not comparable and each one refreshes this
+   * when it starts.  The two long ones are the two that wait on something
+   * outside the device, and both derive their budget from the worker's own so
+   * the ordering is a property of the code rather than a note asking the next
+   * person to keep them in step.
+   */
+
+  switch (runtime->social_stage)
+    {
+      case VS_SOCIAL_STAGE_WAITING:
+        return VS_SOCIAL_FINALIZE_STAGE_TIMEOUT_MS;
+
+      case VS_SOCIAL_STAGE_FETCHING:
+        return VS_SOCIAL_FETCH_STAGE_TIMEOUT_MS;
+
+      default:
+
+        /* STOPPING, CLOSING and SAVING are all local work or a single round
+         * trip.  Measured 2026-09-07: stopping plus closing together took
+         * 6.5 s and saving took 6.6 s, so this is several times the worst
+         * observed and still short enough to catch a wedge.
+         *
+         * NONE lands here too, which is the window between entering the page
+         * and the first stage event arriving.
+         */
+
+        return VS_SOCIAL_STAGE_TIMEOUT_MS;
+    }
 }
 
 /****************************************************************************
@@ -1412,15 +1610,144 @@ static void vs_social_stage_timeout(struct vs_runtime_s *runtime)
         break;
 
       case VS_PAGE_SOCIAL_FINALIZING:
-        vs_social_abort();
-        vs_cancel_request(runtime);
-        vs_set_error_reason(runtime, -ETIMEDOUT, VS_PAGE_HISTORY, false,
-                            "社交记录整理无响应");
+        {
+          /* Which step stopped answering is the whole diagnosis, so it goes in
+           * the message the user reads as well as the log.
+           */
+
+          static const char *const stalled[VS_SOCIAL_STAGE_COUNT] =
+          {
+            "社交记录整理无响应",
+            "停止采集无响应",
+            "云端关闭会话无响应",
+            "云端生成建议无响应",
+            "保存记录无响应",
+            "接收语音无响应"
+          };
+
+          enum vs_social_stage_e stage = runtime->social_stage;
+
+          vs_social_abort();
+          vs_cancel_request(runtime);
+          vs_set_error_reason(runtime, -ETIMEDOUT, vs_browse_page(runtime),
+                              vs_social_can_retry(),
+                              stage < VS_SOCIAL_STAGE_COUNT ?
+                                stalled[stage] : stalled[0]);
+
+          /* Retry means "collect the minutes again", not "switch the
+           * network".  Set after vs_set_error_reason(), which resets it.
+           */
+
+          if (runtime->error_retryable)
+            {
+              runtime->error_retry = VS_RETRY_SOCIAL;
+            }
+        }
         break;
 
       default:
         break;
     }
+}
+
+/****************************************************************************
+ * Name: vs_update_record_audio
+ *
+ * Description:
+ *   Start, keep or stop the browsed record's spoken minutes.
+ *
+ *   Driven by what the page is showing rather than by what the user pressed.
+ *   The browse selection moves from five different key branches plus
+ *   vs_show_newest_record(), and an arm-on-keypress design would have needed
+ *   every one of them to remember both halves of this.
+ *
+ *   Three cases, and the middle one is the reason this is not simply "stop then
+ *   play":
+ *
+ *     the page shows what is already playing   leave it alone
+ *     the page shows something else            stop, and start the dwell timer
+ *     the page shows no record at all          stop
+ *
+ *   The middle case is what a session's own result page relies on.  Playback
+ *   starts when the minutes are ready and the user is then dropped on the
+ *   result page; pressing back lands them on the history entry that session
+ *   just wrote, which is the file already on the speaker.  Stopping and
+ *   restarting it there would replay the opening two seconds for no reason.
+ *
+ ****************************************************************************/
+
+static void vs_update_record_audio(struct vs_runtime_s *runtime)
+{
+  struct vs_history_index_s current;
+  char key[VS_HISTORY_KEY_MAX];
+  char want[VS_TTS_PATH_MAX];
+  char playing[VS_TTS_PATH_MAX];
+
+  key[0] = '\0';
+  want[0] = '\0';
+
+  /* Only the record page has a record.  The blank page, the volume page and
+   * every modal page count as "no record", which is what makes leaving the
+   * browse ring stop the audio.
+   */
+
+  if (runtime->page == VS_PAGE_HISTORY && !runtime->history_blank &&
+      vs_history_get_index(VS_HISTORY_KIND_SOCIAL, runtime->index,
+                           &current) == 0)
+    {
+      snprintf(key, sizeof(key), "%s", current.record_key);
+      if (vs_history_audio_path(VS_HISTORY_KIND_SOCIAL, current.record_key,
+                                want, sizeof(want)) < 0)
+        {
+          want[0] = '\0';
+        }
+    }
+
+  if (strcmp(key, runtime->tts_dwell_key) == 0)
+    {
+      /* Same selection as last pass.  Only the timer can still do anything. */
+
+      if (runtime->tts_dwell_at_ms != 0 &&
+          (int32_t)(runtime->tts_dwell_at_ms - vs_app_now_ms()) <= 0)
+        {
+          runtime->tts_dwell_at_ms = 0;
+
+          if (want[0] != '\0')
+            {
+              /* A record with no audio file fails inside vs_tts and says so
+               * once.  Not worth checking for here: access() on the UI thread
+               * is the SD-NAND read this page is not allowed to do.
+               */
+
+              (void)vs_tts_play(want);
+            }
+        }
+
+      return;
+    }
+
+  /* The selection moved. */
+
+  snprintf(runtime->tts_dwell_key, sizeof(runtime->tts_dwell_key), "%s", key);
+  vs_tts_current(playing, sizeof(playing));
+
+  if (want[0] != '\0' && strcmp(playing, want) == 0)
+    {
+      /* Already speaking this record.  No stop, and no timer -- rearming it
+       * would restart the file the moment it expired.
+       */
+
+      runtime->tts_dwell_at_ms = 0;
+      return;
+    }
+
+  if (playing[0] != '\0')
+    {
+      vs_tts_stop();
+    }
+
+  runtime->tts_dwell_at_ms = want[0] != '\0' ?
+    vs_app_now_ms() + CONFIG_VS_HISTORY_TTS_DWELL_MS : 0;
 }
 
 static void vs_switch_network(struct vs_display_s *display,
@@ -1491,6 +1818,14 @@ static void vs_set_error(struct vs_runtime_s *runtime, int error,
   runtime->error = error != 0 ? error : -EIO;
   runtime->error_return_page = return_page;
   runtime->error_retryable = retryable;
+
+  /* Network is the default meaning because it was the only one, and every
+   * existing caller that asks for a retryable error means it.  A caller that
+   * means something else overrides this afterwards; doing it that way round
+   * keeps the ones that do not care from having to say so.
+   */
+
+  runtime->error_retry = retryable ? VS_RETRY_NETWORK : VS_RETRY_NONE;
   if (runtime->network.error == runtime->error &&
       runtime->network.error_reason[0] != '\0')
     snprintf(runtime->error_reason, sizeof(runtime->error_reason), "%s",
@@ -1648,13 +1983,32 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
                               false, "社交会话操作失败");
         break;
 
+      case VS_APP_EVENT_SOCIAL_STAGE:
+        if (runtime->page == VS_PAGE_SOCIAL_FINALIZING)
+          {
+            runtime->social_stage = event->stage;
+            snprintf(runtime->social_stage_text,
+                     sizeof(runtime->social_stage_text), "%s", event->text);
+
+            /* Cleared, not extended: the main loop re-arms it on the next pass
+             * with the budget the new stage is entitled to.  That is what makes
+             * this a no-progress timer rather than a total one.
+             */
+
+            runtime->social_stage_until_ms = 0;
+          }
+        break;
+
       case VS_APP_EVENT_SOCIAL_RESULT:
         if (runtime->page == VS_PAGE_SOCIAL_FINALIZING)
           {
+            runtime->social_stage = VS_SOCIAL_STAGE_NONE;
+            runtime->social_stage_text[0] = '\0';
             if (event->text[0] == '\0')
               {
                 vs_cancel_request(runtime);
-                vs_set_error_reason(runtime, -EBADMSG, VS_PAGE_HISTORY, false,
+                vs_set_error_reason(runtime, -EBADMSG,
+                                    vs_browse_page(runtime), false,
                                     "社交摘要为空");
               }
             else
@@ -1662,6 +2016,15 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
                 snprintf(runtime->result_text, sizeof(runtime->result_text),
                          "%s", event->text);
                 runtime->page = VS_PAGE_SOCIAL_RESULT;
+
+                /* The record is already on the card: this event is posted
+                 * after social_persist_minutes() returned.  Aim the browse
+                 * pages at it now, so leaving the result page shows the
+                 * conversation that was just summarised instead of whatever
+                 * was on screen before the session started.
+                 */
+
+                vs_show_newest_record(runtime);
               }
           }
         break;
@@ -1669,9 +2032,36 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
       case VS_APP_EVENT_SOCIAL_FINALIZE_FAILED:
         if (runtime->page == VS_PAGE_SOCIAL_FINALIZING)
           {
+            /* Which step failed, in the words the stage line was already
+             * using, so the error page continues the sentence the user was
+             * reading rather than replacing it with a generic one.
+             */
+
+            static const char *const failed[VS_SOCIAL_STAGE_COUNT] =
+            {
+              "社交记录整理失败",
+              "停止采集失败",
+              "云端关闭会话失败",
+              "云端未给出建议",
+              "保存记录失败",
+              "接收语音失败"
+            };
+
+            enum vs_social_stage_e stage = runtime->social_stage;
+
+            runtime->social_stage = VS_SOCIAL_STAGE_NONE;
+            runtime->social_stage_text[0] = '\0';
             vs_cancel_request(runtime);
-            vs_set_error_reason(runtime, event->error, VS_PAGE_HISTORY, false,
-                                "社交记录整理失败");
+            vs_set_error_reason(runtime, event->error,
+                                vs_browse_page(runtime),
+                                vs_social_can_retry(),
+                                stage < VS_SOCIAL_STAGE_COUNT ?
+                                  failed[stage] : failed[0]);
+
+            if (runtime->error_retryable)
+              {
+                runtime->error_retry = VS_RETRY_SOCIAL;
+              }
           }
         break;
 
@@ -1983,7 +2373,7 @@ static void vs_handle_event(struct vs_display_s *display,
                      */
 
                     runtime->voice_arming = false;
-                    runtime->page = VS_PAGE_HISTORY;
+                    runtime->page = vs_browse_page(runtime);
                     vs_cancel_request(runtime);
                     vs_render_now(display, runtime);
                   }
@@ -2255,7 +2645,15 @@ static void vs_handle_event(struct vs_display_s *display,
             if (event->key == VS_KEY_CONFIRM || event->key == VS_KEY_BACK)
               {
                 vs_cancel_request(runtime);
-                runtime->page = VS_PAGE_HISTORY;
+
+                /* vs_show_newest_record() already pointed the pair at the new
+                 * record when the result arrived, so this is normally
+                 * VS_PAGE_HISTORY.  Asking rather than assuming keeps the page
+                 * and the flag from disagreeing if the store could not be
+                 * reloaded.
+                 */
+
+                runtime->page = vs_browse_page(runtime);
               }
             break;
 
@@ -2284,7 +2682,50 @@ static void vs_handle_event(struct vs_display_s *display,
 
           case VS_PAGE_ERROR:
             if (event->key == VS_KEY_CONFIRM && runtime->error_retryable &&
-                network != NULL)
+                runtime->error_retry == VS_RETRY_SOCIAL)
+              {
+                uint32_t request_id;
+                int ret;
+
+                request_id = vs_begin_request(runtime);
+                ret = vs_social_retry_finalize(request_id);
+                if (ret == 0)
+                  {
+                    /* Back to the page the failure came from, with the stage
+                     * line cleared so the first event of the retry is what
+                     * fills it rather than the last one of the attempt that
+                     * failed.
+                     */
+
+                    runtime->social_stage = VS_SOCIAL_STAGE_NONE;
+                    runtime->social_stage_text[0] = '\0';
+                    runtime->social_stage_until_ms = 0;
+                    runtime->page = VS_PAGE_SOCIAL_FINALIZING;
+                    vs_render_now(display, runtime);
+                  }
+                else if (ret == -EBUSY)
+                  {
+                    /* The failed attempt's thread has not finished unwinding.
+                     * A transient hint rather than a second error page: the
+                     * retry is still available and the user only has to press
+                     * again.
+                     */
+
+                    vs_cancel_request(runtime);
+                    vs_set_response(runtime, VS_KEY_CONFIRM, "稍等");
+                    vs_render_now(display, runtime);
+                  }
+                else
+                  {
+                    vs_cancel_request(runtime);
+                    vs_set_error_reason(runtime, ret,
+                                        runtime->error_return_page, false,
+                                        "无法重新整理记录");
+                  }
+              }
+            else if (event->key == VS_KEY_CONFIRM && runtime->error_retryable &&
+                     runtime->error_retry == VS_RETRY_NETWORK &&
+                     network != NULL)
               {
                 enum vs_net_mode_e mode = runtime->error_target_mode;
                 int ret;
@@ -2415,12 +2856,17 @@ static void vs_handle_event(struct vs_display_s *display,
             {
               /* The session is already gone -- it ended on its own, or this is
                * a second long-press landing after the first was accepted.
-               * There are no minutes coming, so go back to history rather than
-               * waiting on the finalizing page.
+               * There are no minutes coming, so go back to the browse pages
+               * rather than waiting on the finalizing page.
+               *
+               * Through vs_browse_page() because this is a social exit like the
+               * others: a session entered from the photo home would otherwise
+               * land on VS_PAGE_HISTORY with history_blank still set and draw
+               * an empty left screen.
                */
 
               vs_cancel_request(runtime);
-              runtime->page = VS_PAGE_HISTORY;
+              runtime->page = vs_browse_page(runtime);
               runtime->progress = 0;
             }
         }
@@ -2551,6 +2997,14 @@ int vs_app_run(void)
   runtime.api_ready = bk7258_ai_config_ready();
   vs_history_open();
 
+  /* After the store, because everything it plays lives in it, and before the
+   * first frame, because a record could be selected as soon as the user has a
+   * screen.  A failure is not fatal: vs_tts_play() then reports -ENODEV and the
+   * only thing lost is spoken output.
+   */
+
+  (void)vs_tts_open();
+
   /* Only now is /mnt/sdnand known to be mounted: SD-NAND comes up on a delayed
    * work item and vs_history_open() is what blocks for it.  Reading the volume
    * any earlier -- next to the driver query above, where it would read more
@@ -2628,18 +3082,29 @@ int vs_app_run(void)
         else if (runtime.social_stage_until_ms == 0)
           {
             runtime.social_stage_until_ms =
-              vs_app_now_ms() + vs_social_stage_budget_ms(runtime.page);
+              vs_app_now_ms() + vs_social_stage_budget_ms(&runtime);
           }
         else if ((int32_t)(runtime.social_stage_until_ms -
                            vs_app_now_ms()) <= 0)
           {
-            printf("velasight: social stage timed out on page %d after "
-                   "%lu ms\n", (int)runtime.page,
-                   (unsigned long)vs_social_stage_budget_ms(runtime.page));
+            printf("velasight: social stage timed out on page %d stage %d "
+                   "after %lu ms\n", (int)runtime.page,
+                   (int)runtime.social_stage,
+                   (unsigned long)vs_social_stage_budget_ms(&runtime));
             vs_social_stage_timeout(&runtime);
             vs_render(display, &runtime);
           }
       }
+
+      /* Auto-play of the record the user has settled on.
+       *
+       * Decided from the page and the index each pass rather than armed by the
+       * key handlers, for the same reason as the block above: there are five
+       * places that move the browse selection and one of them would eventually
+       * be added without remembering to do this.
+       */
+
+      vs_update_record_audio(&runtime);
 
       /* Input feedback never blocks its action.  SHORT updates the business
        * state immediately and carries its visual overlay onto the resulting
@@ -2753,6 +3218,13 @@ fail:
    */
 
   vs_social_close();
+
+  /* After the session, before the store: the session may have just handed a
+   * file to the player, and the player is reading out of the directory
+   * vs_history_close() is about to forget.
+   */
+
+  vs_tts_close();
   vs_voice_close();
   vs_network_close(network);
   vs_history_close();

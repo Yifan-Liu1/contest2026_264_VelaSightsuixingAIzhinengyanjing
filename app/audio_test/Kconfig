@@ -16,3 +16,29 @@ config LVX_USE_DEMO_CONTEST2026_264_AUDIO_TEST
 		This is a measurement command rather than a player or recorder: the
 		AP configuration has no writable filesystem, so there is nowhere to
 		store a WAV file.
+
+config AUDIO_TEST_OGG_COMPLEXITY
+	int "Opus encoder complexity (0-10)"
+	default 0
+	range 0 10
+	---help---
+		Complexity passed to OPUS_SET_COMPLEXITY by the shared Ogg Opus
+		encoder in audio_test_ogg.c, which both the audio_test command and
+		the VelaSight social session use.
+
+		Deliberately not libopus's own default of 9.  That default assumes
+		a host encoding far faster than realtime; this board does not.
+		Measured 2026-09-07 during a continuous social session, encoding
+		each 2 s chunk took about 3.2 s of dedicated CPU -- the encoder was
+		60% short of keeping up with the microphone, and 45% of the
+		conversation was lost to the capture ring overflowing while it
+		worked.
+
+		0 is the cheapest setting and typically several times faster than
+		9.  What it gives up is rate-distortion efficiency, which matters
+		least in this application: 16 kHz mono speech at 24 kbps on its way
+		to a recogniser, where the alternative is missing half of it.
+
+		Raise it only after measuring that the encoder keeps ahead of the
+		microphone -- the "microphone: ... N bytes dropped" line at the end
+		of a session is the test.

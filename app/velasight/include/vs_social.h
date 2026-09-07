@@ -159,8 +159,48 @@ int vs_social_finalize(uint32_t request_id);
 
 void vs_social_abort(void);
 
-/* True while a session is running, including while it is finalizing.  For the
- * UI to avoid offering a second start, and for shutdown.
+/****************************************************************************
+ * Name: vs_social_retry_finalize
+ *
+ * Description:
+ *   Run the resumable half of a failed finalize again: poll the cloud for the
+ *   minutes, save them, fetch the audio, report.  Non-blocking, and reports
+ *   its outcome through the same SOCIAL_STAGE / SOCIAL_RESULT /
+ *   SOCIAL_FINALIZE_FAILED events as the first attempt, so the UI needs no
+ *   separate handling for a retried session.
+ *
+ *   Only the tail is repeated.  The close itself is not: by the time a retry
+ *   is on offer the cloud has already accepted DELETE /session and handed over
+ *   the msgId its result will appear under, and that msgId keeps answering.
+ *   What failed was reading it, writing the record or fetching the audio, and
+ *   all three are safe to do again.
+ *
+ *   Not available for a finalize that failed before the close was accepted --
+ *   there is no msgId to poll then, and the honest answer is that the
+ *   conversation is gone.  Ask vs_social_can_retry() first, or take -EINVAL as
+ *   the same answer.
+ *
+ * Input Parameters:
+ *   request_id - the id the UI is now waiting on; every event this produces is
+ *                stamped with it
+ *
+ * Returned Value:
+ *   0 when the retry thread started.  -EINVAL when there is nothing to resume,
+ *   -EBUSY when a session or an earlier retry is still running, -EAGAIN when
+ *   the thread could not be created.
+ *
+ ****************************************************************************/
+
+int vs_social_retry_finalize(uint32_t request_id);
+
+/* True when vs_social_retry_finalize() would be accepted.  For the error page,
+ * which has to decide whether to offer the key before the user presses it.
+ */
+
+bool vs_social_can_retry(void);
+
+/* True while a session is running, including while it is finalizing or being
+ * retried.  For the UI to avoid offering a second start, and for shutdown.
  */
 
 bool vs_social_active(void);

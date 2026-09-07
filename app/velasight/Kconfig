@@ -117,6 +117,35 @@ config VS_VOICE_PROMPT_MAX_BYTES
 	range 2048 131072
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 
+config VS_VOICE_TRANSCRIPT_MAX_BYTES
+	int "VelaSight idle assistant social transcript budget (bytes)"
+	default 4096
+	range 0 32768
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How much of a social record's spoken transcript is put in front of
+		the model, as its own message alongside the record reference.
+
+		The transcript is audioTimeline from the end-of-session minutes:
+		one entry per recognised sentence, each with its own timestamps and
+		emotion.  It is the only place the words of a conversation exist --
+		txtMinutes is a summary of it, not a copy -- so without this the
+		assistant can answer "how did it go" but not "what did he say".
+
+		Sized against what a session produces rather than what the prompt
+		could hold.  Rendered one line per sentence and stripped of the
+		fields the model has no use for, a sentence costs roughly 30 bytes
+		against the 164 its JSON does, so 4096 carries something like 130
+		sentences -- about ten minutes of conversation at the density of
+		the sample records.  A longer session is truncated with a line
+		saying how many sentences were dropped, so the model is never left
+		to assume it saw everything.
+
+		Raising this spends prompt budget, which
+		CONFIG_VS_VOICE_PROMPT_MAX_BYTES bounds and the context compactor
+		competes for.  Zero disables the transcript entirely and restores
+		the previous behaviour of sending only the summary.
+
 config VS_VOICE_RESP_MAX_BYTES
 	int "VelaSight idle assistant model response buffer (bytes)"
 	default 32768
@@ -431,7 +460,7 @@ config VS_AUDIO_ADC_GAIN
 
 config VS_AUDIO_CAPTURE_RING_BYTES
 	int "VelaSight capture staging ring (bytes)"
-	default 131072
+	default 262144
 	range 16384 1048576
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
@@ -447,9 +476,32 @@ config VS_AUDIO_CAPTURE_RING_BYTES
 		back holding 12.7 s of audio, and the recognizer saw chopped words.
 
 		This ring is the slack between the two, so a stall costs buffer
-		space instead of audio.  The default is four seconds of 16 kHz mono.
-		If the "capture level" log line ever reports dropped bytes, the
-		consumer fell further behind than this covers.
+		space instead of audio.  If the "microphone" log line at the end of
+		a session reports dropped bytes, the consumer fell further behind
+		than this covers.
+
+		Raised from 131072 (4.1 s) to 262144 (8.2 s of 16 kHz mono) on
+		measurement.  A 74 s social session on 2026-09-07 had the ADC
+		deliver 70.5 s of audio and the ring discard 1009152 bytes of it --
+		31.5 s, 44.8% -- because the drain needed about 4.1 s to encode
+		each 2 s chunk, which is exactly the old ring's capacity, so it sat
+		permanently on the edge of overflowing.
+
+		Not raised further, and that is a deliberate ceiling rather than
+		caution about memory.  A ring is slack for a consumer that is
+		momentarily behind; it cannot help one that is behind on average,
+		and the only thing extra depth buys such a consumer is a longer
+		backlog.  For this session the backlog is audio the cloud has to
+		align against a video timeline, so depth turns "some audio was
+		lost" into "all the audio arrives progressively later than the
+		frames it belongs with" -- which is worse, because it is wrong
+		rather than incomplete.  524288 was tried and is what 16 s of drift
+		looks like.
+
+		8.2 s covers a stall without letting the lag become the problem.
+		Whether the drain keeps up at all is decided elsewhere: by the Opus
+		complexity it runs at (CONFIG_AUDIO_TEST_OGG_COMPLEXITY) and by its
+		priority (VS_PRIORITY_SOCIAL_AUDIO in include/vs_types.h).
 
 # Social-session cloud (app/velasight/vs_cloud.c).
 #
@@ -624,7 +676,7 @@ config VS_SOCIAL_DOWNLOAD_MAX_BYTES
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		Upper bound on the spoken minutes fetched from ttsMinutes and
-		written to CONFIG_VS_SOCIAL_MINUTES_AUDIO_PATH.
+		written beside the record they belong to.
 
 		This is a limit on a file, not on an allocation.  The download
 		streams to storage through one 8 KB transport buffer, so raising
@@ -647,26 +699,6 @@ config VS_SOCIAL_DOWNLOAD_MAX_BYTES
 		Exceeding it is not fatal: the text minutes are already on screen
 		and persisted by then, the partial file is removed, and the audio
 		is skipped with a log line naming this option.
-
-config VS_SOCIAL_MINUTES_AUDIO_PATH
-	string "VelaSight spoken minutes file"
-	default "/mnt/sdnand/ai_agent/minutes.wav"
-	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
-	---help---
-		Where the spoken minutes are written before being played.
-
-		One fixed path rather than one file per session, so it cannot
-		accumulate: each session truncates the last one's audio.  The file
-		is deliberately left in place after playing -- having the last
-		session's WAV on disk is what makes "the voice sounded wrong"
-		something that can be investigated instead of reproduced.
-
-		The parent directory is created if missing.  The default sits
-		beside the history store, which vs_history.c already creates at
-		startup, so on a healthy boot it is there before this runs.
-
-		Whatever filesystem this names has to hold
-		CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES.
 
 config VS_SOCIAL_MINUTES_TEXT_MAX_BYTES
 	int "VelaSight social text minutes download budget (bytes)"
@@ -913,6 +945,135 @@ config VS_SOCIAL_FINALIZE_TIMEOUT_MS
 		observed maximum.  Waiting costs a spinner; timing out early
 		discards minutes the cloud did produce.
 
+config VS_SOCIAL_DOWNLOAD_BLOCK_BYTES
+	int "VelaSight download write block (bytes)"
+	default 32768
+	range 512 262144
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How much of a download is accumulated before it is written to the
+		card.  Must be a multiple of 512; the point of the option is
+		sector alignment and an odd value defeats it.
+
+		This exists because of how two layers meet.  The TLS transport
+		hands the download sink one record at a time -- mbedtls_ssl_read()
+		returns at most one record however large a buffer it is given,
+		about 1.4 KB on a 1500-byte path -- and this filesystem is FAT on
+		SD-NAND with a 1-bit bus, single-block PIO transfers and no write
+		buffer beneath it.  Writing each record straight through therefore
+		straddles 512-byte sectors at both ends, and FAT reads back and
+		rewrites the partial ones; the next record then reads the same
+		trailing sector again.
+
+		Measured 2026-09-07 without aggregation: 114054 bytes took 62.6 s,
+		about 0.77 s per record, 1.8 KB/s.  Uploads to the same host over
+		the same pooled connection in the same session ran near 24 KB/s
+		and write nothing, so the cost was the card rather than the link.
+		It was slow enough that the peer reset the connection at 62 s.
+
+		32768 is 64 sectors.  Larger mostly buys diminishing returns and
+		costs PSRAM for the duration of the transfer; 512 reduces this to
+		the unaggregated behaviour without removing the code path.
+
+config VS_TTS_CHUNK_BYTES
+	int "VelaSight audio playback read block (bytes)"
+	default 65536
+	range 4096 262144
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How much of a WAV file is read per iteration while playing it.
+
+		Sized against the card, not the audio.  The constraint is that a
+		block must be read in less time than it takes to play, or the DAC
+		starves and the listener hears gaps.
+
+		8192 was the original value and is only 250 ms of 16 kHz mono --
+		against storage that measured 0.77 s for a 1.4 KB write, that left
+		no margin at all: the pre-buffer would drain within the first few
+		reads.  65536 is 2 s of the same audio and 128 sectors exactly.
+
+		The cost is reaction time.  A stop is acted on at block
+		boundaries, so the read loop leaves up to one block late -- which
+		nobody hears, because vs_audio_playback_stop() silences the DAC
+		immediately and independently of this loop.
+
+config VS_TTS_PRELOAD_MAX_BYTES
+	int "VelaSight audio preload budget (bytes)"
+	default 1048576
+	range 0 4194304
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Largest spoken-minutes file that is read into memory in full before
+		the speaker is opened.  Larger files are streamed instead.
+
+		This exists because the storage cannot feed realtime audio.
+		Measured 2026-09-07: 199680 bytes took 22467 ms to read, 8.9 KB/s,
+		against the 32 KB/s that 16 kHz 16-bit mono consumes -- the card
+		supplies 28% of what playback needs.  A streamed file therefore
+		underruns by arithmetic rather than by bad luck, and the gaps fall
+		in the middle of the sentence.
+
+		Reading first does not make playback finish sooner and cannot:
+		audio cannot be played faster than it can be read.  What it does is
+		move the waiting to the front, where it is a pause before the
+		summary instead of holes inside it.
+
+		1048576 is 32 s of 16 kHz mono, which covers any minutes this cloud
+		has produced, out of the 6 MB PSRAM heap.  Set to 0 to force
+		streaming everywhere, which is only useful for reproducing the
+		underrun behaviour.
+
+config VS_SOCIAL_FETCH_TIMEOUT_MS
+	int "VelaSight spoken minutes download timeout (ms)"
+	default 90000
+	range 10000 300000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long the finalizing page waits for the spoken minutes to
+		download before treating the transfer as wedged.
+
+		Not enforced by the download itself -- the transport already ends
+		a stalled connection on VS_SOCIAL_IO_TIMEOUT_MS, and a transfer
+		that is merely slow is still progress.  This is the UI's
+		no-progress deadline for that step, and it is deliberately the
+		longest of them: the file's size is not known in advance and it is
+		the one step whose duration scales with how much the other side
+		had to say.
+
+		Sized against measurement rather than guessed.  On 2026-09-07 a
+		138 KB prefix took 16.4 s, and that was with the camera still
+		streaming and taking CPU from the transfer; the camera is now
+		released before this step runs.  90 s covers a file several times
+		that size on a link several times worse.
+
+config VS_HISTORY_TTS_DWELL_MS
+	int "VelaSight history auto-play dwell (ms)"
+	default 2000
+	range 500 10000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long a record has to stay on screen before its spoken minutes
+		start playing.
+
+		The delay is the whole feature.  Browsing is a held key producing
+		a record every couple of hundred milliseconds, and starting audio
+		on arrival would mean a burst of first syllables; starting it only
+		once the user has stopped turns "I am looking at this one" into the
+		trigger.  Every change of selection restarts this and silences
+		whatever was playing.
+
+config VS_TTS_STACKSIZE
+	int "VelaSight audio playback worker stack (bytes)"
+	default 8192
+	range 4096 32768
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		Stack for the thread that reads a WAV file and feeds the DAC.
+
+		Small on purpose: the transfer buffer is drawn from PSRAM rather
+		than kept here, so what is left is a RIFF header parse and a read
+		loop.
+
 config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
 	int "VelaSight social alert confirmation windows"
 	default 3
@@ -941,23 +1102,82 @@ config VS_SOCIAL_ALERT_COOLDOWN_MS
 		appeared and vanished before it could be read would be worse than
 		none, because the user would know something happened and not what.
 
-config VS_SOCIAL_QUEUE_SLOTS
-	int "VelaSight social upload queue depth"
-	default 4
-	range 2 8
+config VS_SOCIAL_AUDIO_QUEUE_SLOTS
+	int "VelaSight social audio upload queue depth (chunks)"
+	default 16
+	range 4 64
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		How many captured items may wait for the uploader.  Full means
-		the oldest is dropped.
+		How many encoded audio chunks may wait for the uploader.
 
-		This is the slack between a fixed capture cadence and a network
-		that is not.  It is small on purpose: each image slot can hold up
-		to 160 KB of PSRAM, and a deep queue would mostly serve to upload
-		frames that are no longer about anything -- the session wants the
-		most recent face, not a backlog.
+		Audio and images used to share one four-slot ring, which meant a
+		burst of frames could evict speech.  They cannot substitute for
+		each other: a dropped frame costs one sample out of a timeline
+		that has many, while a dropped chunk removes those seconds of the
+		conversation from the transcript and from the spoken minutes
+		permanently -- nothing else recorded them.  So audio now has its
+		own queue, and it is deep.
 
-		The "dropped" count in the end-of-session log is how to tell
-		whether this was ever reached.
+		Deep is affordable here precisely because audio is small.  One
+		chunk is CONFIG_VS_SOCIAL_AUDIO_CHUNK_MS of Opus at
+		CONFIG_VS_SOCIAL_AUDIO_BITRATE, about 6 KB for the default two
+		seconds at 24 kbps, so sixteen slots reserve roughly 96 KB of
+		PSRAM worst case and buy 32 seconds of stall tolerance against a
+		producer that emits one chunk every two seconds.
+
+		This is a depth, not a promise.  A stall longer than the depth
+		still drops the oldest chunk, because the alternative is blocking
+		the thread that drains the microphone ring and losing the audio
+		one level lower down where nothing counts it.  Every such drop is
+		logged individually rather than coalesced.
+
+config VS_SOCIAL_IMAGE_QUEUE_SLOTS
+	int "VelaSight social image upload queue depth (frames)"
+	default 2
+	range 1 8
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many captured frames may wait for the uploader.  Full means
+		the oldest is dropped and the sampler slows down.
+
+		Deliberately shallow, and shallower than the four slots images
+		used to share with audio.  Each slot can hold 160 KB of PSRAM,
+		and an emotion result is about the moment it was sampled: a queue
+		that holds a backlog spends the uplink on faces that have stopped
+		being current.  Two slots means what reaches the cloud is the
+		newest frame plus at most one predecessor.
+
+		Overflow is not only absorbed here, it is fed back:
+		CONFIG_VS_SOCIAL_IMAGE_INTERVAL_MAX_MS describes how far the
+		sampler backs off when this fills.
+
+config VS_SOCIAL_IMAGE_INTERVAL_MAX_MS
+	int "VelaSight social image sampling floor when the queue backs up (ms)"
+	default 2000
+	range 500 5000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		The slowest the image sampler will go, in milliseconds between
+		frames.  2000 is 0.5 fps.
+
+		CONFIG_VS_SOCIAL_IMAGE_INTERVAL_MS is the other end: the fastest,
+		and where a session starts.  Between them the sampler moves
+		itself.  A frame dropped for a full queue doubles the interval; a
+		run of frames that uploaded without a drop shortens it again in
+		smaller steps.  Backing off multiplicatively and recovering
+		additively is the same shape as TCP congestion control and for
+		the same reason -- overshooting the link's capacity should be
+		expensive to do and cheap to undo.
+
+		What this buys is not throughput, it is freshness.  Sampling
+		faster than the uplink can carry does not deliver more frames, it
+		delivers the same number with a backlog in front of them, so every
+		frame the cloud sees is older than it had to be.  Matching the
+		sampler to the link keeps the newest frame the one being sent.
+
+		Raising this lets a bad link degrade further before frames are
+		lost outright; lowering it toward
+		CONFIG_VS_SOCIAL_IMAGE_INTERVAL_MS disables the adaptation.
 
 config VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS
 	int "VelaSight social upload backoff floor (ms)"

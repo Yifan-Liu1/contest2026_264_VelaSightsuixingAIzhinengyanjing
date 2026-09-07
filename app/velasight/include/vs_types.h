@@ -56,6 +56,47 @@
 
 #define VS_PRIORITY_SOCIAL (SCHED_PRIORITY_DEFAULT - 5)
 
+/* The one social thread that cannot sit below the UI: the microphone drain.
+ *
+ * The other three produce or send data that is worth less the older it gets, so
+ * being late costs a dropped frame and nothing more.  This one is the consumer
+ * of a fixed-size staging ring that vs_audio.c's own capture thread fills at
+ * VS_PRIORITY_AUDIO -- ten above the UI -- and a consumer below a producer is
+ * an inversion with only one outcome: the ring overflows and the samples are
+ * gone.
+ *
+ * Measured 2026-09-07 at VS_PRIORITY_SOCIAL: a 74 s session had 70.5 s of audio
+ * delivered by the ADC and 1009152 bytes -- 31.5 s, 44.8% of it -- discarded by
+ * the ring, because the drain only managed a 48.6% duty cycle against the three
+ * other threads at its own level plus the UI above it.  Half the conversation
+ * never reached the encoder, and what did reach it had the two sides of each
+ * hole spliced into one chunk.
+ *
+ * Above the other social threads but still below the UI, and the second half of
+ * that is not a preference -- it is what keeps the device usable.
+ *
+ * The first attempt put this at VS_PRIORITY_AUDIO - 1, one below the producer
+ * and nine above the UI, on the reasoning that a drain should outrank what it
+ * drains into.  That reasoning is sound only for a consumer that finishes its
+ * work and blocks.  This one does not: the encode costs more wall time than the
+ * audio it consumes, so with the ring never empty it never reaches the -EAGAIN
+ * that makes it sleep, and at a priority above the UI that is a device that
+ * stops responding.
+ *
+ * Measured 2026-09-07 at +9: the session ran 46 s with no frame grabbed, no
+ * upload issued and no key or repaint serviced, then began emitting one
+ * "AUDIO DROPPED, queue of 16 full" every 3.2 s forever -- the encoder still
+ * producing at the only priority that could run, into a ring whose consumer
+ * was starved.  Raising the priority converted a 45% audio loss into a hang.
+ *
+ * So: two steps above the other three social workers, which is the advantage
+ * that was actually wanted, and three below the UI, which no worker may
+ * outrank.  A consumer that cannot keep up now falls behind visibly instead of
+ * taking the screen with it.
+ */
+
+#define VS_PRIORITY_SOCIAL_AUDIO (VS_PRIORITY_SOCIAL + 2)
+
 /* Key sampling.  Above the UI so a press is timestamped promptly, below the
  * audio path because 5 ms of jitter in a debounce window is invisible.
  */

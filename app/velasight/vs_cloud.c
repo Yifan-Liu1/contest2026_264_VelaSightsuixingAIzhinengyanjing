@@ -4266,6 +4266,35 @@ out:
 
 #define CLOUD_DOWNLOAD_REPORT_STRIDE (128 * 1024)
 
+/* How much body is accumulated before it is written to the card.
+ *
+ * This exists because of how the two layers below meet.  The transport hands
+ * the sink one TLS record at a time -- mbedtls_ssl_read() returns at most one
+ * record however large a buffer it is given, which on a 1500-byte path is
+ * about 1.4 KB -- and this filesystem is FAT on SD-NAND configured for 1-bit
+ * PIO single-block transfers with no write buffer under it
+ * (CONFIG_SDIO_WIDTH_D1_ONLY, CONFIG_MMCSD_MULTIBLOCK_LIMIT=1, no
+ * CONFIG_DRVR_WRITEBUFFER).  So a 1.4 KB write straddles 512-byte sectors at
+ * both ends, and FAT reads-modifies-writes each partial one -- then the next
+ * record's write reads the same trailing sector back and rewrites it.
+ *
+ * Measured 2026-09-07 without this: 114054 bytes took 62.6 s, about 0.77 s per
+ * record, 1.8 KB/s.  Uploads to the same host on the same pooled connection in
+ * the same session ran at roughly 24 KB/s, and they write nothing -- so the
+ * cost was the card, not the link.  The transfer was slow enough that the peer
+ * gave up on it: the failure was MBEDTLS_ERR_NET_RECV_FAILED at 62 s, a reset
+ * rather than a local timeout.
+ *
+ * A multiple of 512 is the whole point: every flush is then sector-aligned and
+ * sector-sized, so no partial sector is ever read back to be modified.  32 KB
+ * is 64 sectors, which is enough that the per-write overhead disappears into
+ * the transfer while staying small enough to draw from PSRAM once per download.
+ */
+
+#ifndef CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES 32768
+#endif
+
 struct cloud_file_sink_s
 {
   int fd;
@@ -4274,23 +4303,38 @@ struct cloud_file_sink_s
   size_t next_report;
   bool over;   /* refused because the budget was reached */
   int err;     /* errno from write(), 0 when there was none */
-};
 
-static int cloud_file_sink(void *arg, const void *data, size_t len)
-{
-  struct cloud_file_sink_s *sink = arg;
-  const unsigned char *p = data;
-  size_t off = 0;
-
-  /* Checked before writing, not after.  Stopping once the file is already too
-   * large would still have spent the storage.
+  /* The aggregation buffer.  NULL is a supported state and means "write every
+   * record straight through", which is what happens when PSRAM could not spare
+   * the block -- slow, but a slow download beats a failed one.
    */
 
-  if (sink->written + len > sink->max_bytes)
-    {
-      sink->over = true;
-      return -1;
-    }
+  unsigned char *buf;
+  size_t cap;
+  size_t fill;
+  bool buf_psram;
+
+  /* Counted so the log can say whether aggregation actually happened.  A
+   * download whose throughput is still bad with a low write count is a network
+   * problem; the same throughput with a write count near the record count says
+   * the buffer was not in play.
+   */
+
+  unsigned int writes;
+};
+
+/****************************************************************************
+ * Name: cloud_file_write_all
+ *
+ * Description:
+ *   write() that either places every byte or says why it could not.
+ *
+ ****************************************************************************/
+
+static int cloud_file_write_all(struct cloud_file_sink_s *sink,
+                                const unsigned char *p, size_t len)
+{
+  size_t off = 0;
 
   while (off < len)
     {
@@ -4318,6 +4362,84 @@ static int cloud_file_sink(void *arg, const void *data, size_t len)
         }
 
       off += (size_t)n;
+    }
+
+  sink->writes++;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: cloud_file_flush
+ *
+ * Description:
+ *   Put whatever is buffered on the card.  Called when the buffer fills and
+ *   once more for the tail; safe when nothing is buffered.
+ *
+ ****************************************************************************/
+
+static int cloud_file_flush(struct cloud_file_sink_s *sink)
+{
+  size_t fill = sink->fill;
+
+  if (fill == 0)
+    {
+      return 0;
+    }
+
+  /* Cleared before the write rather than after, so a failure cannot leave the
+   * same bytes queued for a second attempt from the tail flush.
+   */
+
+  sink->fill = 0;
+  return cloud_file_write_all(sink, sink->buf, fill);
+}
+
+static int cloud_file_sink(void *arg, const void *data, size_t len)
+{
+  struct cloud_file_sink_s *sink = arg;
+  const unsigned char *p = data;
+  size_t remaining = len;
+
+  /* Checked before writing, not after.  Stopping once the file is already too
+   * large would still have spent the storage.
+   */
+
+  if (sink->written + len > sink->max_bytes)
+    {
+      sink->over = true;
+      return -1;
+    }
+
+  if (sink->buf == NULL)
+    {
+      if (cloud_file_write_all(sink, p, len) < 0)
+        {
+          return -1;
+        }
+    }
+  else
+    {
+      while (remaining > 0)
+        {
+          size_t room = sink->cap - sink->fill;
+          size_t take = remaining < room ? remaining : room;
+
+          memcpy(sink->buf + sink->fill, p, take);
+          sink->fill += take;
+          p += take;
+          remaining -= take;
+
+          /* Only a full buffer is flushed here.  The tail is left for
+           * vs_cloud_download_to_file(), which knows the transfer is over --
+           * flushing a partial buffer mid-stream would reintroduce exactly the
+           * unaligned write this exists to avoid.
+           */
+
+          if (sink->fill == sink->cap && cloud_file_flush(sink) < 0)
+            {
+              return -1;
+            }
+        }
     }
 
   sink->written += len;
@@ -4357,9 +4479,27 @@ int vs_cloud_download_to_file(const char *url, const char *path,
   sink.max_bytes = max_bytes;
   sink.next_report = CLOUD_DOWNLOAD_REPORT_STRIDE;
 
+  /* The write aggregation buffer.  Optional by design: cloud_file_sink() falls
+   * back to writing each record straight through when this is NULL, which is
+   * slow but still correct.  See CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES.
+   */
+
+  sink.buf = cloud_alloc(CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES,
+                         &sink.buf_psram);
+  if (sink.buf != NULL)
+    {
+      sink.cap = CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES;
+    }
+  else
+    {
+      printf("%s: no %d byte download buffer, writing unaggregated\n",
+             CLOUD_TAG, CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES);
+    }
+
   parsed = cloud_alloc(sizeof(*parsed), &parsed_psram);
   if (parsed == NULL)
     {
+      cloud_free(sink.buf, sink.buf_psram);
       return -ENOMEM;
     }
 
@@ -4399,6 +4539,21 @@ int vs_cloud_download_to_file(const char *url, const char *path,
   http = cloud_http_ex(parsed, "GET", NULL, NULL, 0, scratch,
                        CONFIG_VS_SOCIAL_REG_RESP_BYTES, NULL,
                        cloud_file_sink, &sink);
+
+  /* The tail, before the close that would otherwise discard it.
+   *
+   * Only when the transfer itself succeeded: on a failure the file is about to
+   * be unlinked, so writing the last partial block would be paying for storage
+   * that is being thrown away -- and on the -EFBIG path it would push the file
+   * past the budget that just rejected it.
+   */
+
+  if (http >= 200 && http < 300 && !sink.over && sink.err == 0 &&
+      cloud_file_flush(&sink) < 0)
+    {
+      printf("%s: writing the last block of %s failed: %d\n", CLOUD_TAG, path,
+             sink.err);
+    }
 
   close(sink.fd);
   sink.fd = -1;
@@ -4456,6 +4611,14 @@ int vs_cloud_download_to_file(const char *url, const char *path,
       *len = sink.written;
     }
 
+  /* The write count is the evidence that aggregation happened.  Without it a
+   * slow download cannot be attributed: this many writes for this many bytes
+   * says whether the card or the link was the limit.
+   */
+
+  printf("%s: %s written in %u write(s) of up to %zu bytes\n", CLOUD_TAG, path,
+         sink.writes, sink.cap != 0 ? sink.cap : sink.written);
+
   ret = 0;
   goto out;
 
@@ -4473,6 +4636,7 @@ out:
       close(sink.fd);
     }
 
+  cloud_free(sink.buf, sink.buf_psram);
   cloud_free(scratch, scratch_psram);
   cloud_free(parsed, parsed_psram);
   return ret;

@@ -11,6 +11,7 @@
 #include "include/vs_cloud.h"
 #include "include/vs_history.h"
 #include "include/vs_social.h"
+#include "include/vs_tts.h"
 
 /****************************************************************************
  * Name: velasight_event_name
@@ -118,6 +119,12 @@ static int velasight_social_probe(unsigned int seconds)
 
   vs_history_open();
 
+  /* The player, so this command exercises the same path the UI does rather
+   * than the same path minus its audio.
+   */
+
+  (void)vs_tts_open();
+
   ret = vs_cloud_init();
   if (ret < 0 && ret != -ENODATA)
     {
@@ -222,8 +229,24 @@ static int velasight_social_probe(unsigned int seconds)
       elapsed += 200;
     }
 
+  /* Let the spoken minutes finish before tearing anything down.
+   *
+   * Before vs_social_close(), not after: that call aborts the session, and an
+   * abort stops playback.  The session thread posts its result and only then
+   * hands the file to the player, so a short settle comes first -- otherwise
+   * the loop below can look at a player that has not been asked to do anything
+   * yet and conclude there is nothing to wait for.
+   */
+
+  usleep(500000);
+  while (vs_tts_busy())
+    {
+      usleep(200000);
+    }
+
   vs_social_close();
   (void)velasight_drain_events();
+  vs_tts_close();
 
   if (terminal == VS_APP_EVENT_SOCIAL_RESULT)
     {

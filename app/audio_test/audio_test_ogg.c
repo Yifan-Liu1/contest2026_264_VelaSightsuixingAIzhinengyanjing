@@ -58,6 +58,16 @@
  * it is exactly 320 samples.
  */
 
+/* Opus encoder complexity, 0..10.  See where it is applied for why this board
+ * cannot afford libopus's default of 9.
+ */
+
+#ifndef CONFIG_AUDIO_TEST_OGG_COMPLEXITY
+#  define CONFIG_AUDIO_TEST_OGG_COMPLEXITY 0
+#endif
+
+#define AUDIO_TEST_OGG_COMPLEXITY CONFIG_AUDIO_TEST_OGG_COMPLEXITY
+
 #define OGG_FRAME_MS            20
 
 /* Largest packet Opus can emit for one frame. */
@@ -689,6 +699,25 @@ void *audio_test_ogg_encoder_create(unsigned int rate, unsigned int bitrate,
   opus_encoder_ctl(h->enc, OPUS_SET_BITRATE((opus_int32)bitrate));
   opus_encoder_ctl(h->enc, OPUS_SET_VBR(1));
   opus_encoder_ctl(h->enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+
+  /* Complexity, which nothing used to set -- so it ran at libopus's default of
+   * 9, the second most expensive setting there is.
+   *
+   * That default assumes a host that encodes far faster than realtime.  This
+   * one does not: measured 2026-09-07, a continuous social session needed about
+   * 3.2 s of dedicated CPU to encode each 2 s chunk, so the encoder alone was
+   * 60% short of keeping up with the microphone and 45% of the conversation was
+   * lost to the staging ring overflowing.
+   *
+   * 0 is the cheapest setting and typically several times faster than 9.  What
+   * it costs is rate-distortion efficiency, which matters least here of
+   * anywhere: this is 16 kHz mono speech at 24 kbps being sent to a recogniser,
+   * not music for a listener, and the alternative on offer is missing half of
+   * it.
+   */
+
+  opus_encoder_ctl(h->enc,
+                   OPUS_SET_COMPLEXITY(AUDIO_TEST_OGG_COMPLEXITY));
   opus_encoder_ctl(h->enc, OPUS_GET_LOOKAHEAD(&h->lookahead));
 
   return h;

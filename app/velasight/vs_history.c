@@ -64,6 +64,14 @@
 #define VS_HISTORY_KEY_FMT    "R%07u"
 #define VS_HISTORY_BODY_FMT   "%s/R%07u.JSN"
 #define VS_HISTORY_BODY_TMP   "%s/R%07u.TMP"
+
+/* The spoken minutes that belong to a record, filed beside its body under the
+ * same stem.  Not part of the record itself: the body is the cloud's JSON and
+ * has to stay byte-for-byte what the protocol returned, and a WAV has no place
+ * in it.  Sharing the stem is what lets eviction find and remove it.
+ */
+
+#define VS_HISTORY_AUDIO_FMT  "%s/R%07u.WAV"
 #define VS_HISTORY_INDEX_MAX  \
   ((size_t)CONFIG_VS_HISTORY_MAX_RECORDS * 1024u + 2u)
 #define VS_HISTORY_SEQ_PROBES \
@@ -283,6 +291,13 @@ static void vs_history_body_path(enum vs_history_kind_e kind,
   snprintf(path, path_len,
            temporary ? VS_HISTORY_BODY_TMP : VS_HISTORY_BODY_FMT,
            g_history_dir[kind], seq);
+}
+
+static void vs_history_audio_path_locked(enum vs_history_kind_e kind,
+                                         unsigned int seq, char *path,
+                                         size_t path_len)
+{
+  snprintf(path, path_len, VS_HISTORY_AUDIO_FMT, g_history_dir[kind], seq);
 }
 
 static void vs_history_index_path(enum vs_history_kind_e kind,
@@ -1114,6 +1129,7 @@ int vs_history_append(enum vs_history_kind_e kind,
   char temporary[VS_HISTORY_PATH_MAX];
   char destination[VS_HISTORY_PATH_MAX];
   char evicted_path[VS_HISTORY_PATH_MAX];
+  char evicted_audio[VS_HISTORY_PATH_MAX];
   cJSON *body;
   unsigned int old_count;
   unsigned int new_count;
@@ -1170,6 +1186,7 @@ int vs_history_append(enum vs_history_kind_e kind,
     }
 
   evicted_path[0] = '\0';
+  evicted_audio[0] = '\0';
   if (evict)
     {
       unsigned int evicted_seq;
@@ -1179,6 +1196,16 @@ int vs_history_append(enum vs_history_kind_e kind,
         {
           vs_history_body_path(kind, evicted_seq, false, evicted_path,
                                sizeof(evicted_path));
+
+          /* The audio sidecar goes with it.  Nothing outside this file knows
+           * a record was evicted, so if this is not done here the WAV becomes
+           * an orphan that nothing will ever look at or delete -- and at a few
+           * hundred KB each, sixty-four of those are the whole point of having
+           * a retention limit.
+           */
+
+          vs_history_audio_path_locked(kind, evicted_seq, evicted_audio,
+                                       sizeof(evicted_audio));
         }
     }
 
@@ -1218,12 +1245,52 @@ int vs_history_append(enum vs_history_kind_e kind,
       vs_history_sync_dir(g_history_dir[kind]);
     }
 
+  /* Same treatment for the audio, and the same reason for tolerating ENOENT:
+   * most records never had one.
+   */
+
+  if (evicted_audio[0] != '\0' && unlink(evicted_audio) < 0 &&
+      errno != ENOENT)
+    {
+      printf("vs_history: could not remove evicted audio %s: %d\n",
+             evicted_audio, -errno);
+    }
+
   ret = 0;
 
 out_unlock:
   pthread_mutex_unlock(&g_history_lock);
   free(candidate);
   return ret;
+}
+
+int vs_history_audio_path(enum vs_history_kind_e kind,
+                          const char *record_key, char *path, size_t len)
+{
+  char scratch[VS_HISTORY_PATH_MAX];
+  unsigned int seq;
+
+  if (!vs_history_kind_valid(kind) || path == NULL || len == 0 ||
+      vs_history_key_parse(record_key, &seq) < 0)
+    {
+      return -EINVAL;
+    }
+
+  /* Formatted into a local of the store's own width first, so a caller with a
+   * shorter buffer is told its buffer is too small rather than handed a
+   * truncated path that names a different file -- or, worse, names the record
+   * body it was derived from.
+   */
+
+  vs_history_audio_path_locked(kind, seq, scratch, sizeof(scratch));
+
+  if (strlen(scratch) >= len)
+    {
+      return -ENAMETOOLONG;
+    }
+
+  snprintf(path, len, "%s", scratch);
+  return 0;
 }
 
 void vs_history_close(void)
