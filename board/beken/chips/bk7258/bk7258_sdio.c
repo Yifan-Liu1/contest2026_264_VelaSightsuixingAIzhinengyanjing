@@ -182,17 +182,31 @@ static uint32_t sdio_write_status(uint32_t status)
          BK7258_SDIO_WRITE_STATUS_SHIFT;
 }
 
+/* Wait for the card's CRC status token after a block write.
+ *
+ * Called from sdio_interrupt(), so the bound matters: this used to be 1000
+ * undelayed register reads, which is bounded in iterations but not in any unit
+ * anyone can reason about -- the time it holds the CPU in interrupt context
+ * depends on bus timing and on what the compiler did with the loop.  A
+ * microsecond bound says what it costs.  The token itself is eight SD clocks
+ * behind the data block, which is 0.3 us at the 26 MHz transfer clock, so the
+ * budget below is several thousand times what a healthy card needs and only
+ * ever runs down when something is wrong.
+ */
+
 static bool sdio_write_accepted(FAR uint32_t *status)
 {
   unsigned int retry;
 
-  for (retry = 0; retry < 1000; retry++)
+  for (retry = 0; retry < BK7258_SDIO_WRITE_STATUS_US; retry++)
     {
       *status = sdio_read(BK7258_SDIO_INT_STATUS);
       if (sdio_write_status(*status) == BK7258_SDIO_WRITE_STATUS_ACCEPTED)
         {
           return true;
         }
+
+      up_udelay(1);
     }
 
   return false;
@@ -200,7 +214,8 @@ static bool sdio_write_accepted(FAR uint32_t *status)
 
 static int sdio_fill_tx_fifo(FAR struct bk7258_sdio_s *priv)
 {
-  unsigned int timeout;
+  clock_t deadline = clock_systime_ticks() +
+                     MSEC2TICK(BK7258_SDIO_FILL_TIMEOUT_MS);
 
   while (priv->remaining != 0)
     {
@@ -208,15 +223,13 @@ static int sdio_fill_tx_fifo(FAR struct bk7258_sdio_s *priv)
       size_t copy = priv->remaining < sizeof(word) ? priv->remaining :
                     sizeof(word);
 
-      timeout = 100000;
       while ((sdio_read(BK7258_SDIO_FIFO) & BK7258_SDIO_TX_READY) == 0)
         {
-          if (timeout == 0)
+          if ((int32_t)(clock_systime_ticks() - deadline) >= 0)
             {
               return -ETIMEDOUT;
             }
 
-          timeout--;
           up_udelay(1);
         }
 
@@ -310,6 +323,7 @@ static int sdio_interrupt(int irq, FAR void *context, FAR void *arg)
 static int sdio_wait_command(struct bk7258_sdio_s *priv, uint32_t cmd)
 {
   clock_t deadline = clock_systime_ticks() + MSEC2TICK(1000);
+  unsigned int spins = BK7258_SDIO_CMD_SPIN_US;
   uint32_t status;
 
   for (;;)
@@ -330,12 +344,37 @@ static int sdio_wait_command(struct bk7258_sdio_s *priv, uint32_t cmd)
           return -ETIMEDOUT;
         }
 
-      /* At transfer speed the RX FIFO can fill before a 100 us sleep
-       * expires.  Keep the PIO loop tight while data is active; otherwise a
-       * 512-byte sector consistently overflows after the first 256 bytes. */
-      if (!priv->data_active)
+      /* At transfer speed the RX FIFO can fill before a sleep expires.  Keep
+       * the PIO loop tight while data is active; otherwise a 512-byte sector
+       * consistently overflows after the first 256 bytes.
+       *
+       * With no data phase this used to be nxsig_usleep(100).  That could not
+       * do what it said: CONFIG_USEC_PER_TICK is 1000, clock_time2ticks()
+       * rounds up and clock_delay2abstick() adds another tick, so 100 us was
+       * always about 2 ms.  Every command with no data phase paid it --
+       * CMD13, CMD16, CMD24 -- and two of them are what set the poll
+       * granularity of mmcsd_transferready(), the loop that gives up after
+       * exactly one second.
+       *
+       * Poll without yielding for as long as a command can legitimately take,
+       * then fall back to a whole-tick sleep.  The fast path is now
+       * microseconds instead of milliseconds, and a card that has stopped
+       * answering still costs almost no CPU while the 1 s deadline runs down.
+       */
+
+      if (priv->data_active)
         {
-          nxsig_usleep(100);
+          continue;
+        }
+
+      if (spins != 0)
+        {
+          spins--;
+          up_udelay(1);
+        }
+      else
+        {
+          nxsig_usleep(1000);
         }
     }
 
@@ -635,10 +674,14 @@ static int sdio_recvsetup(FAR struct sdio_dev_s *dev, FAR uint8_t *buffer,
               BK7258_SDIO_DATA_TIMEOUT);
   sdio_write(BK7258_SDIO_DATA_CTRL, value | BK7258_SDIO_DATA_ENABLE);
 
-  /* The vendor card driver requires this settling interval after starting
-   * the receive engine; without it the receive-end event can be missed. */
+  /* Let the receive engine settle before the caller issues CMD17; without an
+   * interval here the receive-end event can be missed.  A busy wait rather
+   * than nxsig_usleep(2000), which really slept about 3 ms on this 1 ms tick
+   * and would otherwise have dominated a sector read at transfer speed.  See
+   * BK7258_SDIO_RX_SETTLE_US for how the figure was chosen.
+   */
 
-  nxsig_usleep(2000);
+  up_udelay(BK7258_SDIO_RX_SETTLE_US);
   return OK;
 }
 
