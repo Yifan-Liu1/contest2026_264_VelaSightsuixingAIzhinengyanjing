@@ -387,11 +387,23 @@ config BK7258_JPEG_BITRATE_PCT
 		50 KB/30 KB at 1280x720 (jpeg_hal.c), and 100 leaves them exactly
 		as they are.
 
+		480x480 -- this board's default capture geometry -- has no vendor
+		band and uses 20 KB/5 KB, picked to bracket its ~17 KB natural
+		frame rather than sit above it. See
+		bk7258_jpeg_enc_set_target_bitrate().
+
 		Every byte the encoder emits is a byte the DMA moves, the EOF
 		handler copies out of the drain ring and the validator walks, so
 		this is the one setting that shortens all three together. It pays
 		for that in picture quality, which is why it defaults to the
 		vendor's numbers.
+
+		Note what lowering this means at 480x480: the window already
+		brackets the natural frame length, so anything below 100 pushes the
+		ceiling under what the geometry produces on its own, and the rate
+		control starts genuinely compressing harder instead of leaving the
+		frame alone. That is the intended way to go smaller than ~17 KB,
+		but unlike the 480 band itself it is not free.
 
 endif
 

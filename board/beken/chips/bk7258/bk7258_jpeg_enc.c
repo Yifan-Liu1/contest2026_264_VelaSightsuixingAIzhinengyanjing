@@ -179,15 +179,21 @@
 #define JPEG_QUANT_TABLE                 JPEG_REG(0x20)
 #define JPEG_QUANT_TABLE_LEN             32u
 
-/* Rate-control byte window per resolution band, verbatim from
- * jpeg_hal.c's JPEG_BITRATE_{MAX,MIN}_SIZE_* macros and the x_pixel
- * switch in jpeg_hal_set_target_bitrate().  x_pixel is width/8, so the
- * band boundaries are 40/80/160/200 == 320/640/1280/1600 pixels wide
- * (X_PIXEL_* in ap/include/driver/jpeg_enc_types.h).
+/* Rate-control byte window per resolution band.  The 320/640/1280 bands
+ * are verbatim from jpeg_hal.c's JPEG_BITRATE_{MAX,MIN}_SIZE_* macros and
+ * the x_pixel switch in jpeg_hal_set_target_bitrate(); x_pixel is
+ * width/8, so those band boundaries are 40/80/160/200 == 320/640/1280/1600
+ * pixels wide (X_PIXEL_* in ap/include/driver/jpeg_enc_types.h).
+ *
+ * The 480 band has no vendor counterpart -- see
+ * bk7258_jpeg_enc_set_target_bitrate() for why one is needed here and
+ * where these two numbers come from.
  */
 
 #define JPEG_BITRATE_MAX_320             (20u * 1024u)
 #define JPEG_BITRATE_MIN_320             (5u * 1024u)
+#define JPEG_BITRATE_MAX_480             (20u * 1024u)
+#define JPEG_BITRATE_MIN_480             (5u * 1024u)
 #define JPEG_BITRATE_MAX_640             (35u * 1024u)
 #define JPEG_BITRATE_MIN_640             (20u * 1024u)
 #define JPEG_BITRATE_MAX_1280            (50u * 1024u)
@@ -198,6 +204,7 @@
 #endif
 
 #define JPEG_X_PIXEL_320                 40u
+#define JPEG_X_PIXEL_480                 60u
 #define JPEG_X_PIXEL_640                 80u
 #define JPEG_X_PIXEL_1280                160u
 #define JPEG_X_PIXEL_1600                200u
@@ -368,14 +375,47 @@ static void bk7258_jpeg_enc_write_quant_table(void)
  *
  * Description:
  *   Programs the rate-control byte window for the given x_pixel
- *   (= width / 8), reproducing jpeg_hal_set_target_bitrate()'s switch
- *   exactly -- including its behaviour for widths it does not name: the
- *   vendor switch matches x_pixel only against 40/80/160/200, and every
- *   other value (e.g. 1920/8 = 240, or 864/8 = 108) falls into the
- *   default case, which uses the 640-wide window.  That is intentional
- *   here: a "wider than 1280 gets the 1280 window" generalisation would
- *   be a behaviour change relative to the reference, and the byte
- *   windows have not been characterised on this board.
+ *   (= width / 8).
+ *
+ *   The 320/640/1280/1600 cases reproduce
+ *   jpeg_hal_set_target_bitrate()'s switch exactly, including its
+ *   behaviour for widths it does not name: the vendor switch matches
+ *   x_pixel only against 40/80/160/200, and every other value (e.g.
+ *   1920/8 = 240, or 864/8 = 108) falls into the default case, which uses
+ *   the 640-wide window.  That is kept deliberately: a "wider than 1280
+ *   gets the 1280 window" generalisation would be a behaviour change
+ *   relative to the reference, and those byte windows have not been
+ *   characterised on this board.
+ *
+ *   480 is the one deliberate deviation from the vendor switch.  It is
+ *   this board's default capture geometry -- both the still-photo and the
+ *   social-session upload paths ask for 480x480 -- and 480/8 = 60 is not
+ *   one of the vendor's bands, so it used to land in the default case and
+ *   be rate-controlled against the 640 window (35 KB/20 KB).  That window
+ *   is wrong for this geometry in both directions, and which way it goes
+ *   wrong depends on scene content:
+ *
+ *     - A frame that naturally encodes below the 20 KB floor (~17 KB has
+ *       been measured on a low-detail scene) makes the rate control raise
+ *       quality to reach a floor the geometry cannot hold, overshoot to
+ *       49-65 KB and fall back, oscillating frame to frame.  That made
+ *       480x480 slower than 640x480 -- 17.4-17.9 fps vs 24.4-29.2 fps --
+ *       because the extra ~40 KB on every other frame still has to be
+ *       copied out of the drain ring, staged and re-aligned.  It also left
+ *       the size of a single still upload undefined: 17 KB or 65 KB
+ *       depending on which phase it was taken in.
+ *
+ *     - A frame that naturally lands inside 20-35 KB (30 frames measured
+ *       at 26.1-26.8 KB on a more detailed scene) sits in the window and
+ *       is left alone, so the ceiling is 35 KB for a geometry whose own
+ *       output is well under that.
+ *
+ *   The 480 band therefore reuses the vendor's 320 window (20 KB/5 KB):
+ *   the low floor stops the rate control inventing quality to reach it,
+ *   and the 20 KB ceiling is a bound this geometry can actually be held
+ *   to.  Both effects shrink the frame, but by a scene-dependent amount,
+ *   so this is a change of target rather than a fixed byte saving.  Use
+ *   CONFIG_BK7258_JPEG_BITRATE_PCT to scale the band from here.
  *
  ****************************************************************************/
 
@@ -389,6 +429,11 @@ static void bk7258_jpeg_enc_set_target_bitrate(uint32_t x_pixel)
       case JPEG_X_PIXEL_320:
         up_size  = JPEG_BITRATE_MAX_320;
         low_size = JPEG_BITRATE_MIN_320;
+        break;
+
+      case JPEG_X_PIXEL_480:
+        up_size  = JPEG_BITRATE_MAX_480;
+        low_size = JPEG_BITRATE_MIN_480;
         break;
 
       case JPEG_X_PIXEL_1280:
