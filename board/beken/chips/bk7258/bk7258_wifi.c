@@ -681,6 +681,33 @@ static void wifi_set_carrier(bool carrier)
     }
 }
 
+/* Publish a carrier change to the network stack, but never wait for the
+ * device lock to do it.
+ *
+ * netdev_lower_carrier_on/off() take the netdev's d_lock, and
+ * netdev_ifr_ioctl() holds that same lock across the whole of SIOCSIFFLAGS --
+ * which means across the whole of wifi_ifdown() and therefore across
+ * wifi_stop_active_role().  That function blocks waiting for a CP
+ * confirmation, and wifi_worker() is the only thread that can deliver one.
+ * So a blocking acquire here parks the very thread the ifdown is waiting on:
+ * both wifi_command() calls in the stop path time out, ifdown reports
+ * -ETIMEDOUT after 2 x WIFI_COMMAND_TIMEOUT, and the first STA -> SoftAP
+ * switch after boot fails every time.  It is the first switch specifically
+ * because it is the only one that both starts from a carrier and has to stop
+ * a running role, so it is the only one that creates the pending
+ * notification.
+ *
+ * A contended lock leaves the change pending instead.  The claim on
+ * carrier_notified is still taken up front, so two callers can never race and
+ * report opposite states in the wrong order; it is only handed back -- using
+ * the same "!carrier" idiom bk7258_wifi_initialize() uses to force the first
+ * notification -- when the lock was not free.  The worker loop runs at least
+ * every WIFI_WORK_INTERVAL, so a deferral costs one tick period.  d_lock is
+ * recursive, so holding it over the lowerhalf call below is free and keeps
+ * this on the documented API rather than reaching for netdev_carrier_off()
+ * directly.
+ */
+
 static void wifi_notify_carrier(void)
 {
   bool carrier;
@@ -696,6 +723,17 @@ static void wifi_notify_carrier(void)
   g_wifi.carrier_notified = carrier;
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
 
+  if (netdev_trylock(&g_wifi.lower.netdev) < 0)
+    {
+      flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
+      if (g_wifi.carrier_notified == carrier)
+        {
+          g_wifi.carrier_notified = !carrier;
+        }
+      rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
+      return;
+    }
+
   if (carrier)
     {
       netdev_lower_carrier_on(&g_wifi.lower);
@@ -704,6 +742,8 @@ static void wifi_notify_carrier(void)
     {
       netdev_lower_carrier_off(&g_wifi.lower);
     }
+
+  netdev_unlock(&g_wifi.lower.netdev);
 }
 
 static uint8_t wifi_role_vif(enum wifi_role role)
@@ -2481,6 +2521,29 @@ static int wifi_stop_active_role(void)
           return OK;
         }
     }
+
+  if (ret == -ETIMEDOUT)
+    {
+      /* The CP never confirmed the stop within the bound.  Leaving the role
+       * in WIFI_ROLE_STOPPING looks like the conservative choice, but it is
+       * the one state nothing can leave: this function answers -EBUSY on
+       * every later attempt and so does wifi_connect(), so a single missed
+       * confirmation used to make wlan0 unusable until the next reboot.
+       *
+       * Everything local to the stop has already happened -- tx_gate closed,
+       * carrier off, the CP told to stop -- so let the role go idle and say
+       * that it was not confirmed.  wifi_role_deactivate() bumps role_epoch
+       * with it, so a confirmation that turns up late finds WIFI_ROLE_NONE
+       * and is ignored, and frames still in flight for the old role are
+       * discarded rather than delivered against the next one.
+       */
+
+      printf("bk7258_wifi: %s stop unconfirmed, forcing the role idle\n",
+             role == WIFI_ROLE_STA ? "STA" : "SoftAP");
+      wifi_role_deactivate(role);
+      return ret;
+    }
+
   if (ret < 0)
     {
       bool carrier;
@@ -2488,7 +2551,7 @@ static int wifi_stop_active_role(void)
       nxmutex_lock(&g_wifi.packet_lock);
       flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
       if (g_wifi.active_role == role &&
-          g_wifi.role_state == WIFI_ROLE_STOPPING && ret != -ETIMEDOUT)
+          g_wifi.role_state == WIFI_ROLE_STOPPING)
         {
           g_wifi.role_state = previous_state;
           g_wifi.tx_gate = previous_state == WIFI_ROLE_ACTIVE &&
@@ -2507,6 +2570,7 @@ static int wifi_stop_active_role(void)
 static int wifi_ifdown(struct netdev_lowerhalf_s *lower)
 {
   irqstate_t flags;
+  bool stranded;
   int ret;
 
   (void)lower;
@@ -2515,6 +2579,7 @@ static int wifi_ifdown(struct netdev_lowerhalf_s *lower)
   flags = rspin_lock_irqsave(&g_bk7258_driver_lock);
   g_wifi.admin_up = false;
   g_wifi.tx_gate = false;
+  stranded = g_wifi.active_role != WIFI_ROLE_NONE;
 
   /* Closing tx_gate stops new frames, but whatever had accumulated would
    * otherwise sit in the chain until the interface came back up and then go out
@@ -2524,8 +2589,31 @@ static int wifi_ifdown(struct netdev_lowerhalf_s *lower)
   wifi_tx_pending_drop_locked();
   rspin_unlock_irqrestore(&g_bk7258_driver_lock, flags);
   nxmutex_unlock(&g_wifi.packet_lock);
+
+  /* Unlike wifi_disconnect(), an ifdown is not a request that can be declined:
+   * the caller asked for the interface to be administratively down, and it now
+   * is -- admin_up cleared, tx_gate closed, queued frames dropped.  A role the
+   * CP would not confirm stopping is not allowed to keep that from being true,
+   * so drop it locally and report success.
+   *
+   * Reporting the stop error instead is what turned a stop timeout into an
+   * unrecoverable mode switch.  netdev_ifdown() only clears IFF_UP when
+   * d_ifdown() answers OK, and netdev_ifup() skips d_ifup() entirely while
+   * IFF_UP is set.  So an error here left the stack believing wlan0 was up
+   * while this driver had admin_up = false, the following wapi_set_ifup()
+   * silently did nothing, and every wifi_connect() after it failed with
+   * -ENETDOWN.
+   */
+
+  if (stranded)
+    {
+      printf("bk7258_wifi: ifdown could not confirm the role stop (%d), "
+             "dropping the role locally\n", ret);
+      wifi_role_deactivate(WIFI_ROLE_NONE);
+    }
+
   wifi_set_carrier(false);
-  return ret;
+  return OK;
 }
 
 static int wifi_transmit(struct netdev_lowerhalf_s *lower, netpkt_t *packet)
