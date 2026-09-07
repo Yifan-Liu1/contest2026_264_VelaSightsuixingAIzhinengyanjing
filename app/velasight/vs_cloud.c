@@ -62,6 +62,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -343,6 +344,34 @@ struct cloud_state_s
 
 static struct cloud_state_s g_cloud;
 
+/* Serializes one whole cleartext exchange, because there is one socket.
+ *
+ * cloud_state_s::keep_sock is a single descriptor deliberately -- see its
+ * declaration for why the connection cannot simply be reopened -- and two
+ * threads reach it: an upload worker registering a frame, and the session
+ * thread polling getResult every CONFIG_VS_SOCIAL_POLL_INTERVAL_MS.  Nothing
+ * kept them apart, and HTTP/1.1 on one connection is strictly ordered: two
+ * requests written back to back are answered in order, so whichever thread
+ * calls recv() first takes the other one's response.  The register call would
+ * then parse a getResult body, find no msgId in it and report -EPROTO, and
+ * the frame would be counted as a failed upload for a reason nothing in the
+ * log could explain.
+ *
+ * Held across the whole exchange rather than around the descriptor handoff,
+ * which is what makes it correct: the hazard is the interleaving of request
+ * and response, not the bookkeeping in cloud_keep_take().
+ *
+ * This does not make the two calls independent, and is not meant to.  With
+ * one connection they cannot be, and serializing them explicitly is what lets
+ * more than one upload worker exist at all -- the register halves take turns
+ * while their transfer halves, which go to a different host over TLS, overlap.
+ *
+ * A file-scope initialiser rather than a member of g_cloud, which
+ * vs_cloud_init() clears with memset().
+ */
+
+static pthread_mutex_t g_cloud_keep_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
@@ -365,6 +394,43 @@ static uint64_t cloud_now_ms(void)
   struct timespec ts;
 
   if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
+    {
+      return 0;
+    }
+
+  return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/****************************************************************************
+ * Name: cloud_uptime_ms
+ *
+ * Description:
+ *   Monotonic milliseconds, for measuring how long something took.
+ *
+ *   Separate from cloud_now_ms() because the wall clock on this board is
+ *   stepped while the session is running.  vela_tls.c's handshake calls
+ *   clock_settime(CLOCK_REALTIME) when it finds the clock older than 2024 --
+ *   the "Clock too old, forcing to 2026" line -- so a duration measured across
+ *   the first TLS connection of a session subtracts a pre-step reading from a
+ *   post-step one.
+ *
+ *   Measured 2026-09-07, before this existed: an upload's transfer time was
+ *   reported as 274854411 ms.  The arithmetic is exact --
+ *   (uint32_t)(1772275200000 - 129938) is 2748544110, which over a ten-upload
+ *   report window averages to that figure -- so the reading was the clock step
+ *   itself, from 130 s of uptime to the forced 2026 epoch, truncated to 32
+ *   bits.
+ *
+ *   The protocol timestamp still uses the wall clock, which is what it is for.
+ *   Only elapsed time comes from here.
+ *
+ ****************************************************************************/
+
+static uint64_t cloud_uptime_ms(void)
+{
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
     {
       return 0;
     }
@@ -1552,6 +1618,14 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
   int attempt;
   int ret = -EIO;
 
+  /* Both attempts inside one critical section, not one each.  A retry only
+   * happens because a held connection produced nothing, and releasing the lock
+   * in between would let the other thread open a fresh connection and be
+   * midway through its own exchange on it when this one resumed.
+   */
+
+  pthread_mutex_lock(&g_cloud_keep_lock);
+
   for (attempt = 0; attempt < 2; attempt++)
     {
       bool reused = false;
@@ -1561,6 +1635,7 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
 
       if (sock < 0)
         {
+          pthread_mutex_unlock(&g_cloud_keep_lock);
           return sock;
         }
 
@@ -1571,6 +1646,7 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
       if (ret >= 0 && reusable)
         {
           cloud_keep_put(sock, url);
+          pthread_mutex_unlock(&g_cloud_keep_lock);
           return ret;
         }
 
@@ -1589,6 +1665,7 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
 
       if (ret >= 0 || !reused || touched)
         {
+          pthread_mutex_unlock(&g_cloud_keep_lock);
           return ret;
         }
 
@@ -1597,6 +1674,7 @@ static int cloud_plain_http(const struct cloud_url_s *url, const char *method,
        */
     }
 
+  pthread_mutex_unlock(&g_cloud_keep_lock);
   return ret;
 }
 
@@ -2861,6 +2939,8 @@ int vs_cloud_social_upload(const char *session_id,
   cJSON *value = NULL;
   struct cloud_url_s *url = NULL;
   vela_header_t headers[2];
+  uint64_t stamp;
+  uint64_t began;
   int status = 0;
   int http;
   int ret;
@@ -2883,6 +2963,44 @@ int vs_cloud_social_upload(const char *session_id,
 
   memset(out, 0, sizeof(*out));
 
+  /* The wall-clock instant the media was produced.
+   *
+   * The caller hands over a monotonic reading, so this converts: take the
+   * item's age from the monotonic clock, then subtract it from the wall clock.
+   * Reading a wall clock at production and sending that directly would be
+   * simpler and wrong -- the clock is stepped mid-session by vela_tls.c's
+   * handshake, so items produced before the step would carry uptime while
+   * items after it carried an epoch, in the same session.  An age is immune to
+   * the step, and everything uploaded after it therefore lands on a real date.
+   *
+   * The fallback is for callers with nothing better -- vs_cloud_probe()'s
+   * synthetic objects -- not for the session path.  Stamping at registration is
+   * wrong for a real item in two ways at once: it dates a frame from when it
+   * reached the front of the queue rather than when the shutter fired, and with
+   * more than one upload worker two items can be stamped in the opposite order
+   * to the one they were captured in.  See
+   * vs_cloud_media_packet_s::produced_ms.
+   */
+
+  stamp = cloud_now_ms();
+
+  if (packet->produced_ms != 0)
+    {
+      uint64_t uptime = cloud_uptime_ms();
+      uint64_t age = uptime > packet->produced_ms ?
+                     uptime - packet->produced_ms : 0;
+
+      /* Only when it leaves a sane value.  An age larger than the wall clock
+       * means the clock has not been set yet, and reporting a negative date as
+       * a huge unsigned one would be worse than reporting the current reading.
+       */
+
+      if (stamp > age)
+        {
+          stamp -= age;
+        }
+    }
+
   /* Step one: register.  event is the reserved outer event type (emotion
    * recognition); msgEvent says which kind of file this is.
    */
@@ -2894,7 +3012,7 @@ int vs_cloud_social_upload(const char *session_id,
            packet->type == VS_CLOUD_MEDIA_AUDIO ? VS_CLOUD_MEDIA_AUDIO
                                                 : VS_CLOUD_MEDIA_IMAGE,
            vs_cloud_device_id(), session_id,
-           (unsigned long long)cloud_now_ms());
+           (unsigned long long)stamp);
 
   resp = cloud_alloc(CONFIG_VS_SOCIAL_REG_RESP_BYTES, &from_psram);
   if (resp == NULL)
@@ -2902,8 +3020,16 @@ int vs_cloud_social_upload(const char *session_id,
       return -ENOMEM;
     }
 
+  /* Timed even on the failure paths below, because a register call that took
+   * four seconds and then failed is the same diagnosis as one that took four
+   * seconds and succeeded, and the caller can only report what it is given.
+   */
+
+  began = cloud_uptime_ms();
   http = cloud_api_call("POST", CLOUD_PATH_UPLOAD, body, resp,
                         CONFIG_VS_SOCIAL_REG_RESP_BYTES);
+  out->register_ms = (uint32_t)(cloud_uptime_ms() - began);
+
   if (http < 0)
     {
       ret = http;
@@ -3016,9 +3142,12 @@ int vs_cloud_social_upload(const char *session_id,
   headers[1].name = NULL;
   headers[1].value = NULL;
 
+  began = cloud_uptime_ms();
   http = cloud_http(url, "PUT", CLOUD_UPLOAD_SEND_CT ? headers : NULL,
                     packet->data, packet->len, resp,
                     CONFIG_VS_SOCIAL_REG_RESP_BYTES, NULL);
+  out->transfer_ms = (uint32_t)(cloud_uptime_ms() - began);
+
   if (http < 0)
     {
       printf("%s: %s transfer failed: %d\n", CLOUD_TAG,
@@ -3571,6 +3700,7 @@ static void cloud_summarize_timeline(cJSON *timeline,
                                      struct vs_cloud_minutes_s *minutes)
 {
   unsigned int counts[3] = { 0, 0, 0 }; /* calm, happy, tense */
+  unsigned int reds = 0;                /* of those, the red ones */
   unsigned int total = 0;
   cJSON *item;
 
@@ -3578,6 +3708,7 @@ static void cloud_summarize_timeline(cJSON *timeline,
   minutes->happy = 0;
   minutes->tense = 0;
   minutes->emotion_samples = 0;
+  minutes->extreme_samples = 0;
 
   if (timeline == NULL || !cJSON_IsArray(timeline))
     {
@@ -3626,11 +3757,23 @@ static void cloud_summarize_timeline(cJSON *timeline,
             continue;
         }
 
+      /* Counted from extreme rather than from the emotion, so it follows
+       * cloud_classify_emotion()'s one definition of the word instead of
+       * repeating the colour test here.
+       */
+
+      if (extreme)
+        {
+          reds++;
+        }
+
       total++;
     }
 
   minutes->emotion_samples = (uint16_t)(total > UINT16_MAX ? UINT16_MAX
                                                            : total);
+  minutes->extreme_samples = (uint16_t)(reds > UINT16_MAX ? UINT16_MAX
+                                                          : reds);
 
   if (total == 0)
     {
@@ -4123,9 +4266,17 @@ out:
        * across sessions it would be an instance chosen by whichever session
        * happened to be first, and the next open would be answered by that
        * instance whether or not it is the one still standing.
+       *
+       * Under the same lock as every other use of that descriptor.  By the
+       * time a finalize gets here the upload workers have already been joined,
+       * so nothing is using it -- but that ordering lives in vs_social.c and
+       * this file should not be relying on it to avoid closing a socket
+       * another thread is reading.
        */
 
+      pthread_mutex_lock(&g_cloud_keep_lock);
       cloud_keep_drop();
+      pthread_mutex_unlock(&g_cloud_keep_lock);
     }
 
   cJSON_Delete(root);
@@ -4295,6 +4446,54 @@ out:
 #  define CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES 32768
 #endif
 
+/* How much of an object one GET asks for, and how many times a window may be
+ * reissued before the download is given up on.
+ *
+ * This exists because of a failure shape that three consecutive sessions
+ * reproduced identically.  Measured 2026-09-07 against the staging store, the
+ * spoken minutes arrive fast and then decay to a stop:
+ *
+ *   0      -> 138629 B    2.58 s    53.7 KB/s
+ *   138629 -> 269701 B   33.20 s     3.9 KB/s
+ *   269701 -> 294277 B   59.80 s     0.4 KB/s   then the read timed out
+ *
+ * and an earlier session did the same at 41.4 KB/s then 0.45 KB/s.  The first
+ * ~135 KB of every attempt is quick; what follows is not.  Note also that the
+ * last stretch moved 24 KB, less than one CONFIG_VS_SOCIAL_DOWNLOAD_BLOCK_BYTES
+ * block, so not a single write() happened during those 59.8 seconds -- the card
+ * is not what stalls, whatever else is.
+ *
+ * The failure is a local read timeout, not the peer hanging up:
+ * MBEDTLS_ERR_NET_RECV_FAILED is -0x004C and appeared in the log as
+ * "ssl_read (stream) ret=0x4c", while MBEDTLS_ERR_NET_CONN_RESET is -0x0050.
+ * vela_tls.c puts the socket in blocking mode and bounds it with SO_RCVTIMEO,
+ * and mbedtls's net_would_block() only treats EAGAIN as "would block" on a
+ * non-blocking descriptor -- so an expired SO_RCVTIMEO arrives here as a read
+ * failure.  Every byte already on the card was then thrown away by the unlink
+ * below, twice, at 179590 and 294277 bytes of a file around 600 KB.
+ *
+ * So: ask for the object a window at a time.  Each GET is short enough to
+ * finish inside the fast stretch, a window that fails is reissued from the
+ * byte count the sink actually reached rather than from zero, and the transfer
+ * as a whole survives a stall that would previously have ended it.  Requests
+ * are Range GETs on the same pooled connection, so the extra windows cost a
+ * request line each and no handshake.
+ *
+ * 131072 is chosen against the measurement: it is comfortably inside the
+ * ~135 KB that arrives quickly, and it is a multiple of the write block so
+ * window boundaries do not create unaligned writes.  Zero disables windowing
+ * and restores the single-request behaviour, which is also what happens
+ * automatically if the store refuses a Range header.
+ */
+
+#ifndef CONFIG_VS_SOCIAL_DOWNLOAD_WINDOW_BYTES
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_WINDOW_BYTES 131072
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_DOWNLOAD_ATTEMPTS
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_ATTEMPTS 4
+#endif
+
 struct cloud_file_sink_s
 {
   int fd;
@@ -4461,6 +4660,15 @@ int vs_cloud_download_to_file(const char *url, const char *path,
   char *scratch = NULL;
   bool parsed_psram = false;
   bool scratch_psram = false;
+
+  /* Zeroed by the fallback path when the store will not take a Range header,
+   * which is what makes "windowed" a runtime property rather than a build one.
+   */
+
+  size_t window = CONFIG_VS_SOCIAL_DOWNLOAD_WINDOW_BYTES;
+  unsigned int stalls = 0;
+  unsigned int requests = 0;
+  bool complete = false;
   int http;
   int ret;
 
@@ -4536,9 +4744,149 @@ int vs_cloud_download_to_file(const char *url, const char *path,
       goto out;
     }
 
-  http = cloud_http_ex(parsed, "GET", NULL, NULL, 0, scratch,
-                       CONFIG_VS_SOCIAL_REG_RESP_BYTES, NULL,
-                       cloud_file_sink, &sink);
+  /* One window at a time, resuming from what actually landed.  See
+   * CONFIG_VS_SOCIAL_DOWNLOAD_WINDOW_BYTES for the measurement this answers.
+   */
+
+  http = -EIO;
+
+  for (; ; )
+    {
+      char range[64];
+      vela_header_t headers[2] =
+      {
+        {
+          NULL, NULL
+        },
+        {
+          NULL, NULL
+        }
+      };
+      size_t before = sink.written;
+      size_t got;
+
+      if (window != 0)
+        {
+          snprintf(range, sizeof(range), "bytes=%zu-%zu", sink.written,
+                   sink.written + window - 1);
+          headers[0].name  = "Range";
+          headers[0].value = range;
+        }
+
+      http = cloud_http_ex(parsed, "GET", window != 0 ? headers : NULL, NULL,
+                           0, scratch, CONFIG_VS_SOCIAL_REG_RESP_BYTES, NULL,
+                           cloud_file_sink, &sink);
+      got = sink.written - before;
+      requests++;
+
+      /* The sink refusing is an answer about this download, not about this
+       * window, so it ends the loop and is reported below.
+       */
+
+      if (sink.over || sink.err != 0)
+        {
+          break;
+        }
+
+      if (http < 0)
+        {
+          /* The transport gave up mid-window.  Without Range there is no way
+           * to ask for the rest, so this is terminal; with it, everything
+           * already on the card stays and the next request starts from where
+           * the sink stopped -- so even a window that fails leaves the
+           * download further along than it was.
+           *
+           * Every failure spends an attempt, including one that delivered
+           * some bytes first, and only a completed response refills the
+           * budget.  Crediting partial delivery instead would not terminate:
+           * a window that hands over one byte and then stalls forever would
+           * reset the count forever.  Since a failed window still advances
+           * the offset, the bound is on consecutive failures rather than on
+           * progress, which is the property that matters.
+           */
+
+          if (window == 0)
+            {
+              break;
+            }
+
+          if (++stalls >= CONFIG_VS_SOCIAL_DOWNLOAD_ATTEMPTS)
+            {
+              break;
+            }
+
+          printf("%s: resuming %s from %zu bytes after %d (attempt %u of "
+                 "%d)\n", CLOUD_TAG, path, sink.written, http, stalls + 1,
+                 CONFIG_VS_SOCIAL_DOWNLOAD_ATTEMPTS);
+          continue;
+        }
+
+      if (http == 416)
+        {
+          /* Asked past the end, which happens when the object length is an
+           * exact multiple of the window: the previous request already
+           * finished the file.  Not an error unless nothing ever arrived.
+           */
+
+          complete = sink.written != 0;
+          break;
+        }
+
+      if (http < 200 || http >= 300)
+        {
+          /* A store that signs the header set will refuse an unexpected Range
+           * the same way it refuses an unexpected Content-Type -- with a 403
+           * over XML.  Nothing has been written yet at this point, so dropping
+           * to a single unwindowed request costs only this round trip, and the
+           * download proceeds exactly as it did before windowing existed.
+           */
+
+          if (window != 0 && sink.written == 0 &&
+              (http == 400 || http == 403 || http == 501))
+            {
+              printf("%s: %s refused a Range request (HTTP %d), retrying "
+                     "whole\n", CLOUD_TAG, parsed->host, http);
+              window = 0;
+              stalls = 0;
+              continue;
+            }
+
+          break;
+        }
+
+      if (window == 0 || http == 200)
+        {
+          /* Windowing is off, or the store ignored Range and answered with the
+           * whole object.  Either way this response was the entire file.
+           *
+           * A 200 after a window has already been stored cannot be used: the
+           * body starts at byte zero and appending it would corrupt what is on
+           * the card.  Refusing is the only honest option.
+           */
+
+          if (window != 0 && before != 0)
+            {
+              printf("%s: %s answered a Range request with HTTP 200 at offset "
+                     "%zu, cannot resume\n", CLOUD_TAG, parsed->host, before);
+              http = -EPROTO;
+              break;
+            }
+
+          complete = true;
+          break;
+        }
+
+      /* 206.  A window that came back short is the last one; a full window
+       * means there is more to ask for.
+       */
+
+      stalls = 0;
+      if (got < window)
+        {
+          complete = true;
+          break;
+        }
+    }
 
   /* The tail, before the close that would otherwise discard it.
    *
@@ -4548,7 +4896,7 @@ int vs_cloud_download_to_file(const char *url, const char *path,
    * past the budget that just rejected it.
    */
 
-  if (http >= 200 && http < 300 && !sink.over && sink.err == 0 &&
+  if (complete && !sink.over && sink.err == 0 &&
       cloud_file_flush(&sink) < 0)
     {
       printf("%s: writing the last block of %s failed: %d\n", CLOUD_TAG, path,
@@ -4577,26 +4925,35 @@ int vs_cloud_download_to_file(const char *url, const char *path,
       goto unlink_out;
     }
 
-  if (http < 0)
-    {
-      /* How far it got is the whole diagnosis.  Zero means the request never
-       * produced a body -- a refused connection, a bad URL, an expired
-       * signature.  A partial count means the transfer started and then the
-       * peer or the link gave up, which is a different problem with a
-       * different fix, and without the number here the two look identical.
-       */
+  /* complete, not the status code, is what says the object arrived.  A
+   * windowed download ends on 206, on 200 or on 416 depending on how the
+   * object length falls against the window, and only the loop above knows
+   * which of those meant "that was the last of it".
+   */
 
-      printf("%s: download of %s failed after %zu bytes: %d\n", CLOUD_TAG,
-             path, sink.written, http);
-      ret = http;
-      goto unlink_out;
-    }
-
-  if (http < 200 || http >= 300)
+  if (!complete)
     {
-      printf("%s: download returned HTTP %d after %zu bytes\n", CLOUD_TAG,
-             http, sink.written);
-      ret = -EIO;
+      if (http < 0)
+        {
+          /* How far it got is the whole diagnosis.  Zero means no request ever
+           * produced a body -- a refused connection, a bad URL, an expired
+           * signature.  A partial count means the transfer started and then
+           * stopped, repeatedly enough to spend every attempt, which is a
+           * different problem with a different fix; without the number here
+           * the two look identical.
+           */
+
+          printf("%s: download of %s failed after %zu bytes: %d\n", CLOUD_TAG,
+                 path, sink.written, http);
+          ret = http;
+        }
+      else
+        {
+          printf("%s: download returned HTTP %d after %zu bytes\n", CLOUD_TAG,
+                 http, sink.written);
+          ret = -EIO;
+        }
+
       goto unlink_out;
     }
 
@@ -4616,8 +4973,9 @@ int vs_cloud_download_to_file(const char *url, const char *path,
    * says whether the card or the link was the limit.
    */
 
-  printf("%s: %s written in %u write(s) of up to %zu bytes\n", CLOUD_TAG, path,
-         sink.writes, sink.cap != 0 ? sink.cap : sink.written);
+  printf("%s: %s written in %u write(s) of up to %zu bytes, %u request(s)\n",
+         CLOUD_TAG, path, sink.writes,
+         sink.cap != 0 ? sink.cap : sink.written, requests);
 
   ret = 0;
   goto out;
@@ -4832,8 +5190,9 @@ int vs_cloud_probe(void)
     }
 
   printf("%s: probe minutes: calm %u happy %u tense %u, %u emotion / %u "
-         "audio samples\n", CLOUD_TAG, minutes.calm, minutes.happy,
-         minutes.tense, minutes.emotion_samples, minutes.audio_samples);
+         "audio samples, %u extreme\n", CLOUD_TAG, minutes.calm,
+         minutes.happy, minutes.tense, minutes.emotion_samples,
+         minutes.audio_samples, minutes.extreme_samples);
   printf("%s: probe tts url: %s\n", CLOUD_TAG,
          minutes.tts_url[0] != '\0' ? minutes.tts_url : "(none)");
   printf("%s: probe summary: %s\n", CLOUD_TAG,

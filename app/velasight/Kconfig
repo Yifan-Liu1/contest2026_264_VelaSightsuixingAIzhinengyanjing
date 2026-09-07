@@ -918,8 +918,8 @@ config VS_SOCIAL_POLL_INTERVAL_MS
 
 config VS_SOCIAL_FINALIZE_TIMEOUT_MS
 	int "VelaSight social finalize timeout (ms)"
-	default 60000
-	range 5000 120000
+	default 90000
+	range 5000 180000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		How long to poll for the minutes after asking the cloud to close
@@ -941,9 +941,17 @@ config VS_SOCIAL_FINALIZE_TIMEOUT_MS
 		to summarise and a voice to synthesise, and the jitter was already
 		inside the old 5.6 s of headroom.
 
-		60000 is chosen against the observed spread rather than the
-		observed maximum.  Waiting costs a spinner; timing out early
-		discards minutes the cloud did produce.
+		Then 60000, chosen against that spread rather than its maximum,
+		which three more measurements showed was still too tight:
+		24.5 s, 44.3 s and 57.4 s on 2026-09-07.  The last one left 2.6 s
+		of a 60 s budget, so the next slightly slower cloud would have
+		shown the user a retry prompt for a session that was about to
+		succeed.
+
+		90000 is against the observed spread again, with the spread now
+		known to reach nearly a minute.  Waiting costs a spinner; timing
+		out early discards minutes the cloud did produce and asks the user
+		to do something about a problem that does not exist.
 
 config VS_SOCIAL_DOWNLOAD_BLOCK_BYTES
 	int "VelaSight download write block (bytes)"
@@ -969,59 +977,164 @@ config VS_SOCIAL_DOWNLOAD_BLOCK_BYTES
 		about 0.77 s per record, 1.8 KB/s.  Uploads to the same host over
 		the same pooled connection in the same session ran near 24 KB/s
 		and write nothing, so the cost was the card rather than the link.
-		It was slow enough that the peer reset the connection at 62 s.
+		It was slow enough that the transfer died at 62 s.
+
+		That death was described here as the peer resetting the
+		connection, which was wrong.  The log line was
+		"ssl_read (stream) ret=0x4c", and MBEDTLS_ERR_NET_RECV_FAILED is
+		-0x004C while MBEDTLS_ERR_NET_CONN_RESET is -0x0050.  It was a
+		local read timeout: vela_tls.c puts the socket in blocking mode
+		and bounds it with SO_RCVTIMEO, and mbedtls's net_would_block()
+		only maps EAGAIN to "would block" on a non-blocking descriptor,
+		so an expired receive timeout surfaces as a read failure.  See
+		VS_SOCIAL_DOWNLOAD_WINDOW_BYTES, which is what actually answers
+		it.
 
 		32768 is 64 sectors.  Larger mostly buys diminishing returns and
 		costs PSRAM for the duration of the transfer; 512 reduces this to
 		the unaggregated behaviour without removing the code path.
 
+config VS_SOCIAL_DOWNLOAD_WINDOW_BYTES
+	int "VelaSight download window (bytes per GET)"
+	default 131072
+	range 0 1048576
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How much of an object one GET asks for, as a Range request.  Zero
+		fetches the whole thing in a single request, which is what this
+		code did before the option existed.
+
+		This is here because of a failure three consecutive sessions
+		reproduced identically.  Measured 2026-09-07 fetching ttsMinutes
+		from the staging store, the transfer starts fast and decays to a
+		stop:
+
+		  0      -> 138629 B    2.58 s    53.7 KB/s
+		  138629 -> 269701 B   33.20 s     3.9 KB/s
+		  269701 -> 294277 B   59.80 s     0.4 KB/s   then it timed out
+
+		and an earlier session did the same at 41.4 KB/s and then
+		0.45 KB/s.  The card is not the reason: that last stretch moved
+		24 KB, less than one VS_SOCIAL_DOWNLOAD_BLOCK_BYTES block, so not
+		a single write() happened during those 59.8 seconds.
+
+		What the three runs agree on is that the first ~135 KB of every
+		attempt arrives quickly.  So ask for the object in pieces that
+		size: each GET finishes inside the fast stretch, and no single
+		response lives long enough for the receive timeout to expire.  A
+		piece that fails is reissued from the byte count already on the
+		card rather than from zero, which is the other half of the fix --
+		both failures above threw away everything they had fetched, 179590
+		and 294277 bytes of a file around 600 KB.
+
+		131072 sits comfortably inside the fast stretch and is a multiple
+		of the write block, so window boundaries do not create unaligned
+		writes.  The extra requests share the pooled connection, so they
+		cost a request line each and no handshake.
+
+		A store that signs its header set may refuse a Range header the
+		way it refuses an unexpected Content-Type -- see
+		VS_SOCIAL_UPLOAD_CONTENT_TYPE.  That is handled rather than
+		configured: a 400, 403 or 501 on the first window drops to a
+		single unwindowed request and says so in the log.
+
+config VS_SOCIAL_DOWNLOAD_ATTEMPTS
+	int "VelaSight download attempts per window"
+	default 4
+	range 1 16
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many consecutive transport failures a windowed download
+		tolerates before it gives up.  Only meaningful when
+		VS_SOCIAL_DOWNLOAD_WINDOW_BYTES is non-zero, since without Range
+		there is no way to ask for the rest of an object.
+
+		Consecutive, and reset only by a completed response.  A failed
+		window keeps the bytes it did deliver and the next request resumes
+		past them, so every attempt makes progress whether or not it
+		succeeds -- which means the count does not need to distinguish
+		"slow" from "broken" to terminate.  Refilling the budget on
+		partial delivery instead would not terminate at all: a window that
+		hands over one byte and then stalls forever would reset it forever.
+
+		Note that the finalizing page has its own bound over the top of
+		this one, VS_SOCIAL_FETCH_TIMEOUT_MS, and that a download retrying
+		into a wall will hit that first.
+
 config VS_TTS_CHUNK_BYTES
 	int "VelaSight audio playback read block (bytes)"
-	default 65536
+	default 16384
 	range 4096 262144
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		How much of a WAV file is read per iteration while playing it.
+		How much of a WAV file is read per iteration while playing it, and
+		therefore how much memory playback holds.
 
 		Sized against the card, not the audio.  The constraint is that a
 		block must be read in less time than it takes to play, or the DAC
 		starves and the listener hears gaps.
 
-		8192 was the original value and is only 250 ms of 16 kHz mono --
-		against storage that measured 0.77 s for a 1.4 KB write, that left
-		no margin at all: the pre-buffer would drain within the first few
-		reads.  65536 is 2 s of the same audio and 128 sectors exactly.
+		The storage this was written against no longer exists.  It was
+		8192, raised to 65536 when a 1.4 KB write measured 0.77 s and the
+		card supplied 8.9 KB/s -- 28% of the 32 KB/s that 16 kHz 16-bit
+		mono consumes, so nothing could be streamed and the file had to be
+		read in full first.  After the SD-NAND fix the same read path
+		measures 605 KB/s (486400 bytes in 803 ms, 2026-09-07), which is
+		19 times what playback needs.
+
+		So the block no longer has to be large, and being large now costs
+		something: it is held for the length of the file. 16384 is 512 ms
+		of this audio and 32 sectors exactly, read in about 27 ms against
+		the 512 ms it plays for.  That is still a 19x margin -- the ratio
+		is set by the card against the sample rate and does not change with
+		the block size -- while holding a quarter of what 65536 did.
 
 		The cost is reaction time.  A stop is acted on at block
 		boundaries, so the read loop leaves up to one block late -- which
 		nobody hears, because vs_audio_playback_stop() silences the DAC
-		immediately and independently of this loop.
+		immediately and independently of this loop.  A smaller block makes
+		that shorter, not longer.
 
 config VS_TTS_PRELOAD_MAX_BYTES
 	int "VelaSight audio preload budget (bytes)"
-	default 1048576
+	default 0
 	range 0 4194304
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		Largest spoken-minutes file that is read into memory in full before
 		the speaker is opened.  Larger files are streamed instead.
 
-		This exists because the storage cannot feed realtime audio.
-		Measured 2026-09-07: 199680 bytes took 22467 ms to read, 8.9 KB/s,
-		against the 32 KB/s that 16 kHz 16-bit mono consumes -- the card
-		supplies 28% of what playback needs.  A streamed file therefore
-		underruns by arithmetic rather than by bad luck, and the gaps fall
-		in the middle of the sentence.
+		Zero, which means never preload and always stream.  Any larger
+		value reads a file up to that size into memory before opening the
+		DAC.
 
-		Reading first does not make playback finish sooner and cannot:
-		audio cannot be played faster than it can be read.  What it does is
-		move the waiting to the front, where it is a pause before the
-		summary instead of holes inside it.
+		This existed because the storage could not feed realtime audio.
+		Measured 2026-09-07 before the SD-NAND fix: 199680 bytes took
+		22467 ms to read, 8.9 KB/s, against the 32 KB/s that 16 kHz 16-bit
+		mono consumes -- 28% of what playback needed, so a streamed file
+		underran by arithmetic rather than by bad luck and the gaps fell in
+		the middle of the sentence.  Reading the whole file first did not
+		make playback finish sooner and could not; it moved the waiting to
+		the front, where it was a pause before the summary instead of holes
+		inside it.
 
-		1048576 is 32 s of 16 kHz mono, which covers any minutes this cloud
-		has produced, out of the 6 MB PSRAM heap.  Set to 0 to force
-		streaming everywhere, which is only useful for reproducing the
-		underrun behaviour.
+		The premise is gone.  The same read path now measures 605 KB/s
+		(486400 bytes in 803 ms), 19 times what playback consumes, so
+		streaming through VS_TTS_CHUNK_BYTES has ample margin and was
+		measured with 0 underruns.
+
+		Preloading has a cost that only became visible once it worked.  On
+		the run that first played a file end to end, the 486400-byte
+		preload left "psram heap free 103008 largest 102888 of 3014656" --
+		3.4% of the PSRAM heap -- while the playback ring held another
+		327680.  The budget above it was 1048576, so a file only slightly
+		larger would have failed to allocate, fallen back to streaming
+		anyway, and reported it as an out-of-memory condition.  Streaming
+		unconditionally removes both the peak and that cliff, along with
+		the 803 ms of silence in front of the audio.
+
+		Raise it above zero only if a card regresses to the speeds
+		described above.
 
 config VS_SOCIAL_FETCH_TIMEOUT_MS
 	int "VelaSight spoken minutes download timeout (ms)"
@@ -1075,18 +1188,107 @@ config VS_TTS_STACKSIZE
 		loop.
 
 config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
-	int "VelaSight social alert confirmation windows"
-	default 3
+	int "VelaSight social alert confirmation readings"
+	default 2
 	range 1 10
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		How many consecutive extreme frames raise an alert, and how many
-		consecutive calm ones clear it.
+		How many extreme readings raise an alert, and how many consecutive
+		calm ones clear it.
 
-		Without this the screen changes colour on single-frame noise.
-		With it, an alert means the cloud said the same thing about three
-		frames in a row -- about a second at the default sampling rate,
-		which is short enough to still be about the moment it describes.
+		Without this the screen changes colour on single-reading noise.
+		The cloud itself does not debounce at all -- it opens an advice
+		slot on the first red frame -- so this is the device deciding that
+		one reading is not enough to interrupt someone.
+
+		"Readings", not "frames", and not "consecutive" on the raise side.
+		It used to require N extreme results in a row and was reset by any
+		result that was not extreme, which measurement showed asks for far
+		more than it appears to: 43 images uploaded produced 7 emotion
+		results, about one every 9.6 s, so three in a row meant anger
+		detected continuously across roughly nineteen seconds with no
+		misclassification anywhere in between -- and one stray green in the
+		middle of a real argument reset the count to zero.  The raise side
+		now counts readings inside
+		VS_SOCIAL_ALERT_WINDOW_MS instead.
+
+		2 against a cloud that would fire on 1: two independent readings
+		agreeing is the least this can ask for and still be a filter, and
+		with the result yield above, three is close to unreachable.
+
+		The clear side is still a consecutive count, because a calm streak
+		is only the fast path there -- VS_SOCIAL_ALERT_HOLD_MS is what
+		actually releases an alert.
+
+config VS_SOCIAL_ALERT_WINDOW_MS
+	int "VelaSight social alert confirmation window (ms)"
+	default 20000
+	range 1000 120000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How far apart the VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS extreme readings
+		may be and still count as one moment.
+
+		This is the span the raise decision looks back over.  A reading
+		that is not extreme does not clear the count; the window expiring
+		is what forgets, which is what makes the filter tolerant of the
+		occasional misread without making it tolerant of anger that
+		happened a minute ago.
+
+		20000 is sized against the measured result rate rather than
+		against the sampling rate, because the two are far apart: the
+		sampler runs at 500-2000 ms but only about one image in six comes
+		back classified, so consecutive readings are ~10 s apart.  Two of
+		them inside 20 s is reachable; the same two inside 2 s is not.
+
+		Shorten it if the cloud's classification yield improves, which is
+		the number that really governs this feature.
+
+config VS_SOCIAL_ALERT_MIN_CONFIDENCE
+	int "VelaSight social alert minimum confidence (percent)"
+	default 40
+	range 0 100
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How sure the cloud has to be about an extreme reading before it
+		counts towards raising an alert.
+
+		The interface sends a confidence with every emotion result -- as a
+		string, "0.95" -- and the device parsed it, carried it and then
+		never looked at it, so a red at 0.5 weighed the same as one at
+		0.95 in a decision made from only a couple of readings.
+
+		Applies to raising only.  A low-confidence red still counts as
+		"still extreme" for VS_SOCIAL_ALERT_HOLD_MS, so a run of unsure
+		readings holds an existing alert open without being able to start
+		one.  Raising interrupts the user; holding does not.
+
+		A result with no confidence field at all is always accepted: a
+		server that omits it must not silently switch the feature off.
+
+		0 disables the check.
+
+		40 is measured, not chosen.  The interface example shows "0.95" and
+		this was first set to 60 on the strength of it, which turned out to
+		be above the entire range this model actually produces.  Two
+		sessions, 2026-09-07:
+
+		  R0000021, 28 classified frames: 0.37 to 0.67, median 0.55, none
+		  at or above 0.70, only 37% at or above 0.60.
+		  19:55 session, every one of the 7 red frames: 40, 42, 44, 45, 46,
+		  47, 57.  Highest 57.
+
+		So the floor rejected all seven reds, no alert was raised all
+		session, and the one advice the cloud did produce was discarded on
+		arrival for want of an alert to attach it to -- the feature could
+		not fire at any point.  At 40 those same seven all pass, the second
+		of them lands 6.3 s after the first and inside
+		VS_SOCIAL_ALERT_WINDOW_MS, and the advice arrives 5.9 s after that
+		with the alert still held by VS_SOCIAL_ALERT_COOLDOWN_MS.
+
+		Raise it again if the model's confidence range moves up.  Judge it
+		against the "extreme frame ignored, confidence N below M" lines,
+		which print the real distribution one line per frame.
 
 config VS_SOCIAL_ALERT_COOLDOWN_MS
 	int "VelaSight social alert cooldown (ms)"
@@ -1101,6 +1303,74 @@ config VS_SOCIAL_ALERT_COOLDOWN_MS
 		already decides whether the emotion is real.  An alert that
 		appeared and vanished before it could be read would be worse than
 		none, because the user would know something happened and not what.
+
+config VS_SOCIAL_ALERT_HOLD_MS
+	int "VelaSight social alert release timeout (ms)"
+	default 12000
+	range 2000 120000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long an alert survives without a single extreme frame before it
+		releases itself.
+
+		The calm streak above is the fast path and this is the one that
+		works.  Clearing on a run of calm results needs the cloud to keep
+		answering with faces it judged calm, and that is not what a session
+		mostly receives: a frame with no usable face comes back as status
+		30 and advances neither streak, and a frame whose result never
+		arrives is retired unanswered.  Measured 2026-09-07, 43 uploaded
+		images produced 7 emotionTimeline entries and 15 unanswered ids --
+		so three consecutive calm results is a coincidence, not an
+		expectation, and the user who calmed down and looked away produced
+		none of them.
+
+		The symptom was an alert raised once staying on screen for the rest
+		of the session.  It never blocked anything -- pause and the hold to
+		end both work from the alert page -- but the device went on warning
+		about an argument that had finished.
+
+		Evaluated on the poll loop rather than when a result arrives, which
+		is the whole point: it has to run when nothing is arriving.  The
+		cooldown above still applies, so the effective minimum is whichever
+		of the two is longer.
+
+		12000 is six poll intervals and covers a sampler backed off to its
+		slowest, where frames are 2 s apart.  Lower it for a device that
+		should forget faster; raise it if an alert flickers off during a
+		pause in a conversation that is still tense.
+
+		A release also waits for any advice still outstanding, however
+		long this is: an alert that cleared first would make its own advice
+		arrive stale and be discarded.  VS_SOCIAL_ADVICE_TIMEOUT_MS is what
+		bounds that wait.
+
+config VS_SOCIAL_ADVICE_TIMEOUT_MS
+	int "VelaSight social advice wait (ms)"
+	default 30000
+	range 2000 120000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long an extreme frame's message is held waiting for the advice
+		the cloud derives from the audio around it.
+
+		The interface delivers that advice under the msgId of the image it
+		judged extreme, not under any audio msgId, so the device has to keep
+		that image's id in flight to collect it -- and the interface defines
+		no terminal state for an advice that will not be sent.  A msgEvent 1
+		sub-result goes to 11 and, if the AI produces nothing, stays there.
+		Without a bound on this side such an entry is held for the rest of
+		the session, and enough of them fill
+		VS_SOCIAL_INFLIGHT_MAX with permanent waiters.
+
+		30000 is generous against the observed shape of the exchange: the
+		advice needs the audio that follows the extreme moment, which is
+		2 s per chunk plus upload plus inference.  It is deliberately longer
+		than VS_SOCIAL_ALERT_HOLD_MS, since the alert waits for this rather
+		than the other way round.
+
+		Reaching it is reported as "no advice for msg N within M ms".  A
+		cloud that answers 30 on the advice instead -- "音频无有效声音" --
+		is a proper terminal state and ends the wait immediately.
 
 config VS_SOCIAL_AUDIO_QUEUE_SLOTS
 	int "VelaSight social audio upload queue depth (chunks)"
@@ -1351,6 +1621,50 @@ config VS_SOCIAL_STACKSIZE_UPLOAD
 		Pops the ring and does the cloud round trip: HTTP request assembly,
 		optionally TLS, then a JSON response to parse.  Its own frame is
 		trivial and everything it needs sits below it.
+
+		Costed per worker; see VS_SOCIAL_UPLOAD_WORKERS.
+
+config VS_SOCIAL_UPLOAD_WORKERS
+	int "VelaSight social upload workers"
+	default 2
+	range 1 2
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How many threads pop the upload rings.  Each costs
+		VS_SOCIAL_STACKSIZE_UPLOAD.
+
+		More than one because an upload is two serial round trips to two
+		different hosts -- register with the business server, then PUT the
+		bytes to the presigned URL -- and one worker can only be inside one
+		of them at a time.  Measured 2026-09-07: 984 ms per item, against a
+		budget of two pooled round trips at about 135 ms each.
+
+		The cost is also very nearly independent of payload size, which is
+		what says the limit is latency rather than bandwidth: in one
+		session an image-heavy report window averaged 869 ms per item while
+		an audio-heavy one, carrying a quarter of the bytes, averaged
+		1636 ms.  Bandwidth would have made the small items faster.
+		Latency does not care, and latency is what overlapping requests
+		hides.
+
+		The two registrations still take turns, because they share one
+		cleartext connection that vs_cloud.c serializes -- deliberately, so
+		that the connection which opened the session stays the one every
+		request uses.  What overlaps is one item's registration against
+		another item's transfer.
+
+		Two is the ceiling, and it is set outside this application.
+		vela_tls.c pools connections in CONN_POOL_SIZE slots, two by
+		default, and reads every response through one of TLS_RAW_BUF_COUNT
+		static 8 KB buffers, also two.  A third concurrent transfer would
+		find no pool slot and open an unpooled connection -- a full
+		handshake per upload -- and would block waiting for a response
+		buffer.  Raising it here without raising those would be slower, not
+		faster.
+
+		Set to 1 to get the old single-worker behaviour.  A session still
+		runs if only some workers start: the rest are throughput, and only
+		failing to start any is fatal.
 
 config VS_SOCIAL_STACKSIZE_CAPTURE
 	int "VelaSight social capture-thread stack size"

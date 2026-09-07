@@ -110,6 +110,13 @@
 #  define CONFIG_VS_HISTORY_TTS_DWELL_MS 2000
 #endif
 
+/* The status panel's ordinary text colour, and what an emotion colour is
+ * measured against.  Same value cloud_classify_emotion() gives a calm frame,
+ * so a page reporting calm and a page reporting nothing look alike.
+ */
+
+#define VS_COLOR_NEUTRAL 0xe8eef2u
+
 /* How long after a failed STA association the next attempt is made.
  *
  * Every retry is a full scan, authenticate and DHCP cycle on the CP, so the
@@ -830,12 +837,39 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
   snapshot->api_ready = runtime->api_ready;
   snprintf(snapshot->error_reason, sizeof(snapshot->error_reason), "%s",
            runtime->error_reason);
-  snapshot->emotion_color = runtime->emotion_color != 0 ?
-                            runtime->emotion_color :
-                            runtime->emotion == VS_EMOTION_TENSE ? 0xe85d5d :
-                            runtime->emotion == VS_EMOTION_CONFUSED ? 0xe3ad4b :
-                            runtime->emotion == VS_EMOTION_HAPPY ? 0x48c78e :
-                            0xe8eef2;
+  /* Only the two pages that are reporting an emotion carry its colour.
+   *
+   * vs_render_status() paints the status panel's value label with this on every
+   * page, and nothing ever put it back.  emotion_color is written when an alert
+   * is raised and reset in exactly two places -- a clear, and the start of the
+   * next session -- so a session that ended while an alert stood left the
+   * finalizing page, the summary and every history entry after it drawing their
+   * status text in alert red, until the user happened to start another session.
+   *
+   * Deciding it here from what the page shows rather than resetting it at each
+   * exit is the same choice vs_update_record_audio() makes, and for the same
+   * reason: there are six ways out of a session and a reset at each one is six
+   * chances to forget.  This way a page that is not about an emotion cannot
+   * show one.
+   *
+   * The runtime fields are still cleared where they should be -- a stale
+   * alert_text would otherwise reappear if the page returned to
+   * VS_PAGE_SOCIAL_ALERT -- this only stops them reaching the screen from
+   * anywhere else.
+   */
+
+  snapshot->emotion_color = VS_COLOR_NEUTRAL;
+
+  if (runtime->page == VS_PAGE_SOCIAL_RUNNING ||
+      runtime->page == VS_PAGE_SOCIAL_ALERT)
+    {
+      snapshot->emotion_color = runtime->emotion_color != 0 ?
+                        runtime->emotion_color :
+                        runtime->emotion == VS_EMOTION_TENSE ? 0xe85d5d :
+                        runtime->emotion == VS_EMOTION_CONFUSED ? 0xe3ad4b :
+                        runtime->emotion == VS_EMOTION_HAPPY ? 0x48c78e :
+                        VS_COLOR_NEUTRAL;
+    }
 
   switch (runtime->page)
     {
@@ -1943,26 +1977,54 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
         break;
 
       case VS_APP_EVENT_SOCIAL_ALERT:
+
+        /* State unconditionally, page change only from the two pages an alert
+         * may take over.  Same split as ALERT_CLEARED below and for a stronger
+         * reason: this event also carries the cloud's advice, which is the one
+         * thing an extreme moment produces, arrives once, and is retired from
+         * the session's tracking as it is delivered.  Guarding the whole case
+         * on the page dropped it outright if the user happened to be pausing,
+         * resuming or holding the exit key when it landed.
+         *
+         * Not entering the alert page from elsewhere is deliberate: a paused
+         * session is not observing anyone, and an exit already under way should
+         * not be interrupted.  The text and colour are still updated, so a
+         * session that returns to VS_PAGE_SOCIAL_RUNNING shows the current
+         * reading rather than a stale one.
+         */
+
+        runtime->emotion = event->emotion;
+        runtime->emotion_color = event->color;
+        snprintf(runtime->alert_text, sizeof(runtime->alert_text), "%s",
+                 event->text);
+
         if (runtime->page == VS_PAGE_SOCIAL_RUNNING ||
             runtime->page == VS_PAGE_SOCIAL_ALERT)
           {
-            runtime->emotion = event->emotion;
-            runtime->emotion_color = event->color;
-            snprintf(runtime->alert_text, sizeof(runtime->alert_text), "%s",
-                     event->text);
             runtime->page = VS_PAGE_SOCIAL_ALERT;
           }
         break;
 
       case VS_APP_EVENT_SOCIAL_ALERT_CLEARED:
-        if (runtime->page == VS_PAGE_SOCIAL_ALERT ||
-            runtime->page == VS_PAGE_SOCIAL_PAUSED)
+
+        /* The state goes unconditionally; only the page change is guarded.
+         *
+         * These three fields describe the emotion the session is reporting,
+         * which is a fact about the session and not about the page in front of
+         * it.  Guarding the whole case on the page -- as this did -- meant a
+         * clear that landed while the user was on the pausing, exiting or
+         * finalizing page was discarded, and vs_social does not resend: it has
+         * already dropped alert_active and bumped the generation.  The alert
+         * text and its colour then survived to the end of the session.
+         */
+
+        runtime->emotion = VS_EMOTION_NONE;
+        runtime->emotion_color = 0;
+        runtime->alert_text[0] = '\0';
+
+        if (runtime->page == VS_PAGE_SOCIAL_ALERT)
           {
-            runtime->emotion = VS_EMOTION_NONE;
-            runtime->emotion_color = 0;
-            runtime->alert_text[0] = '\0';
-            if (runtime->page == VS_PAGE_SOCIAL_ALERT)
-              runtime->page = VS_PAGE_SOCIAL_RUNNING;
+            runtime->page = VS_PAGE_SOCIAL_RUNNING;
           }
         break;
 

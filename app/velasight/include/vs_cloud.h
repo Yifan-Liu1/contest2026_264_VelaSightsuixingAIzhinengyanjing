@@ -294,6 +294,33 @@ struct vs_cloud_media_packet_s
    */
 
   uint32_t sequence;
+
+  /* When this media was produced, as CLOCK_MONOTONIC milliseconds, or zero to
+   * let the upload stamp itself as it registers.
+   *
+   * Supplying it matters as soon as more than one upload worker exists.  The
+   * registration body carries a timestamp, and taking it inside the register
+   * call means the value describes when the item happened to reach the front
+   * of the queue rather than when it was captured -- so a frame that waited
+   * behind two others is stamped late, and with concurrent workers two items
+   * can be stamped in the opposite order to the one they were captured in.
+   * Neither is recoverable afterwards, because nothing else records the
+   * capture time.
+   *
+   * Monotonic, and named for the clock rather than for the field it feeds,
+   * because the two are not the same domain and conflating them was a real
+   * bug: this arrived as CLOCK_MONOTONIC and went into the protocol's
+   * timestamp unconverted, which sent the cloud milliseconds since boot where
+   * it expected an epoch.  The conversion to wall clock happens inside
+   * vs_cloud_social_upload(), which is the only place that knows both clocks
+   * and the only place the answer is needed.
+   *
+   * Monotonic is the right thing to carry.  A wall clock read here would be
+   * stepped between production and upload -- see the "Clock too old" step in
+   * vela_tls.c -- and an age measured against a monotonic clock survives that.
+   */
+
+  uint64_t produced_ms;
 };
 
 /* Result of one upload.
@@ -313,6 +340,21 @@ struct vs_cloud_upload_s
 {
   char msg_id[VS_CLOUD_MSG_ID_MAX];
   bool payload_sent;
+
+  /* How long each half took, in milliseconds.
+   *
+   * Reported separately because the two halves are not comparable and only
+   * one of them is visible from outside: the transfer goes to the object
+   * store over TLS and logs a line per request, while the registration is a
+   * cleartext call to the business server that logs nothing at all.  A
+   * session whose uploads are slow therefore looks identical whether the
+   * store or the API is the reason, and the only way to tell from the log was
+   * to measure the gaps between the store's own lines.  These two numbers
+   * answer it directly.
+   */
+
+  uint32_t register_ms;
+  uint32_t transfer_ms;
 };
 
 /* One entry from a getResult response, already mapped onto UI vocabulary.
@@ -394,6 +436,16 @@ struct vs_social_event_s
  * 疑惑 and 惊讶, none of which belong under calm or happy in a three-way
  * split.  They sum to 100 unless the timeline was empty, in which case all
  * three are zero.
+ *
+ * Which means tense is not the extreme rate, and it is the obvious thing to
+ * mistake for it.  Only red is extreme by this interface; blue is four
+ * emotions that are merely not pleasant.  Measured 2026-09-07, a session
+ * reporting "tense 26" over 49 samples had roughly half of those entries blue.
+ * extreme_samples below is the number that answers "how much of this
+ * conversation was actually 生气 or 反感", and it is deliberately not folded
+ * into the three percentages: those are persisted in vs_history_index_s and
+ * shown on a screen with room for three figures, and changing their meaning
+ * would silently reinterpret every record already on the card.
  */
 
 struct vs_cloud_minutes_s
@@ -430,8 +482,16 @@ struct vs_cloud_minutes_s
   uint8_t happy;
   uint8_t tense;
 
-  uint16_t emotion_samples; /* entries in emotionTimeline */
+  uint16_t emotion_samples; /* entries in emotionTimeline, classified ones */
   uint16_t audio_samples;   /* entries in audioTimeline */
+
+  /* Of emotion_samples, the ones the cloud coloured red.  The cloud's own
+   * count of extreme frames for the whole session, which is what the device's
+   * polled tally has to be judged against: polling only sees the results that
+   * arrive before a message is retired, the timeline sees all of them.
+   */
+
+  uint16_t extreme_samples;
 };
 
 /****************************************************************************

@@ -61,32 +61,35 @@
  * that is not sector-aligned pays to fetch the partial sectors at both ends.
  *
  * The constraint is that a chunk has to be read in less time than the chunk
- * lasts, or the DAC starves.  8 KB is only 250 ms of 16 kHz mono, and the
- * same storage measured 0.77 s for a 1.4 KB write during a download, so 8 KB
- * left no margin at all: the 1 s pre-buffer would drain in the first few
- * reads and every one after that would be an underrun.
+ * lasts, or the DAC starves.  That was once a real problem: the same storage
+ * measured 8.9 KB/s against the 32 KB/s playback consumes, so no block size
+ * worked and the file had to be read in full before the DAC was opened.
  *
- * 64 KB is 2 s of 16 kHz mono and 128 sectors exactly, which puts the
- * per-call overhead into the noise and gives the ring time to absorb a slow
- * read.  The cost is reaction time: a stop is acted on at chunk boundaries,
- * so it is felt within one chunk's read rather than instantly.  That is the
- * right trade here because vs_audio_playback_stop() silences the DAC
- * immediately and independently -- the loop leaving late only delays the file
- * being closed, which nobody hears.
+ * It measures 605 KB/s now -- 486400 bytes in 803 ms, 2026-09-07 -- which is
+ * 19 times what playback needs.  The margin is that ratio, set by the card
+ * against the sample rate, and it does not change with the block size, so the
+ * block is now chosen for the memory it holds rather than for throughput.
+ * 16 KB is 512 ms of 16 kHz mono and 32 sectors exactly, read in about 27 ms.
+ *
+ * Reaction time also improves with a smaller block: a stop is acted on at
+ * chunk boundaries, so the loop leaves within one read rather than one 2 s
+ * read.  Either way nobody hears the difference, because
+ * vs_audio_playback_stop() silences the DAC immediately and independently --
+ * the loop leaving late only delays the file being closed.
  */
 
 #ifndef CONFIG_VS_TTS_CHUNK_BYTES
-#  define CONFIG_VS_TTS_CHUNK_BYTES 65536
+#  define CONFIG_VS_TTS_CHUNK_BYTES 16384
 #endif
 
 #define VS_TTS_CHUNK CONFIG_VS_TTS_CHUNK_BYTES
 
-/* Largest file that is read into memory before the DAC is opened.  See the
- * reasoning where it is used.
+/* Largest file that is read into memory before the DAC is opened, or zero to
+ * always stream.  Zero by default now; see the reasoning where it is used.
  */
 
 #ifndef CONFIG_VS_TTS_PRELOAD_MAX_BYTES
-#  define CONFIG_VS_TTS_PRELOAD_MAX_BYTES 1048576
+#  define CONFIG_VS_TTS_PRELOAD_MAX_BYTES 0
 #endif
 
 /* How far into a file the RIFF walk is willing to go before deciding the
@@ -499,50 +502,51 @@ static void vs_tts_play_file(const char *path, uint32_t generation)
          rate * channels > 0 ?
            (double)data_len / (double)(rate * channels * 2u) : 0.0);
 
-  /* Read it all before the DAC is opened, when it fits.
+  /* Stream through one small buffer, or read the file in full first when
+   * CONFIG_VS_TTS_PRELOAD_MAX_BYTES allows it.
    *
-   * This storage cannot feed realtime audio.  Measured 2026-09-07 on this
-   * board: 199680 bytes took 22467 ms to read, 8.9 KB/s, while 16 kHz 16-bit
-   * mono consumes 32 KB/s -- the card supplies 28% of what playback needs.  No
-   * block size fixes that; a bigger read reduces the number of calls, not the
-   * bytes per second.
+   * Streaming is the default and preloading is the fallback, which is the
+   * reverse of how this started.  Preloading existed because the storage could
+   * not feed realtime audio: measured 2026-09-07 before the SD-NAND fix,
+   * 199680 bytes took 22467 ms to read, 8.9 KB/s, against the 32 KB/s that
+   * 16 kHz 16-bit mono consumes.  At 28% of what playback needed a streamed
+   * file underran by arithmetic rather than by bad luck, and no block size
+   * fixed it -- a bigger read reduces the number of calls, not the bytes per
+   * second.  Reading the whole file first moved that waiting to the front,
+   * where it was silence before the audio instead of holes inside it.
    *
-   * So a streamed file underruns by arithmetic, not by bad luck, and the gaps
-   * land in the middle of the sentence.  Reading first moves all of that
-   * waiting to the front, where it is silence before the audio rather than
-   * holes inside it.
-   *
-   * It does not make playback finish sooner, and cannot: nothing can play audio
-   * faster than it can be read, so the whole thing still takes the read time
-   * either way.  What changes is where the delay is heard.  The trade is
-   * accepted deliberately -- a summary that plays cleanly after a pause is
-   * worth more than one that starts promptly and stutters.
-   *
-   * Bounded by CONFIG_VS_TTS_PRELOAD_MAX_BYTES, above which the streaming path
-   * below is used and the underruns come back.  That is the honest failure
-   * mode for a file too big to hold.
+   * The card measures 605 KB/s now, 19 times what playback consumes, so the
+   * premise is gone and preloading only has costs left.  Measured on the run
+   * that first played a file end to end: a 486400-byte preload left 103008
+   * bytes of PSRAM heap free out of 3014656, 3.4%, with the playback ring
+   * holding another 327680.  The budget above it was 1048576 -- so a file
+   * slightly larger would have failed to allocate, come back here anyway, and
+   * blamed memory for it.  Streaming has neither the peak nor that cliff, nor
+   * the 803 ms of silence in front of the audio.
    */
 
-  if (data_len <= CONFIG_VS_TTS_PRELOAD_MAX_BYTES)
+  if (CONFIG_VS_TTS_PRELOAD_MAX_BYTES != 0 &&
+      data_len <= CONFIG_VS_TTS_PRELOAD_MAX_BYTES)
     {
       buf = vs_tts_alloc(data_len, &buf_psram);
       if (buf != NULL)
         {
           preload = data_len;
         }
+      else
+        {
+          /* Asked for and refused, which is worth a line: the configuration
+           * wanted this file held and the heap could not, so what follows is
+           * not what was configured.
+           */
+
+          printf("%s: no memory to preload %zu bytes, streaming\n", VS_TTS_TAG,
+                 data_len);
+        }
     }
 
   if (buf == NULL)
     {
-      /* Either too large to hold or PSRAM could not spare it.  Stream, and say
-       * which, because the two have different answers.
-       */
-
-      printf("%s: streaming %zu bytes (%s), expect underruns\n", VS_TTS_TAG,
-             data_len,
-             data_len > CONFIG_VS_TTS_PRELOAD_MAX_BYTES ?
-               "over VS_TTS_PRELOAD_MAX_BYTES" : "no memory to preload");
-
       buf = vs_tts_alloc(VS_TTS_CHUNK, &buf_psram);
       if (buf == NULL)
         {
