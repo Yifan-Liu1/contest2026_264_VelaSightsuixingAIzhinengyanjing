@@ -451,7 +451,25 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
         {
           if (key == VS_KEY_BACK)
             {
-              lv_obj_set_pos(panel->key[key], 8, VS_LOWER_TOP_Y);
+              /* Half a glyph in from where it was, which is 8 px in
+               * velasight_font_16_ui.
+               *
+               * This slot holds the longest hint the UI has -- 按住结束 is four
+               * full-width glyphs, exactly the 64 px the box is wide -- so its
+               * first glyph starts at the box's left edge with nothing to
+               * spare.  At y=128, the row's lowest scanline, the display's
+               * chord runs x=16..144 for a centre of (80,80) and a radius of
+               * 80, so a glyph beginning at x=8 has its lower-left corner
+               * outside the circle.  Starting at 16 puts it on the chord
+               * instead of past it.
+               *
+               * Only this slot moves, because only this slot is asked to hold
+               * four glyphs.  The next-key opposite it never carries more than
+               * three -- 下一条 -- so its centred text starts at x=96 and has
+               * the same 8 px of clearance this change buys here.
+               */
+
+              lv_obj_set_pos(panel->key[key], 16, VS_LOWER_TOP_Y);
               lv_obj_set_width(panel->key[key], 64);
             }
           else if (key == VS_KEY_NEXT)
@@ -505,7 +523,23 @@ static void vs_render_content(struct vs_panel_s *panel,
       lv_obj_set_width(panel->meta, VS_META_WIDTH);
     }
 
-  vs_set_label(panel->title, snapshot->content_title);
+  /* The ring crosses this row, so the two cannot share it.
+   *
+   * The level sweep passes over the top of the screen, and at y=8 -- the title
+   * row's highest scanline -- the arc sits at x=56 and x=104 for a centre of
+   * (80,80) and a radius of 76.  A three-glyph centred title in the 64 px box
+   * at x=48 occupies exactly x=56..104, so the glyphs and the arc meet at both
+   * ends of the row.
+   *
+   * The text is what gives way rather than the ring, because the ring is now
+   * how this page reports its state and the right screen's own title still
+   * names the page: 社交中 while running, 情绪升高 once an alert stands.  So
+   * nothing is lost by dropping the duplicate, and the arc gets the row to
+   * itself.
+   */
+
+  vs_set_label(panel->title,
+               snapshot->emotion_ring ? "" : snapshot->content_title);
   vs_set_label(panel->body, snapshot->content_body);
   vs_set_label(panel->meta, snapshot->content_meta);
   for (int line = 0; line < 2; line++)
