@@ -506,6 +506,32 @@ static void *vs_network_start_worker(void *arg)
           vs_network_reset_ap_password(network) :
           vs_network_request_mode(network, worker->mode);
 
+  /* The clock, while still off the UI thread and before anyone is told the
+   * network is up.
+   *
+   * This board has no RTC and no SNTP, so CLOCK_REALTIME counts from zero
+   * until something sets it, and the only thing that does is vela_tls.c --
+   * with a hardcoded 2026-02-28, measured 2026-09-08 to be 191.9 days stale.
+   * Every history record's date and every timestamp sent to the cloud carried
+   * that.  One small GET here replaces it with the gateway's own Date header.
+   *
+   * Here rather than in the NETWORK_READY handler because that handler runs on
+   * the UI thread, where a blocking request is exactly the freeze
+   * social_post()'s comment describes.  Here rather than lazily at the first
+   * session because a record written before any session -- a voice round, a
+   * photo -- would otherwise still be misdated.
+   *
+   * Only on the station path: an access point this device is hosting has no
+   * route to the gateway, so asking would cost a DNS timeout for nothing.
+   * The failure is logged by vs_cloud_clock_sync() and is not fatal; the
+   * network is up either way, which is what the event below reports.
+   */
+
+  if (ret == 0 && !worker->reset_ap_password && worker->mode == VS_NET_STA)
+    {
+      (void)vs_cloud_clock_sync();
+    }
+
   pthread_mutex_lock(&g_app_events.lock);
   g_network_result = network;
   pthread_mutex_unlock(&g_app_events.lock);

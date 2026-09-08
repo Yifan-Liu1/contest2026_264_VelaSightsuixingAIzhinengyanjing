@@ -474,6 +474,205 @@ static uint64_t cloud_uptime_ms(void)
   return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+/* Whether this boot has already taken a date off the wire.
+ *
+ * A latch rather than a magnitude test, because a magnitude test cannot see
+ * the case this exists to fix.  vela_tls.c stamps CLOCK_REALTIME with the
+ * literal 1772275200 -- 2026-02-28 10:40:00 UTC -- whenever it finds the clock
+ * older than 2024, so by the time anything else looks, the clock already reads
+ * a plausible date and every "is it set?" test says yes.  Measured 2026-09-08:
+ * that constant was 191.9 days stale, and it grows a day staler every day the
+ * firmware is not rebuilt.
+ *
+ * So the first date this module can prove is correct wins, whatever the clock
+ * currently claims.  Once per boot and no more: stepping CLOCK_REALTIME is not
+ * free -- see cloud_uptime_ms() for what a mid-session step did to the upload
+ * timings -- and one correction is all a session needs.
+ */
+
+static bool g_cloud_clock_adopted;
+
+/****************************************************************************
+ * Name: cloud_days_from_civil
+ *
+ * Description:
+ *   Days from 1970-01-01 to the given proleptic Gregorian date.
+ *
+ *   Spelled out rather than calling timegm(), which this libc does not
+ *   provide, and rather than mktime(), which reads its input as local time --
+ *   an HTTP date is GMT by specification, so mktime() would be wrong by
+ *   whatever the zone happened to be.
+ *
+ ****************************************************************************/
+
+static int64_t cloud_days_from_civil(int year, unsigned int month,
+                                     unsigned int day)
+{
+  int64_t era;
+  unsigned int yoe;
+  unsigned int doy;
+  unsigned int doe;
+
+  year -= month <= 2;
+  era = (year >= 0 ? year : year - 399) / 400;
+  yoe = (unsigned int)(year - (int)(era * 400));
+  doy = (153 * (month + (month > 2 ? -3u : 9u)) + 2) / 5 + day - 1;
+  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+/****************************************************************************
+ * Name: cloud_clock_parse_imf
+ *
+ * Description:
+ *   Parse an HTTP-date in the only form RFC 9110 requires a sender to
+ *   produce: "Tue, 08 Sep 2026 08:30:23 GMT".
+ *
+ *   The two obsolete formats are not accepted.  Every response this module
+ *   sees comes from one gateway, measured 2026-09-08 to send IMF-fixdate, and
+ *   a parser for formats nothing sends is a parser nothing tests.
+ *
+ *   The weekday is skipped rather than checked.  It is redundant with the
+ *   date, and a peer that disagreed with itself about it would still be
+ *   telling the truth about the date.
+ *
+ * Returned Value:
+ *   true with *out set, or false when the field is not an IMF-fixdate or
+ *   names a date outside the range this device can be running in.
+ *
+ ****************************************************************************/
+
+static bool cloud_clock_parse_imf(const char *value, time_t *out)
+{
+  static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  char month_name[4];
+  const char *found;
+  int64_t epoch;
+  unsigned int day;
+  unsigned int hour;
+  unsigned int minute;
+  unsigned int second;
+  unsigned int month;
+  int year;
+
+  if (sscanf(value, "%*3s, %u %3s %d %u:%u:%u", &day, month_name, &year,
+             &hour, &minute, &second) != 6)
+    {
+      return false;
+    }
+
+  found = strstr(months, month_name);
+  if (found == NULL || (found - months) % 3 != 0)
+    {
+      return false;
+    }
+
+  month = (unsigned int)((found - months) / 3) + 1;
+
+  if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60)
+    {
+      return false;
+    }
+
+  epoch = cloud_days_from_civil(year, month, day) * 86400 +
+          (int64_t)hour * 3600 + (int64_t)minute * 60 + (int64_t)second;
+
+  /* Bounded on both sides.  A gateway that answered with 1970 or 2200 would
+   * be worse than the stale constant this replaces, because the stale one is
+   * at least inside every certificate's validity window.
+   */
+
+  if (epoch < 1704067200ll || epoch >= 4102444800ll)
+    {
+      return false;
+    }
+
+  *out = (time_t)epoch;
+  return true;
+}
+
+/****************************************************************************
+ * Name: cloud_clock_adopt
+ *
+ * Description:
+ *   Set CLOCK_REALTIME from a response's Date header, once per boot.
+ *
+ *   This is the device's only real time source.  There is no RTC in this
+ *   board's configuration -- CONFIG_RTC is not defined -- and no SNTP on any
+ *   path, so CLOCK_REALTIME starts at zero and counts up: the first handshake
+ *   of a session was measured reading 51 and 334 seconds.  What corrects it
+ *   today is vela_tls.c's hardcoded constant, which is not a clock but a
+ *   workaround for certificate validation, and it is wrong by half a year.
+ *
+ *   A response header costs nothing to read and is authoritative: the same
+ *   gateway that stamps it is the one the timestamps are being sent to.  It
+ *   also arrives at the right moment -- the first cloud call of a session is
+ *   cleartext and precedes the first TLS handshake, measured at 41 s -- so a
+ *   clock adopted here is already correct when vela_tls.c looks, and its
+ *   "Clock too old" branch stops being reached at all.
+ *
+ *   Called with the response header block, which is NUL-terminated by
+ *   cloud_plain_http_once() but has the body immediately after it, so the
+ *   search is bounded by header_end rather than by the terminator.
+ *
+ ****************************************************************************/
+
+static void cloud_clock_adopt(const char *header, const char *header_end)
+{
+  struct timespec ts;
+  const char *field;
+  uint64_t before;
+  time_t epoch;
+  struct tm tm;
+
+  if (g_cloud_clock_adopted || header == NULL || header_end == NULL)
+    {
+      return;
+    }
+
+  field = strcasestr(header, "\r\nDate:");
+  if (field == NULL || field >= header_end)
+    {
+      return;
+    }
+
+  field += strlen("\r\nDate:");
+  while (*field == ' ' || *field == '\t')
+    {
+      field++;
+    }
+
+  if (!cloud_clock_parse_imf(field, &epoch))
+    {
+      return;
+    }
+
+  before = cloud_now_ms() / 1000ull;
+  ts.tv_sec = epoch;
+  ts.tv_nsec = 0;
+
+  if (clock_settime(CLOCK_REALTIME, &ts) < 0)
+    {
+      printf("%s: cannot set the clock from the Date header: %d\n", CLOUD_TAG,
+             errno);
+      return;
+    }
+
+  /* Latched only on success, so a filesystem-less failure is retried on the
+   * next response rather than leaving the clock wrong for the whole boot.
+   */
+
+  g_cloud_clock_adopted = true;
+
+  if (gmtime_r(&epoch, &tm) != NULL)
+    {
+      printf("%s: clock set from the cloud's Date header to "
+             "%04d-%02d-%02d %02d:%02d:%02d UTC, was reading %llu\n",
+             CLOUD_TAG, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, (unsigned long long)before);
+    }
+}
+
 /****************************************************************************
  * Name: cloud_id_valid
  *
@@ -1488,6 +1687,15 @@ static int cloud_plain_http_once(const struct cloud_url_s *url,
                        cloud_range_has_token(cn, eol, "close");
         }
     }
+
+    /* The clock, from the same header block and under the same constraint as
+     * the three scans above: it has to be read before the body is moved over
+     * the header.  Every cleartext response is a candidate, which is why this
+     * needs no endpoint of its own -- the first cloud call of any session
+     * carries it.  See cloud_clock_adopt().
+     */
+
+    cloud_clock_adopt(resp, body_start);
   }
 
   /* A body the caller cannot hold is refused before it is read.  Truncating
@@ -2782,6 +2990,57 @@ void vs_cloud_endpoint(const char **host, uint16_t *port,
 bool vs_cloud_configured(void)
 {
   return g_cloud.configured;
+}
+
+bool vs_cloud_clock_synced(void)
+{
+  return g_cloud_clock_adopted;
+}
+
+int vs_cloud_clock_sync(void)
+{
+  char resp[96];
+  int ret;
+
+  if (g_cloud_clock_adopted)
+    {
+      return 0;
+    }
+
+  if (!g_cloud.configured)
+    {
+      return -ENODATA;
+    }
+
+  /* The status code is deliberately ignored, and so is the body.  What is
+   * wanted is the response header, and a 404 carries a Date exactly as a 200
+   * does -- so this works even against a gateway that has no ping endpoint,
+   * which is the point of not adding one to the interface.
+   *
+   * cloud_clock_adopt() has already run by the time this returns, from inside
+   * cloud_plain_http_once().  Reading the latch is how the outcome is known;
+   * there is no second parse here.
+   */
+
+  ret = cloud_api_call("GET", "/ping", NULL, resp, sizeof(resp));
+
+  if (g_cloud_clock_adopted)
+    {
+      return 0;
+    }
+
+  /* Named rather than silent, because the two reasons this fails want
+   * different actions.  A transport error is a network that is not up yet
+   * after all.  A clean exchange that produced no clock means the endpoint is
+   * TLS -- the header block on that path is parsed inside vela_tls.c, where
+   * this module cannot reach it -- and the stale constant is still in force.
+   */
+
+  printf("%s: clock not synced from the cloud (%s); timestamps will carry "
+         "vela_tls.c's forced date\n", CLOUD_TAG,
+         ret < 0 ? "endpoint unreachable" : "endpoint is TLS, header "
+         "unreachable from here");
+  return ret < 0 ? ret : -ENOTSUP;
 }
 
 const char *vs_cloud_device_id(void)

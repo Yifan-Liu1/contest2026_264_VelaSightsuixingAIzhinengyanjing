@@ -555,6 +555,53 @@ int vs_cloud_init(void);
 
 bool vs_cloud_configured(void);
 
+/****************************************************************************
+ * Name: vs_cloud_clock_synced
+ *
+ * Description:
+ *   Whether CLOCK_REALTIME has been set from a cloud response's Date header
+ *   this boot.
+ *
+ *   False does not mean the clock reads zero.  vela_tls.c stamps it with a
+ *   hardcoded 2026-02-28 on the first handshake, so a false here with a
+ *   plausible-looking date means the date is that constant -- measured
+ *   2026-09-08 to be 191.9 days stale, and staler every day.
+ *
+ ****************************************************************************/
+
+bool vs_cloud_clock_synced(void);
+
+/****************************************************************************
+ * Name: vs_cloud_clock_sync
+ *
+ * Description:
+ *   Ask the cloud what time it is, and set CLOCK_REALTIME from the answer.
+ *
+ *   Every cleartext cloud response already sets the clock as a side effect,
+ *   so a device that opens a social session needs no explicit call.  This
+ *   exists for the moment before that: the interval between the network
+ *   coming up and the first session, during which anything reading the wall
+ *   clock -- a history record's date, for one -- would get vela_tls.c's
+ *   constant.
+ *
+ *   Issues one small GET and ignores its status: a 404 carries a Date header
+ *   exactly as a 200 does, so this does not depend on the endpoint offering
+ *   any particular path.
+ *
+ *   Blocking, and not to be called from the UI thread.  vs_app.c calls it
+ *   from the network worker, which is off that thread by construction and is
+ *   the thread that knows the interface just came up.
+ *
+ * Returned Value:
+ *   0 when the clock is set -- including when it already was -- a negative
+ *   errno when the endpoint could not be reached, or -ENOTSUP when the
+ *   endpoint is TLS, whose response headers are parsed inside vela_tls.c
+ *   where this module cannot see them.
+ *
+ ****************************************************************************/
+
+int vs_cloud_clock_sync(void);
+
 /* This device's identifier, valid after vs_cloud_init().  Never NULL. */
 
 const char *vs_cloud_device_id(void);
