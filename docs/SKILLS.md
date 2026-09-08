@@ -113,6 +113,44 @@ AP 镜像只能通过 `EXTERNAL_AP_BIN` 接口注入打包流程，不得手工�
 
 当前 Secure alias / CMSE 只表示按现有 AP 的 SPE 编译属性建立功能基线，不等于镜像已通过 secure boot。在安全启动、OTP/eFuse 和 CPU1 镜像认证闭环前，输出只能标注为开发构建。
 
+### 3.7 启动堆预算：应用静态数据直接吃掉它
+
+AP 的内核堆就是 336 KiB SRAM 区段在 `.bss` 之上的余量，没有独立预留：
+
+```text
+up_allocate_heap() = __heap_start .. __heap_end
+__heap_start = _ebss 之上 0x1000     (bk7258_allocateheap.c)
+__heap_end   = 0x28064000
+当前实测      = 18408 B
+```
+
+所以**任何 app 的静态数据（`.bss`/`.data`）都是从启动堆里直接扣的**，链接报告里的
+`RAM %age Used` 就是这块预算的读数。
+
+关键在顺序：2.9 MB 的 PSRAM 堆由 `bk7258_psram_initialize()` 的
+`kmm_addregion()` 挂上，而那行在 `bk7258_pwc_start()` 末尾；把 PSRAM 弄上线的
+`pwc` 内核线程本身在同一函数更早处用
+`kthread_create("pwc", 110, 2048, ...)` 创建。也就是说 bring-up 期间**只有这十几 KB
+SRAM 堆存在**，PSRAM 一个字节都用不上。
+
+规则：
+
+- 应用不得为只在运行期使用的数据声明大块静态数组。会话期数据按会话从 PSRAM
+  分配（`social_alloc()` 之类 PSRAM-first 分配器），指针留在静态结构里。
+- 改动任何 app 后都要看链接报告的 `RAM` 行，与改动前对比。增长必须有理由。
+- 判断余量时不要看百分比，要算 `__heap_end - __heap_start`：
+
+```bash
+arm-none-eabi-nm cmake_out/bk7258-ap_ai_agent/nuttx | grep -E "__heap_start|__heap_end"
+```
+
+违反的症状与原因毫不相干，这是它值得单列一条的原因。实测 2026-09-08：
+VelaSight 把一张会话期跟踪表从 16 项扩到 24 项，`.bss` 增加 512 B，启动堆从
+17384 B 降到 16872 B，`kthread_create("pwc")` 随即失败。`bk7258_pwc_start()` 里
+该调用的失败分支没有打印，于是 bring-up 只留下 `board bring-up stopped, error=-1`，
+CP 侧报 `CPU1 boot timeout` / `OpenVela AP boot failed: -4102`。一个社交功能改坏了
+板子的启动，而 bring-up 从不接触那张表。修复是把该表改为按会话从 PSRAM 分配。
+
 ## 4. 当前实现状态
 
 以下状态以当前源码和最终 `.config` 为准，具体日期和提交见各子系统方案：
@@ -284,6 +322,8 @@ cmp -s \
 - 检查最终 `.config` 中关键符号与预期一致。
 - 检查 ELF attributes：Cortex-M33、hard-float、`-mcmse`。
 - 检查 `System.map` 和 section 边界不越界。
+- 检查启动堆 `__heap_end - __heap_start` 没有比上一个能启动的版本更小；见 3.7。
+  这一项不能用链接报告的百分比代替，0.15% 就够让 bring-up 失败。
 - 检查 `bk_package.json` 中 AP 角色和文件名。
 - 当前产品使用完整 CJK 字体；因 Beken code 分区必须按 `34K` 对齐，固定数据
   分区前的最大合法值为 `primary_ap_app=4148K`，AP linker raw `FLASH` 区域为

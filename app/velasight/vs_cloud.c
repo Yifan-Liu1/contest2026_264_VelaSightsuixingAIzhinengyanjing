@@ -2391,26 +2391,38 @@ static uint16_t cloud_json_confidence(const cJSON *obj)
  *             collapses the cloud's 20 and 21 into a single 20, so status
  *             cannot tell an extreme frame from a calm one.
  *
- *             The rule is two named emotions: 生气 or 伤心, one occurrence.
- *             Not the red bucket, which is what this used to test and which is
- *             wrong in both directions -- red also contains 反感, which does
- *             not trigger, and 伤心 is blue.  So colour and extreme are
- *             independent axes and a frame can be blue and extreme at once.
+ *             The rule is three named emotions -- 生气, 反感 or 伤心 -- one
+ *             occurrence within a ten-second window, and the cloud now colours
+ *             all three red.  So extreme and the red bucket coincide, which is
+ *             why the colour is what this tests first.
+ *
+ *             They have not always coincided and may not again, which is why
+ *             the detail test is kept alongside.  Before the cloud change 反感
+ *             was red and not extreme while 伤心 was extreme and blue, so the
+ *             two axes were genuinely independent and a blue frame could be
+ *             extreme.  Reading only the colour would have been wrong in both
+ *             directions then, and reading only the detail is a bet that the
+ *             emotion names never change.
  *
  *             Understand what this is, because it is the weaker of the two
- *             signals the device has.  The interface document does not define
- *             which emotions are extreme and does not carry a flag saying so --
- *             it only enumerates the palette.  The rule above reached this
- *             project out of band, so reproducing it here is an inference from
- *             detail strings against a rule that can change without the wire
- *             format changing at all.
+ *             signals the device has, and weaker in a specific way: the cloud
+ *             applies that rule to a *window*, not to a frame.  Confirmed from
+ *             the AI-side log of 2026-09-08: eight frames classified 害怕 --
+ *             which is none of the three -- were still announced as "[extreme]
+ *             检测到极端情绪" because the window's aggregate emotion was 生气,
+ *             and the one frame logged as "[negative] 非极端" was a 害怕 whose
+ *             window aggregate was also 害怕.  A frame this function calls calm
+ *             can therefore belong to an extreme moment, and the cloud will
+ *             attach that moment's advice to it.
  *
- *             The document's own signal is that the cloud opens a msgEvent 1
- *             entry under the image's msgId once it judges the frame extreme,
- *             which is visible in its debug example and is rule-independent.
- *             vs_social.c treats that as authoritative and ORs it over this;
- *             see social_advice_slot_in_batch().  This inference exists so a
- *             frame can raise an alert on the poll that first reports it,
+ *             That is why nothing here may retire a message.  The document's
+ *             own signal is that the cloud opens a msgEvent 1 entry under an
+ *             image's msgId once it judges the moment extreme, which is
+ *             rule-independent; vs_social.c treats it as authoritative, ORs it
+ *             over this, and holds every answered message long enough for it to
+ *             appear.  See social_advice_slot_in_batch() and
+ *             social_inflight_hold().  This per-frame inference exists only so
+ *             a frame can raise an alert on the poll that first reports it,
  *             without waiting to see whether a slot appears.
  *
  ****************************************************************************/
@@ -2419,16 +2431,35 @@ static void cloud_classify_emotion(const char *color, const char *detail,
                                    enum vs_emotion_e *emotion, uint32_t *rgb,
                                    bool *extreme)
 {
+  bool red = color != NULL && strcasecmp(color, "red") == 0;
+
   *emotion = VS_EMOTION_NONE;
   *rgb = 0xe8eef2;
 
-  /* Independent of the colour branches below, and deliberately evaluated
-   * before them so it is obvious that no branch sets it.
+  /* Either signal, and evaluated ahead of the colour branches so it is obvious
+   * that no branch sets it.
+   *
+   * The colour is the primary test now.  Under the current cloud rule the three
+   * extreme emotions are exactly the red bucket, so a single field settles it
+   * and no Chinese substring has to be matched to get the common case right.
+   *
+   * The detail test stays as a second path rather than being deleted, because
+   * the two can only agree while the cloud keeps them aligned and they have
+   * already come apart once: 反感 used to be red and not extreme, and 伤心 used
+   * to be extreme and blue.  A result carrying a detail but no colour, or a
+   * colour this palette does not know, still classifies correctly through it.
+   *
+   * The two disagreeing is visible rather than silent: vs_social.c reports which
+   * half fired for every folded result, as "red" or "detail" in its extreme_src,
+   * so a session carrying "detail" lines says directly that the cloud has moved
+   * one of the three emotions out of the red bucket.
    */
 
-  *extreme = detail != NULL &&
-             (strstr(detail, "生气") != NULL ||
-              strstr(detail, "伤心") != NULL);
+  *extreme = red ||
+             (detail != NULL &&
+              (strstr(detail, "生气") != NULL ||
+               strstr(detail, "反感") != NULL ||
+               strstr(detail, "伤心") != NULL));
 
   if (color == NULL)
     {
@@ -3684,6 +3715,32 @@ static bool cloud_parse_entry(cJSON *entry, struct vs_social_event_s *out)
         return false;
     }
 
+  /* Status 21 on an image entry is the server's code leaking through, not the
+   * peer's.
+   *
+   * The two sets overlap on this value and mean different things: peer 21 is
+   * "advice attached", server 21 is "image judged extreme".  The switch above
+   * cannot tell them apart because it runs before msgEvent is known, and it
+   * resolves the value as a peer code -- so an image entry arrived claiming to
+   * carry advice.  vs_social.c's advice arm then declined it for having the
+   * wrong msgEvent and its emotion arm never saw it, which loses the frame's
+   * emotion and the extreme verdict together.
+   *
+   * msgEvent decides.  Only a msgEvent 1 entry can carry advice, and only a
+   * msgEvent 0 entry can be an image verdict, so pairing 21 with msgEvent 0
+   * identifies the server code unambiguously.  Extreme is left to
+   * emotionDetail below rather than taken from the status, because that is the
+   * one definition of the word this file has.
+   */
+
+  if (out->peer_state == VS_CLOUD_PEER_ADVICE_DONE &&
+      out->msg_event == VS_CLOUD_MSG_EVENT_IMAGE)
+    {
+      printf("%s: msg %s carried server status 21 on an image, reading it as "
+             "an emotion result\n", CLOUD_TAG, out->msg_id);
+      out->peer_state = VS_CLOUD_PEER_EMOTION_DONE;
+    }
+
   if (out->peer_state == VS_CLOUD_PEER_FAILED)
     {
       cloud_value_log(NULL, entry, out->log, sizeof(out->log));
@@ -4085,8 +4142,8 @@ out:
  *
  *   The three buckets follow the cloud's three colours: green 愉悦 is happy,
  *   green 中立 is calm, and red and blue both land in tense.  Folding blue in
- *   with red is a judgement: blue covers 害怕, 伤心, 疑惑 and 惊讶, and in a
- *   three-way split none of those reads as calm or happy.
+ *   with red is a judgement: blue covers 害怕, 疑惑 and 惊讶, and in a three-way
+ *   split none of those reads as calm or happy.
  *
  *   tense takes the rounding remainder so the three always total 100.
  *

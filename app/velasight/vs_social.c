@@ -188,7 +188,11 @@
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS
-#  define CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS 30000
+#  define CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS 60000
+#endif
+
+#ifndef CONFIG_VS_SOCIAL_ADVICE_GRACE_MS
+#  define CONFIG_VS_SOCIAL_ADVICE_GRACE_MS 6000
 #endif
 
 /* Room for the timestamp ring the raise decision keeps.  Sized to the ceiling
@@ -201,6 +205,13 @@
 #define SOCIAL_ALERT_NEEDED \
   (CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS < SOCIAL_ALERT_STAMP_MAX ? \
    CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS : SOCIAL_ALERT_STAMP_MAX)
+
+/* Size of the in-flight table, which is allocated rather than declared.  Spelled
+ * once here because sizeof() cannot be taken through the pointer that holds it.
+ */
+
+#define SOCIAL_INFLIGHT_BYTES \
+  (sizeof(struct social_inflight_s) * CONFIG_VS_SOCIAL_INFLIGHT_MAX)
 
 #ifndef CONFIG_VS_SOCIAL_AUDIO_QUEUE_SLOTS
 #  define CONFIG_VS_SOCIAL_AUDIO_QUEUE_SLOTS 16
@@ -236,7 +247,16 @@
 #define SOCIAL_IMAGE_RECOVER_STEP_MS 250u
 
 #ifndef CONFIG_VS_SOCIAL_INFLIGHT_MAX
-#  define CONFIG_VS_SOCIAL_INFLIGHT_MAX 16
+#  define CONFIG_VS_SOCIAL_INFLIGHT_MAX 24
+#endif
+
+/* The table cannot be deeper than one getResult can ask about.  See
+ * VS_CLOUD_POLL_MAX_IDS: the snapshot below stops at that limit and takes
+ * entries in arrival order, so a deeper table has a tail that is never polled.
+ */
+
+#if CONFIG_VS_SOCIAL_INFLIGHT_MAX > VS_CLOUD_POLL_MAX_IDS
+#  error "CONFIG_VS_SOCIAL_INFLIGHT_MAX exceeds VS_CLOUD_POLL_MAX_IDS"
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_UPLOAD_BACKOFF_MIN_MS
@@ -367,13 +387,36 @@ struct social_ring_s
 /* One uploaded image whose result has not finished arriving.
  *
  * Images only.  Audio uploads are deliberately not tracked here, and that
- * follows from the interface: the cloud attaches an extreme frame's advice to
- * the msgId of the *image* it judged extreme, not to any audio msgId.  So an
- * audio msgId can only ever answer 11 ("still working", forever) or 30, and
- * neither is acted on.  They used to occupy this table anyway -- at one chunk
- * per two seconds against sixteen slots, roughly half of it -- and the slots
- * they held were taken from the images that were waiting for the one result
- * the feature exists to produce.  See social_inflight_add().
+ * follows from the interface: the cloud attaches an extreme moment's advice to
+ * the msgId of an *image*, not to any audio msgId.  So an audio msgId can only
+ * ever answer 11 ("still working", forever) or 30, and neither is acted on.
+ * They used to occupy this table anyway -- at one chunk per two seconds against
+ * sixteen slots, roughly half of it -- and the slots they held were taken from
+ * the images that were waiting for the one result the feature exists to
+ * produce.  See social_inflight_add().
+ *
+ * An entry is not retired when its result arrives, and that is the correction
+ * this structure exists in its current shape for.  The device cannot predict
+ * which msgId an advice will come under.  Two things establish that, both from
+ * the AI-side log of 2026-09-08:
+ *
+ *   The cloud applies its extreme rule to a ten-second window rather than to a
+ *   frame.  Eight frames classified 害怕 -- which is none of 生气, 反感 and
+ *   伤心 -- were announced "[extreme] 检测到极端情绪" because the window's
+ *   aggregate emotion was 生气.  A frame this device reads as calm can belong to
+ *   an extreme moment.
+ *
+ *   The advice is attached to whichever msgId the cloud's pipeline holds when
+ *   the text is ready, including one whose image never classified.  At
+ *   14:52:59 an advice landed on msgId 54, whose image had 404ed three times
+ *   and would answer only with a failure.
+ *
+ * Retiring on the result therefore threw away exactly the messages the advice
+ * was about to arrive under -- counted afterwards as "a result for a retired
+ * id", which is why the device almost never received one.  So every answered
+ * entry is now held for CONFIG_VS_SOCIAL_ADVICE_GRACE_MS on the chance, and
+ * promoted to CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS the moment there is a reason
+ * to expect advice.  See social_inflight_hold().
  */
 
 struct social_inflight_s
@@ -381,38 +424,54 @@ struct social_inflight_s
   char     msg_id[VS_CLOUD_MSG_ID_MAX];
   uint32_t alert_gen;
 
-  /* The msgEvent 0 result has arrived, and whether it was extreme.
-   *
-   * Both together are what says "an advice is still coming": the cloud opens a
-   * msgEvent 1 sub-result under this same msgId as soon as it judges the frame
-   * extreme, so an extreme entry is not finished when its emotion arrives --
-   * it is finished when its advice does.  A calm entry has nothing further to
-   * wait for and is retired immediately.
+  /* A result for the msgEvent 0 side has arrived, of any kind -- an emotion or
+   * a failure.  Says the cloud has answered about the image, not that the
+   * answer was usable.
    */
 
   bool image_seen;
+
+  /* This message belongs to an extreme moment, by either signal: the rule
+   * reproduced from emotionDetail, or the cloud opening a msgEvent 1 slot.
+   *
+   * What it buys is the long deadline rather than the grace window.  It is not
+   * a precondition for collecting advice any more -- the cloud's choice of
+   * msgId does not respect it -- only a reason to wait longer.
+   */
+
   bool extreme;
 
   /* Whether a msgEvent 1 entry has ever been seen for this msgId, in any
-   * state.  Purely an observation: nothing decides anything on it.
+   * state.
    *
-   * It exists because the counters could not answer the one question that
-   * matters when no advice arrives -- did the cloud open a slot at all?  The
-   * arm that handles status 11 only acts when the entry is not already extreme,
-   * which is never true for the entries actually waiting, so a slot sitting at
-   * 11 for its whole thirty seconds was invisible.  Measured 2026-09-08: ten
-   * expired waits, and no way to tell a cloud stuck at 11 from a cloud that
-   * never answered msgEvent 1 at all.
+   * Both a promotion trigger and the answer to the one question the counters
+   * could not settle when no advice arrives: did the cloud open a slot at all?
+   * Measured 2026-09-08: ten expired waits, with no way to tell a cloud stuck
+   * at 11 from a cloud that never answered msgEvent 1.
    */
 
   bool advice_seen;
 
-  /* When the emotion arrived, so a wait for advice that the cloud never sends
-   * can be given up on.  The interface defines no terminal state for a
-   * msgEvent 1 that will not be answered, so the bound has to live here.
+  /* When the msgEvent 0 result arrived, for the log line that reports how long
+   * a wait lasted.  Zero until it does.
    */
 
   uint64_t image_at_ms;
+
+  /* When this entry was registered, for the same log line. */
+
+  uint64_t added_at_ms;
+
+  /* When to give up, absolute and monotonic.
+   *
+   * One deadline rather than a rule applied at each site, because the reasons
+   * to hold an entry accumulate -- registered, answered, judged extreme, slot
+   * observed -- and each one only ever extends it.  The interface defines no
+   * terminal state for a msgEvent 1 that will not be answered, so a deadline
+   * is the only thing that can end such a wait.
+   */
+
+  uint64_t retire_at_ms;
 };
 
 /* What social_poll_once() needs to do its work, gathered so it can live
@@ -608,9 +667,31 @@ struct social_state_s
   uint32_t upload_image_count;
   uint32_t upload_audio_count;
 
-  /* Messages awaiting results. */
+  /* Messages awaiting results.
+   *
+   * Allocated per session from PSRAM rather than living here, and the reason is
+   * the AP's SRAM budget rather than the size of the table.
+   *
+   * The kernel heap on this board is the tail of the 336 KiB RAM region --
+   * __heap_start is placed immediately above .bss by the linker -- so every byte
+   * of static data in this application is a byte the heap does not have.  It is
+   * 17 KiB at boot, and it is the *only* heap that exists during bring-up:
+   * bk7258_psram_initialize() adds the PSRAM region with kmm_addregion() at the
+   * end of bk7258_pwc_start(), while the "pwc" kernel thread that gets it there
+   * is created from the SRAM heap earlier in that same function.
+   *
+   * Measured 2026-09-08: growing this table from 16 to 24 entries added 512
+   * bytes of .bss, took the boot heap from 17384 to 16872 bytes, and
+   * kthread_create("pwc") then failed -- bring-up returned before PSRAM was ever
+   * brought online, and CP reported "CPU1 boot timeout".  A social feature had
+   * broken the board's boot by consuming heap it never touched.
+   *
+   * A pointer costs four bytes here and the table costs nothing until a session
+   * runs, which is long after PSRAM is online.  Indexing is unchanged.
+   */
 
-  struct social_inflight_s inflight[CONFIG_VS_SOCIAL_INFLIGHT_MAX];
+  struct social_inflight_s *inflight;
+  bool inflight_psram;
   uint8_t inflight_count;
 
   /* Entries thrown out because the table was full, and so never polled to a
@@ -675,10 +756,11 @@ struct social_state_s
   /* How the two extreme signals compare, which is the only way to tell whether
    * the out-of-band rule still matches what the cloud is doing.
    *
-   * by_slot counts frames the document's signal caught and the emotionDetail
-   * rule did not -- so a rising by_slot means the rule reproduced in
-   * cloud_classify_emotion() has drifted from the cloud's, and the comment
-   * naming 生气 and 伤心 needs revisiting.  Zero means the two agree.
+   * by_slot counts frames the document's signal caught and the local rule did
+   * not -- so a rising by_slot means the rule reproduced in
+   * cloud_classify_emotion() has drifted from the cloud's, and the red bucket
+   * and the three emotions it names both need revisiting.  Zero means they
+   * agree.
    *
    * late is the subset of those that arrived a poll too late to raise on; see
    * the VS_CLOUD_PEER_ADVICE_PENDING arm.
@@ -709,9 +791,48 @@ struct social_state_s
    */
 
   uint32_t advice_delivered;  /* reached the screen */
-  uint32_t advice_discarded;  /* arrived, but no alert it still described */
+  uint32_t advice_discarded;  /* arrived, but nothing left to attach it to */
   uint32_t advice_refused;    /* status 30 on the wait: cloud says never */
   uint32_t advice_expired;    /* VS_SOCIAL_ADVICE_TIMEOUT_MS elapsed */
+
+  /* Where the delivered advice came from, which is the measurement that says
+   * whether the grace window was worth its table slots.
+   *
+   * grace counts advice collected on a message this device had no reason to
+   * expect any from -- one it read as calm, or one whose image failed outright.
+   * Under the previous code every one of these was lost, so a non-zero figure
+   * here is the fix working and the size of it is how wrong the old assumption
+   * was.  See social_inflight_s for why the cloud does this.
+   *
+   * rescued is the narrower case of an advice that arrived in the same batch as
+   * the result that retired its message, and so was already unmatched by the
+   * time it was read.  Delivered from the event itself rather than from a table
+   * entry; see the unmatched arm of the poll loop.
+   *
+   * quiet counts delivery with no alert standing.  Not an error -- the advice is
+   * the scarce output and is shown regardless -- but it is the number that says
+   * the alert lifetime and the cloud's latency still do not line up.
+   */
+
+  uint32_t advice_from_grace;
+  uint32_t advice_rescued;
+  uint32_t advice_quiet;
+
+  /* Speculative holds that ran out, and messages the cloud never answered at
+   * all.  Split from advice_expired, which now means only "an entry that was
+   * expecting advice did not get it" -- the one figure that reflects on the
+   * cloud.  Together with it these account for every entry the sweep removes.
+   */
+
+  uint32_t grace_expired;
+  uint32_t image_unanswered;
+
+  /* Polls on which the alert would have been released but for an outstanding
+   * advice.  Bounded by CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS, so a large value
+   * means many alerts deferred rather than one deferred forever.
+   */
+
+  uint32_t release_deferred;
 
   /* Whether the cloud ever opened an advice slot, which the four counters
    * above cannot say.  All of them describe a slot that reached a terminal
@@ -879,9 +1000,9 @@ static uint64_t social_now_ms(void)
 #define SOCIAL_POST_ATTEMPTS  3
 #define SOCIAL_POST_RETRY_US  2000
 
-static void social_post(enum vs_app_event_e type, int error,
-                        enum vs_emotion_e emotion, uint32_t color,
-                        const char *text)
+static void social_post_full(enum vs_app_event_e type, int error,
+                             enum vs_emotion_e emotion, uint32_t color,
+                             bool extreme, const char *text)
 {
   struct vs_app_event_s event;
   unsigned int attempt;
@@ -892,6 +1013,7 @@ static void social_post(enum vs_app_event_e type, int error,
   event.error      = error;
   event.emotion    = emotion;
   event.color      = color;
+  event.extreme    = extreme;
 
   if (text != NULL)
     {
@@ -930,6 +1052,20 @@ static void social_post(enum vs_app_event_e type, int error,
     }
 
   printf("%s: UI event %d dropped, queue full\n", SOCIAL_TAG, (int)type);
+}
+
+/* The common case, where the event carries no emotion verdict.
+ *
+ * A wrapper rather than an extra argument at every call site: only the two
+ * emotion-bearing events have anything to say about extreme, and the other
+ * fourteen callers would have had to pass a literal false to express it.
+ */
+
+static void social_post(enum vs_app_event_e type, int error,
+                        enum vs_emotion_e emotion, uint32_t color,
+                        const char *text)
+{
+  social_post_full(type, error, emotion, color, false, text);
 }
 
 /****************************************************************************
@@ -1495,35 +1631,62 @@ static void social_queue_flush(void)
  * In-flight message tracking
  ****************************************************************************/
 
-/* True when this entry has been told it is extreme and is still waiting for the
- * advice that follows.  Called with the lock held.
+/* True when this entry has a reason to expect advice and is still waiting for
+ * it.  Called with the lock held.
  *
- * One decision reads this: the eviction below will not throw such an entry away
- * while it has an alternative, because that entry is the only thing that can
- * collect what the cloud produces for an extreme moment.
+ * Two readers, and they want the same question answered.  The eviction below
+ * will not throw such an entry away while it has an alternative, because that
+ * entry is the only thing that can collect what the cloud produces for an
+ * extreme moment.  And social_alert_release_stale() will not clear an alert
+ * while one exists, because an advice arriving after its alert has gone has
+ * nothing on screen to attach to and is discarded.
  *
- * The alert release used to consult it too, through a social_awaiting_advice()
- * helper that has been removed along with the term.  The idea was that an alert
- * clearing before its advice arrived would make that advice stale and
- * discarded -- true, but it traded a certainty for a possibility.  Measured
- * 2026-09-08: the last extreme frame landed at 10:19:01.9, so
- * VS_SOCIAL_ALERT_HOLD_MS put the release at 10:19:13.9, and the alert actually
- * cleared at 10:19:31.888 -- six milliseconds after the last entry's
- * VS_SOCIAL_ADVICE_TIMEOUT_MS sweep, 18.6 s late, for advice that never came.
- * Against that, the one advice this cloud has ever delivered arrived 5.9 s
- * after its frame, well inside the 12 s hold, so the wait bought nothing even
- * in the case it was written for.  Under the current cloud rule -- one 生气 or
- * one 伤心, one occurrence -- extreme frames are frequent enough that an 18 s
- * over-hold would leave the alert up almost continuously.
- *
- * So the hold is the hold, and a late advice is discarded and counted as such.
- * If advice_discarded starts climbing, that is the evidence for reconsidering,
- * and it is a number now rather than an argument.
+ * That second reader was removed once, on the measurement that it held an alert
+ * 18.6 s past its hold for advice that never came, and reinstating it is part
+ * of the advice fix.  The measurement was real but the conclusion was wrong in
+ * one respect: with the hold shorter than the advice latency, *every* advice
+ * arrived to a cleared alert.  The bound that makes the wait safe is
+ * CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS via social_advice_sweep(), which runs
+ * ahead of the release on each poll -- so an entry whose advice has timed out
+ * stops holding the alert in the same pass rather than the next one.
  */
 
 static bool social_inflight_waiting(const struct social_inflight_s *entry)
 {
-  return entry->image_seen && entry->extreme;
+  return entry->extreme || entry->advice_seen;
+}
+
+/* True when this entry is answered and is only being kept on the chance that
+ * the cloud attaches an advice to it.  Called with the lock held.
+ *
+ * These are the speculative ones, and telling them apart matters in exactly one
+ * place: they are what eviction takes first among answered entries, because
+ * they are the answered entries least likely to still produce anything.
+ */
+
+static bool social_inflight_grace(const struct social_inflight_s *entry)
+{
+  return entry->image_seen && !social_inflight_waiting(entry);
+}
+
+/* Extend this entry's deadline to whatever its current state entitles it to.
+ * Called with the lock held.
+ *
+ * Only ever forward: the reasons to keep an entry accumulate and none of them
+ * revokes an earlier one, so a promotion cannot be undone by a later result
+ * that happens to arrive with a shorter entitlement.
+ */
+
+static void social_inflight_hold(struct social_inflight_s *entry, uint64_t now)
+{
+  uint64_t want = now + (social_inflight_waiting(entry) ?
+                         (uint64_t)CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS :
+                         (uint64_t)CONFIG_VS_SOCIAL_ADVICE_GRACE_MS);
+
+  if (want > entry->retire_at_ms)
+    {
+      entry->retire_at_ms = want;
+    }
 }
 
 /* Drop one entry by index.  Called with the lock held. */
@@ -1535,6 +1698,19 @@ static void social_inflight_remove(uint8_t index);
 static void social_inflight_add(const char *msg_id, uint32_t alert_gen)
 {
   struct social_inflight_s *entry;
+  uint64_t now = social_now_ms();
+
+  /* The table is allocated by the session thread and this runs on an upload
+   * worker, which that thread starts only after the allocation succeeded and
+   * joins before releasing it.  So this cannot fire -- and it is here anyway,
+   * because the cost is one compare against writing 72 bytes through a null
+   * pointer if that ordering is ever changed.
+   */
+
+  if (g_social.inflight == NULL)
+    {
+      return;
+    }
 
   if (g_social.inflight_count == CONFIG_VS_SOCIAL_INFLIGHT_MAX)
     {
@@ -1542,22 +1718,28 @@ static void social_inflight_add(const char *msg_id, uint32_t alert_gen)
       bool sacrificed = true;
       uint8_t i;
 
-      /* Evict something that is not waiting for advice, and prefer the oldest
-       * such entry -- the array is in arrival order, so the first match is it.
+      /* Evicted by what the entry can still produce, worst first, and within a
+       * class by age -- the array is in arrival order, so the first match is
+       * the oldest of its kind.  Three passes rather than one comparison
+       * because the classes are not orderable by a single field.
+       *
+       *   past its deadline   nothing; it is about to be swept anyway
+       *   grace only          a speculative wait for advice that may not come
+       *   no result yet       one frame's emotion, and the cloud still counts
+       *                       it in the end-of-session timeline
+       *   waiting for advice  the only output an extreme moment produces
        *
        * This used to be an unconditional "drop index 0", justified in a comment
        * that said it lost one frame's emotion result and nothing more.  Against
-       * this interface that was wrong.  An extreme frame's advice is delivered
-       * under the msgId of the image, so the entry waiting longest for its
-       * advice is exactly the entry a first-in-first-out eviction removes --
-       * and once removed the id is no longer polled at all, so the advice is
-       * never even fetched.  The one output the feature produces for an extreme
-       * moment was the thing most likely to be discarded.
+       * this interface that was wrong: an advice is delivered under an image's
+       * msgId, so the entry waiting longest for its advice is exactly the entry
+       * a first-in-first-out eviction removes -- and once removed the id is no
+       * longer polled at all, so the advice is never even fetched.
        */
 
       for (i = 0; i < g_social.inflight_count; i++)
         {
-          if (!social_inflight_waiting(&g_social.inflight[i]))
+          if (now >= g_social.inflight[i].retire_at_ms)
             {
               victim = i;
               sacrificed = false;
@@ -1567,14 +1749,44 @@ static void social_inflight_add(const char *msg_id, uint32_t alert_gen)
 
       if (sacrificed)
         {
+          for (i = 0; i < g_social.inflight_count; i++)
+            {
+              if (social_inflight_grace(&g_social.inflight[i]))
+                {
+                  victim = i;
+                  sacrificed = false;
+                  break;
+                }
+            }
+        }
+
+      if (sacrificed)
+        {
+          for (i = 0; i < g_social.inflight_count; i++)
+            {
+              if (!g_social.inflight[i].image_seen &&
+                  !social_inflight_waiting(&g_social.inflight[i]))
+                {
+                  victim = i;
+                  sacrificed = false;
+                  break;
+                }
+            }
+        }
+
+      if (sacrificed)
+        {
           /* Every slot is waiting for advice, so one of them has to go.  Worth
            * a line: it means the table is too small for the rate at which this
-           * conversation is producing extreme frames, and an advice is being
+           * conversation is producing extreme moments, and an advice is being
            * abandoned rather than merely delayed.
            */
 
-          printf("%s: inflight full of pending advice, abandoning msg %s\n",
-                 SOCIAL_TAG, g_social.inflight[0].msg_id);
+          printf("%s: inflight full of pending advice (%u slots), abandoning "
+                 "msg %s after %lu ms\n", SOCIAL_TAG,
+                 (unsigned)CONFIG_VS_SOCIAL_INFLIGHT_MAX,
+                 g_social.inflight[0].msg_id,
+                 (unsigned long)(now - g_social.inflight[0].added_at_ms));
         }
 
       social_inflight_remove(victim);
@@ -1584,7 +1796,17 @@ static void social_inflight_add(const char *msg_id, uint32_t alert_gen)
   entry = &g_social.inflight[g_social.inflight_count++];
   memset(entry, 0, sizeof(*entry));
   snprintf(entry->msg_id, sizeof(entry->msg_id), "%s", msg_id);
-  entry->alert_gen = alert_gen;
+  entry->alert_gen   = alert_gen;
+  entry->added_at_ms = now;
+
+  /* The full timeout before any result has arrived, not the grace window.  The
+   * grace window is what an *answered* message gets; this one is still waiting
+   * to be answered, and an image result was measured arriving up to twelve
+   * seconds after its upload.  A deadline shorter than that would retire
+   * messages the cloud was still working on.
+   */
+
+  entry->retire_at_ms = now + (uint64_t)CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS;
 }
 
 /* Drop one entry by index.  Called with the lock held. */
@@ -2600,14 +2822,22 @@ static bool social_emotion_step(const struct vs_social_event_s *event,
  * Name: social_advice_sweep
  *
  * Description:
- *   Give up on advice the cloud is never going to send.
+ *   Retire every entry whose deadline has passed, whatever it was holding on
+ *   for.
  *
- *   An extreme frame's entry is held so its msgEvent 1 result can be collected
- *   under the same msgId.  The interface defines no terminal state for a
- *   msgEvent 1 that will not be answered -- it goes to 11 and, if nothing
- *   comes, stays there -- so without a bound here such an entry is held for the
- *   rest of the session.  Enough of them and the table is full of permanent
- *   waiters, which is what forced the eviction that used to lose them.
+ *   The interface defines no terminal state for a msgEvent 1 that will not be
+ *   answered -- it goes to 11 and, if nothing comes, stays there -- so without a
+ *   bound here an entry expecting advice is held for the rest of the session.
+ *   Answered entries kept on speculation for CONFIG_VS_SOCIAL_ADVICE_GRACE_MS
+ *   need the same treatment for the same reason, and messages the cloud never
+ *   answers at all need it too.  One deadline per entry covers all three; see
+ *   social_inflight_hold().
+ *
+ *   The line it prints is the one to read when no advice arrives, because it
+ *   names which of the two situations happened: "slot seen" is a cloud that
+ *   opened a msgEvent 1 entry and then produced nothing, no slot is a message
+ *   the cloud was never going to advise on.  The previous version could not
+ *   tell those apart and the counters blamed the wrong side for both.
  *
  *   Runs on the poll loop, taking the lock itself.
  *
@@ -2624,18 +2854,59 @@ static void social_advice_sweep(void)
     {
       struct social_inflight_s *entry = &g_social.inflight[i];
 
-      if (social_inflight_waiting(entry) &&
-          now - entry->image_at_ms >= CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS)
+      if (now >= entry->retire_at_ms)
         {
           char msg_id[VS_CLOUD_MSG_ID_MAX];
+          bool waiting = social_inflight_waiting(entry);
+          bool answered = entry->image_seen;
+          bool slot = entry->advice_seen;
+          bool extreme = entry->extreme;
+          unsigned long held = (unsigned long)(now - entry->added_at_ms);
+
+          /* Everything the log line needs is copied out first: the removal
+           * memmoves the tail down, so entry stops describing this message the
+           * moment it returns.
+           */
 
           snprintf(msg_id, sizeof(msg_id), "%s", entry->msg_id);
           social_inflight_remove(i);
-          g_social.advice_expired++;
+
+          /* Counted apart, because they are different failures.  An entry that
+           * was expecting advice and did not get it is the feature not working;
+           * one that merely ran out its speculative window is the ordinary
+           * case, and lumping them together made the advice numbers unreadable.
+           * An entry the cloud never answered at all is a third thing again.
+           */
+
+          if (waiting)
+            {
+              g_social.advice_expired++;
+            }
+          else if (answered)
+            {
+              g_social.grace_expired++;
+            }
+          else
+            {
+              g_social.image_unanswered++;
+            }
 
           pthread_mutex_unlock(&g_social.lock);
-          printf("%s: no advice for msg %s within %d ms, giving up\n",
-                 SOCIAL_TAG, msg_id, CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS);
+
+          if (waiting)
+            {
+              printf("%s: no advice for msg %s after %lu ms (%s, extreme %s)\n",
+                     SOCIAL_TAG, msg_id, held,
+                     slot ? "slot seen, cloud produced nothing" :
+                            "no msgEvent 1 slot ever opened",
+                     extreme ? "yes" : "no");
+            }
+          else if (!answered)
+            {
+              printf("%s: msg %s never answered, %lu ms after upload\n",
+                     SOCIAL_TAG, msg_id, held);
+            }
+
           pthread_mutex_lock(&g_social.lock);
 
           /* The removal shifted the tail down, so this index has to be looked
@@ -2655,29 +2926,60 @@ static bool social_alert_release_stale(void)
 {
   uint64_t now = social_now_ms();
   bool cleared = false;
+  bool deferred = false;
 
   pthread_mutex_lock(&g_social.lock);
 
-  /* Both bounds have to pass, and they mean different things.  The cooldown is
-   * the readability floor the alert is entitled to whatever happens next; the
-   * hold is how long the absence of an extreme frame is allowed to be read as
-   * "over" rather than as "between frames".
+  /* All three bounds have to pass, and they mean different things.  The
+   * cooldown is the readability floor the alert is entitled to whatever happens
+   * next; the hold is how long the absence of an extreme frame is allowed to be
+   * read as "over" rather than as "between frames"; and the outstanding advice
+   * is the one thing the alert still owes the user.
+   *
+   * The third was absent, and that was the whole of "the device almost never
+   * shows an advice".  The cloud's advice arrives six to eighteen seconds after
+   * the moment (AI-side log, 2026-09-08) against a twelve-second hold, so the
+   * alert had usually gone by the time the text existed -- and the delivery test
+   * requires a standing alert, so every one of those arrivals was discarded.
+   *
+   * Bounded by social_advice_sweep(), which runs immediately before this on
+   * every poll: an entry past CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS is gone by the
+   * time this looks, so the deferral cannot outlast that.
    */
 
   if (g_social.alert_active &&
       now - g_social.alert_since_ms >= CONFIG_VS_SOCIAL_ALERT_COOLDOWN_MS &&
       now - g_social.alert_extreme_ms >= CONFIG_VS_SOCIAL_ALERT_HOLD_MS)
     {
-      g_social.alert_active = false;
+      uint8_t i;
 
-      /* Bumped for the same reason the other two paths bump it: advice still in
-       * flight for this alert would contradict a screen that has moved on.
-       */
+      for (i = 0; i < g_social.inflight_count; i++)
+        {
+          if (social_inflight_waiting(&g_social.inflight[i]))
+            {
+              deferred = true;
+              break;
+            }
+        }
 
-      g_social.alert_gen++;
-      g_social.extreme_have = 0;
-      g_social.extreme_head = 0;
-      cleared = true;
+      if (deferred)
+        {
+          g_social.release_deferred++;
+        }
+      else
+        {
+          g_social.alert_active = false;
+
+          /* Bumped for the same reason the other two paths bump it: advice
+           * still in flight for this alert would contradict a screen that has
+           * moved on.
+           */
+
+          g_social.alert_gen++;
+          g_social.extreme_have = 0;
+          g_social.extreme_head = 0;
+          cleared = true;
+        }
     }
 
   pthread_mutex_unlock(&g_social.lock);
@@ -2686,6 +2988,17 @@ static bool social_alert_release_stale(void)
     {
       printf("%s: alert released, no extreme frame for %d ms\n", SOCIAL_TAG,
              CONFIG_VS_SOCIAL_ALERT_HOLD_MS);
+    }
+  else if (deferred)
+    {
+      /* Every poll while it defers, which is at most
+       * CONFIG_VS_SOCIAL_ADVICE_TIMEOUT_MS / CONFIG_VS_SOCIAL_POLL_INTERVAL_MS
+       * lines per alert.  Worth that: an alert staying up past its hold is
+       * visible to the user and this is the only thing that explains it.
+       */
+
+      printf("%s: alert held past %d ms, advice still outstanding\n",
+             SOCIAL_TAG, CONFIG_VS_SOCIAL_ALERT_HOLD_MS);
     }
 
   return cleared;
@@ -2837,14 +3150,18 @@ static void social_poll_once(void)
       bool raise = false;
       bool clear = false;
       bool deliver_advice = false;
-      bool advice_dropped = false;
+      bool advice_quiet = false;
       bool advice_refused = false;
-      bool dropped_active = false;
-      uint32_t dropped_gen = 0;
-      char dropped_id[VS_CLOUD_MSG_ID_MAX];
+      bool report_emotion = false;
+      bool report_slot = false;
+      uint8_t tracked = 0;
       uint32_t gen = 0;
       uint32_t color = 0;
+      uint32_t waited_ms = 0;
       enum vs_emotion_e emotion = VS_EMOTION_NONE;
+      bool extreme = false;
+      const char *extreme_src = "-";
+      char dropped_id[VS_CLOUD_MSG_ID_MAX];
       char text[VS_TEXT_LONG];
 
       text[0] = '\0';
@@ -2871,17 +3188,57 @@ static void social_poll_once(void)
 
         if (!matched)
           {
-            /* Counted rather than ignored.  A result for an id this device is
-             * no longer tracking is how the cloud's extreme signal can still be
-             * lost: a frame retired as calm has its slot opened afterwards, and
-             * by then there is nothing left to attach it to.  The batch scan in
-             * EMOTION_DONE below closes that for the same-batch case, which is
-             * the one the document's example shows; this number is how a
-             * later-batch case would make itself known.
+            /* A result for an id this device is no longer tracking.
+             *
+             * With answered entries now held for their grace window this should
+             * be rare, and what is left is the one ordering it cannot prevent:
+             * an advice arriving in the same batch as the result that retired
+             * its own message.  The entries in a batch are not ordered, so the
+             * removal can be processed first, and then the advice -- the only
+             * output an extreme moment produces -- would be dropped here for
+             * want of a table row.
+             *
+             * It does not need one.  A msgEvent 1 result carries its own text;
+             * the entry was only ever the place the generation was remembered.
+             * So deliver it and say so.  Anything else unmatched is counted and
+             * named, because this is the one remaining place a cloud signal can
+             * go missing and a bare counter could not say which signal.
              */
 
+            bool rescue = ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO &&
+                          ev->peer_state == VS_CLOUD_PEER_ADVICE_DONE &&
+                          ev->suggestion[0] != '\0';
+            bool quiet = !g_social.alert_active;
+
             g_social.poll_unmatched++;
+
+            if (rescue)
+              {
+                g_social.advice_delivered++;
+                g_social.advice_rescued++;
+                if (quiet)
+                  {
+                    g_social.advice_quiet++;
+                  }
+              }
+
             pthread_mutex_unlock(&g_social.lock);
+
+            if (rescue)
+              {
+                printf("%s: advice for retired msg %s recovered%s: %s\n",
+                       SOCIAL_TAG, ev->msg_id,
+                       quiet ? " (no alert standing)" : "", ev->suggestion);
+                social_post_full(VS_APP_EVENT_SOCIAL_ADVICE, 0,
+                                 VS_EMOTION_TENSE, 0, true, ev->suggestion);
+              }
+            else
+              {
+                printf("%s: result for retired msg %s ignored, msgEvent %d "
+                       "status %d\n", SOCIAL_TAG, ev->msg_id,
+                       (int)ev->msg_event, ev->raw_status);
+              }
+
             continue;
           }
 
@@ -2905,10 +3262,12 @@ static void social_poll_once(void)
                * below 60" printed about fifty times at a steady 2.02 s, which
                * is the poll interval plus one round trip, not the image
                * interval.  Two things followed.  The advice deadline was pushed
-               * forward every time image_at_ms was rewritten, so
-               * social_advice_sweep() could never reach it -- there is not one
-               * timeout line in a session where entries waited over a hundred
-               * seconds.  And had the confidence gate not been rejecting these
+               * forward on every repeat, so social_advice_sweep() could never
+               * reach it -- there is not one timeout line in a session where
+               * entries waited over a hundred seconds.  The deadline now lives
+               * in social_inflight_s::retire_at_ms and this guard is what keeps
+               * a repeat from extending it.  And had the confidence gate not
+               * been rejecting these
                * frames, a single one counted twice would have satisfied
                * VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS on its own, which is the whole
                * debounce defeated by one frame.
@@ -2935,11 +3294,41 @@ static void social_poll_once(void)
                    * which is this thread's own working copy.
                    */
 
+                  /* Which half of the local rule fired, told apart by the
+                   * emotion the colour mapped to.
+                   *
+                   * VS_EMOTION_TENSE is the red bucket, so an extreme frame that
+                   * is also tense was caught by the colour and one that is not
+                   * was caught by an emotionDetail name outside red.  Under the
+                   * current cloud every extreme emotion is red, so "detail"
+                   * should never appear -- and if it starts to, the cloud has
+                   * moved one of 生气, 反感 or 伤心 out of the red bucket and
+                   * cloud_classify_emotion() needs revisiting.
+                   */
+
+                  extreme_src = !ev->extreme ? "-" :
+                                ev->emotion == VS_EMOTION_TENSE ? "red" :
+                                                                  "detail";
+
                   if (!ev->extreme &&
                       social_advice_slot_in_batch(scratch->events, got,
                                                   ev->msg_id))
                     {
                       ev->extreme = true;
+                      extreme_src = "slot(batch)";
+                      g_social.emotion_extreme_slot++;
+                    }
+
+                  /* A slot seen on an earlier poll counts too.  It is recorded
+                   * on the entry precisely so it can outlive the batch it
+                   * arrived in, and without this the entry would be folded in as
+                   * calm despite the cloud having already said otherwise.
+                   */
+
+                  if (!ev->extreme && g_social.inflight[index].advice_seen)
+                    {
+                      ev->extreme = true;
+                      extreme_src = "slot(earlier)";
                       g_social.emotion_extreme_slot++;
                     }
 
@@ -2949,8 +3338,11 @@ static void social_poll_once(void)
                    */
 
                   g_social.inflight[index].image_seen  = true;
-                  g_social.inflight[index].extreme     = ev->extreme;
                   g_social.inflight[index].image_at_ms = social_now_ms();
+                  if (ev->extreme)
+                    {
+                      g_social.inflight[index].extreme = true;
+                    }
 
                   g_social.emotion_results++;
                   if (ev->extreme)
@@ -2978,23 +3370,40 @@ static void social_poll_once(void)
                   (void)social_emotion_step(ev, &raise, &clear);
                   emotion = ev->emotion;
                   color   = ev->color;
+                  extreme = ev->extreme;
                   snprintf(text, sizeof(text), "%s", ev->display_text);
 
-                  /* An image that did not raise an alert produced an
-                   * emotionTimeline entry on the cloud and nothing on screen.
-                   * That is the design: the screen is for the moments worth
-                   * interrupting, the timeline is for the record.
+                  /* Held, not retired, and this is the correction that makes
+                   * the feature work at all.
                    *
-                   * Retire it now.  A calm frame never grows an audio entry --
-                   * the cloud only starts the advice chain for a frame it
-                   * judged extreme -- so waiting for one would hold the slot
-                   * until it aged out.
+                   * The old code retired a non-extreme entry here, reasoning
+                   * that the cloud only opens an advice chain for a frame it
+                   * judged extreme so a calm frame could never grow one.  The
+                   * cloud does not work that way: its rule runs over a
+                   * ten-second window, so a frame this device reads as calm can
+                   * belong to an extreme moment, and the advice for that moment
+                   * is attached to whichever msgId the pipeline is holding when
+                   * the text is ready.  Retiring on the result therefore threw
+                   * away most of the messages the advice was about to arrive
+                   * under.  See social_inflight_s for the two log findings.
+                   *
+                   * social_inflight_hold() gives an extreme entry the full
+                   * timeout and everything else the short grace window, so the
+                   * speculation costs table slots for a few poll cycles rather
+                   * than for the session.
                    */
 
-                  if (!ev->extreme)
-                    {
-                      social_inflight_remove(index);
-                    }
+                  social_inflight_hold(&g_social.inflight[index],
+                                       social_now_ms());
+                  report_emotion = true;
+
+                  /* Snapshotted here rather than read at the printf, which is
+                   * outside the lock.  Only a log value, but the uploader adds
+                   * to this table from another thread and a torn read would be
+                   * a torn read whatever it was for.
+                   */
+
+                  tracked = g_social.inflight_count;
                 }
               break;
 
@@ -3032,78 +3441,111 @@ static void social_poll_once(void)
                     {
                       g_social.inflight[index].advice_seen = true;
                       g_social.advice_slots_seen++;
+                      report_slot = true;
                     }
-                }
 
-              if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO &&
-                  g_social.inflight[index].image_seen &&
-                  !g_social.inflight[index].extreme)
-                {
-                  g_social.inflight[index].extreme = true;
-                  g_social.emotion_extreme++;
-                  g_social.emotion_extreme_slot++;
-                  g_social.emotion_extreme_late++;
+                  /* The promotion, and it no longer waits for the image result.
+                   *
+                   * It used to require image_seen, on the reasoning that a slot
+                   * only means something once the frame it belongs to has been
+                   * classified.  That had it backwards: an open slot is the
+                   * cloud's own statement that this moment is extreme, which is
+                   * a stronger signal than any emotionDetail rule and does not
+                   * need corroborating.  Requiring the image first meant a slot
+                   * that opened before its image result -- ordinary, since the
+                   * cloud pushes both within a second of each other -- left the
+                   * entry on the short grace window and it could age out before
+                   * the advice landed.
+                   */
+
+                  if (!g_social.inflight[index].extreme)
+                    {
+                      g_social.inflight[index].extreme = true;
+                      g_social.emotion_extreme++;
+                      g_social.emotion_extreme_slot++;
+                      if (g_social.inflight[index].image_seen)
+                        {
+                          g_social.emotion_extreme_late++;
+                        }
+                    }
+
+                  social_inflight_hold(&g_social.inflight[index],
+                                       social_now_ms());
                 }
               break;
 
             case VS_CLOUD_PEER_ADVICE_DONE:
               if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO)
                 {
-                  /* The generation test.  Advice for an alert that has since
-                   * cleared would contradict what is on screen, so it is
-                   * dropped rather than shown late.
+                  /* Delivered whenever it has text, and the removal of the
+                   * conditions that used to guard this is deliberate.
                    *
-                   * ">=", not "==".  An alert standing at generation G was
-                   * raised by incrementing alert_gen to G, so an image taken
-                   * before that raise carries G-1 and an image taken while the
-                   * alert stands carries G.  Both belong to this alert.  Only
-                   * something older than G-1 predates an earlier alert and is
-                   * genuinely stale.
+                   * There were two, a standing alert and a generation test, and
+                   * between them they rejected essentially every advice this
+                   * cloud sends.  The alert test is the fatal one: the advice
+                   * arrives six to eighteen seconds after the moment (AI-side
+                   * log, 2026-09-08) against a twelve-second alert hold, so by
+                   * the time the text existed there was usually no alert left.
+                   * social_alert_release_stale() now defers the release while an
+                   * advice is outstanding, which closes most of that gap -- but
+                   * only most, since an advice can still arrive on a message the
+                   * device never knew was extreme, and the deferral is bounded.
                    *
-                   * The equality this replaces admitted the first case and
-                   * rejected the second, and the second is the one the
-                   * interface produces: advice is delivered under "图片序列最后
-                   * 检测到极端情绪的最后一张图片" -- the last extreme
-                   * frame of the run, not the frame that happened to raise the
-                   * alert.  With
-                   * VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS at 2 the run usually
-                   * continues past the raise, so the frame the cloud advises on
-                   * is usually one taken during the alert, and the test threw
-                   * away exactly the advice it existed to protect.
+                   * The generation test was written to stop an advice
+                   * contradicting a screen that had moved on.  That concern is
+                   * answered better by pinning: VS_APP_EVENT_SOCIAL_ADVICE is
+                   * its own event, held on screen until another advice replaces
+                   * it, so it no longer competes with the emotion line for the
+                   * same field and cannot be contradicted by it.  Against that,
+                   * an advice is the only thing this feature produces for an
+                   * extreme moment and it arrives once; showing it a few seconds
+                   * late is worth far more than withholding it.
+                   *
+                   * gen is still read and still logged.  It is the measurement
+                   * that says how far behind the alert state these arrive, which
+                   * is what a future tightening would have to be argued from.
                    */
 
-                  if (g_social.alert_active &&
-                      gen + 1 >= g_social.alert_gen)
+                  if (ev->suggestion[0] != '\0')
                     {
                       deliver_advice = true;
+                      advice_quiet = !g_social.alert_active;
                       g_social.advice_delivered++;
+
+                      if (advice_quiet)
+                        {
+                          g_social.advice_quiet++;
+                        }
+
+                      /* Collected on a message this device had no reason to
+                       * expect advice from.  Every one of these was lost before
+                       * the grace window existed, so the count is how much the
+                       * old assumption was costing.
+                       */
+
+                      if (!g_social.inflight[index].extreme &&
+                          !g_social.inflight[index].advice_seen)
+                        {
+                          g_social.advice_from_grace++;
+                        }
+
                       snprintf(text, sizeof(text), "%s", ev->suggestion);
                       emotion = VS_EMOTION_TENSE;
+                      extreme = true;
+                      waited_ms = (uint32_t)
+                        (social_now_ms() -
+                         g_social.inflight[index].added_at_ms);
                     }
                   else
                     {
-                      /* Counted apart from the sweep's timeouts.  An advice
-                       * that arrived and was thrown away is a device fault; one
-                       * that never arrived is not, and a single "missed" figure
-                       * covering both said nothing about either.  Measured
-                       * 2026-09-07: 7 missed was 6 frames the cloud was never
-                       * going to advise on plus the 1 advice it did send.
+                      /* Terminal and empty.  The cloud says the advice is done
+                       * and sent nothing, which is not a device fault but is
+                       * still an extreme moment that produced no output.
                        */
 
                       g_social.advice_discarded++;
-
-                      /* Named rather than silent.  This is the feature's only
-                       * output for an extreme moment, and the two reasons it
-                       * can be discarded need telling apart: no alert standing
-                       * at all, or an alert from a later moment that this
-                       * advice no longer describes.
-                       */
-
-                      advice_dropped = true;
                       snprintf(dropped_id, sizeof(dropped_id), "%s",
                                ev->msg_id);
-                      dropped_gen = gen;
-                      dropped_active = g_social.alert_active;
                     }
 
                   social_inflight_remove(index);
@@ -3112,38 +3554,100 @@ static void social_poll_once(void)
 
             case VS_CLOUD_PEER_FAILED:
 
-              /* 30 collapses four server-side reasons, the common one being
-               * "no usable face in the frame".  At two frames a second that is
-               * ordinary rather than exceptional, so it is retired quietly --
-               * unless it lands on an entry that was waiting for advice, which
-               * is the interface's one way of saying "there will be none" and
-               * is worth a line.
+              /* 30 collapses four server-side reasons, and which side failed
+               * decides what to do about it.  msgEvent tells them apart, and
+               * this arm used to ignore it and treat both the same way.
+               *
+               *   msgEvent 1  "音频无有效声音" or the audio could not be read.
+               *               A real terminal answer to the wait: there will be
+               *               no advice for this message, so the entry is done.
+               *
+               *   msgEvent 0  no usable face, or the image could not be read.
+               *               Ordinary at two frames a second -- and emphatically
+               *               not a statement about advice.  Measured on the
+               *               AI side 2026-09-08 at 14:52:59: an advice landed on
+               *               msgId 54 whose image had 404ed three times.  So the
+               *               image is written off and the message is held on the
+               *               same grace window an answered one gets.
+               *
+               * Retiring on an image failure was the second largest source of
+               * lost advice after retiring on a calm result, and for the same
+               * reason: the device was deciding on the cloud's behalf which
+               * messages could still produce something.
                */
 
               g_social.failed_results++;
 
-              if (social_inflight_waiting(&g_social.inflight[index]))
+              if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO)
                 {
                   advice_refused = true;
                   g_social.advice_refused++;
                   snprintf(dropped_id, sizeof(dropped_id), "%s", ev->msg_id);
                   snprintf(text, sizeof(text), "%s", ev->log);
+                  social_inflight_remove(index);
                 }
-
-              social_inflight_remove(index);
+              else
+                {
+                  g_social.inflight[index].image_seen  = true;
+                  g_social.inflight[index].image_at_ms = social_now_ms();
+                  social_inflight_hold(&g_social.inflight[index],
+                                       social_now_ms());
+                }
               break;
 
             default:
-              /* 10, 11 and 40 all mean "still working".  Leave it in flight. */
+
+              /* 0, 10 and 40 all mean "still working"; 11 has its own arm
+               * above.  Leave the entry in flight on its existing deadline.
+               */
+
               break;
           }
       }
 
       pthread_mutex_unlock(&g_social.lock);
 
+      /* One line per folded emotion result, and it is the line the whole
+       * extreme path is diagnosed from.
+       *
+       * Nothing printed the per-frame verdict before.  The session totals said
+       * how many results were extreme and the alert path said when it fired,
+       * but between "the cloud classified this frame" and "the device decided
+       * it was not extreme" there was no record at all -- so a session where the
+       * cloud saw fifty extreme frames and the device raised nothing could not
+       * be explained without guessing which of the two rules disagreed.
+       *
+       * extreme_src is what settles it: "detail" means the emotionDetail rule
+       * fired, "slot" means the cloud's own msgEvent 1 did and the local rule
+       * did not, "-" means neither.  A session full of "slot" lines is a local
+       * rule that has drifted from the cloud's.
+       */
+
+      if (report_emotion)
+        {
+          printf("%s: msg %s emotion %s conf %u extreme %s (%s), "
+                 "inflight %u\n", SOCIAL_TAG, ev->msg_id,
+                 text[0] != '\0' ? text : "-",
+                 (unsigned)ev->confidence, extreme ? "yes" : "no",
+                 extreme_src, (unsigned)tracked);
+        }
+
+      if (report_slot)
+        {
+          /* The cloud has committed to advising on this message.  Worth a line
+           * on its own: from here the only outcomes are a delivery, a refusal or
+           * a timeout, and knowing the slot opened is what makes a later timeout
+           * mean "the cloud did not follow through" rather than "there was
+           * nothing to follow through on".
+           */
+
+          printf("%s: advice slot opened on msg %s\n", SOCIAL_TAG, ev->msg_id);
+        }
+
       if (raise)
         {
-          social_post(VS_APP_EVENT_SOCIAL_ALERT, 0, emotion, color, text);
+          social_post_full(VS_APP_EVENT_SOCIAL_ALERT, 0, emotion, color,
+                           extreme, text);
         }
       else if (clear)
         {
@@ -3153,13 +3657,16 @@ static void social_poll_once(void)
 
       if (deliver_advice && text[0] != '\0')
         {
-          /* Still an ALERT rather than a new event type: the page is already
-           * showing the alert, and this replaces its text with the advice the
-           * cloud derived from the surrounding audio.
+          /* Its own event, not an ALERT.  See VS_APP_EVENT_SOCIAL_ADVICE: an
+           * advice arrives once and has to survive the emotion readings that
+           * follow it, which it could not while both wrote the same field.
            */
 
-          printf("%s: advice for msg %s: %s\n", SOCIAL_TAG, ev->msg_id, text);
-          social_post(VS_APP_EVENT_SOCIAL_ALERT, 0, emotion, color, text);
+          printf("%s: advice for msg %s after %lu ms%s: %s\n", SOCIAL_TAG,
+                 ev->msg_id, (unsigned long)waited_ms,
+                 advice_quiet ? " (no alert standing)" : "", text);
+          social_post_full(VS_APP_EVENT_SOCIAL_ADVICE, 0, emotion, color,
+                           true, text);
         }
 
       if (advice_refused)
@@ -3168,11 +3675,10 @@ static void social_poll_once(void)
                  dropped_id, text[0] != '\0' ? ": " : "", text);
         }
 
-      if (advice_dropped)
+      if (!deliver_advice && dropped_id[0] != '\0' && !advice_refused)
         {
-          printf("%s: advice for msg %s discarded, %s (gen %lu)\n", SOCIAL_TAG,
-                 dropped_id, !dropped_active ? "no alert standing" :
-                 "belongs to an earlier alert", (unsigned long)dropped_gen);
+          printf("%s: advice for msg %s arrived empty (gen %lu)\n", SOCIAL_TAG,
+                 dropped_id, (unsigned long)gen);
         }
     }
 }
@@ -3345,13 +3851,17 @@ static void social_release_devices(void)
   struct vs_media_stream_s *camera;
   struct vs_audio_cap_s *mic;
   struct social_poll_scratch_s *poll;
+  struct social_inflight_s *inflight;
   bool poll_psram;
+  bool inflight_psram;
 
   pthread_mutex_lock(&g_social.lock);
   camera = g_social.camera;
   mic    = g_social.mic;
   poll   = g_social.poll;
   poll_psram = g_social.poll_psram;
+  inflight   = g_social.inflight;
+  inflight_psram = g_social.inflight_psram;
   g_social.camera = NULL;
   g_social.mic    = NULL;
 
@@ -3363,11 +3873,27 @@ static void social_release_devices(void)
    */
 
   g_social.poll = NULL;
+
+  /* The in-flight table goes the same way, and here the race is real rather
+   * than notional: social_inflight_add() runs on the upload workers.  They have
+   * been joined by the time this is reached -- social_stop_producers() and the
+   * upload drain both precede it -- so clearing the pointer under the lock is
+   * belt and braces, and the count goes with it so nothing can index a table
+   * that is no longer there.
+   */
+
+  g_social.inflight = NULL;
+  g_social.inflight_count = 0;
   pthread_mutex_unlock(&g_social.lock);
 
   if (poll != NULL)
     {
       social_free((unsigned char *)poll, poll_psram);
+    }
+
+  if (inflight != NULL)
+    {
+      social_free((unsigned char *)inflight, inflight_psram);
     }
 
   if (camera != NULL)
@@ -3477,12 +4003,12 @@ static void social_log_totals(void)
    * single "missed" they used to share hid which side was at fault.
    *
    *   delivered  reached the screen.  The only success.
-   *   discarded  the cloud sent it and the device threw it away.  A device
-   *              fault every time, and the one to act on.
+   *   discarded  the cloud said the advice was done and sent no text.
    *   refused    the cloud answered the wait with status 30.  A real answer.
-   *   expired    nothing came within VS_SOCIAL_ADVICE_TIMEOUT_MS.  Mostly
-   *              ordinary: the cloud advises once per extreme run, on its last
-   *              frame, so every earlier red frame in a run expires by design.
+   *   expired    a message that was expecting advice did not get it within
+   *              VS_SOCIAL_ADVICE_TIMEOUT_MS.  Partly ordinary: the cloud
+   *              advises once per extreme run, so earlier frames in a run
+   *              expire by design.
    */
 
   printf("%s: advice: %lu delivered, %lu discarded, %lu refused, "
@@ -3491,6 +4017,27 @@ static void social_log_totals(void)
          (unsigned long)g_social.advice_discarded,
          (unsigned long)g_social.advice_refused,
          (unsigned long)g_social.advice_expired);
+
+  /* Where the deliveries came from, which is what says whether the grace window
+   * earns its table slots.
+   *
+   *   grace    collected on a message this device had no reason to expect any
+   *            advice from -- read as calm, or its image failed outright.  Every
+   *            one of these was lost before the window existed, so this figure
+   *            is the size of the bug that was fixed.
+   *   rescued  arrived in the same batch as the result that retired its own
+   *            message, and was delivered from the event rather than a table
+   *            entry.
+   *   quiet    delivered with no alert standing.  Not a fault -- the advice is
+   *            shown regardless -- but it measures how far the cloud's latency
+   *            still runs past VS_SOCIAL_ALERT_HOLD_MS.
+   */
+
+  printf("%s: advice source: %lu from grace window, %lu rescued unmatched, "
+         "%lu with no alert standing\n", SOCIAL_TAG,
+         (unsigned long)g_social.advice_from_grace,
+         (unsigned long)g_social.advice_rescued,
+         (unsigned long)g_social.advice_quiet);
 
   /* Whether the cloud ever opened a slot, and whether the results it did send
    * carried anything.  The four counters above describe terminal states only,
@@ -3501,6 +4048,19 @@ static void social_log_totals(void)
   printf("%s: advice slots: %lu opened, %lu pending result(s) seen\n",
          SOCIAL_TAG, (unsigned long)g_social.advice_slots_seen,
          (unsigned long)g_social.advice_pending_seen);
+
+  /* What the sweep removed that was not waiting for advice, and how often the
+   * alert was held back for one that was.  Read grace against
+   * advice_from_grace: the ratio is how speculative the window is, and a
+   * from_grace of zero over many grace_expired means the cloud has stopped
+   * attaching advice to unexpected messages and the window can be shortened.
+   */
+
+  printf("%s: holds: %lu grace window(s) expired, %lu message(s) never "
+         "answered, %lu alert release(s) deferred\n", SOCIAL_TAG,
+         (unsigned long)g_social.grace_expired,
+         (unsigned long)g_social.image_unanswered,
+         (unsigned long)g_social.release_deferred);
 
   printf("%s: payload: %lu of %lu result(s) carried no emotion "
          "(%lu sent no response)\n", SOCIAL_TAG,
@@ -3916,7 +4476,7 @@ static void social_collect_minutes(const char *msg_id)
 
   /* The extreme count is printed next to the polled one on purpose.  tense
    * folds red and blue together -- see vs_cloud_minutes_s -- so it cannot say
-   * how much of the conversation was actually 生气 or 反感, and the two figures
+   * how much of the conversation the cloud actually flagged, and the two figures
    * side by side are what shows whether polling saw the extreme frames the
    * cloud's own timeline recorded.
    */
@@ -4144,6 +4704,24 @@ static void *social_session_worker(void *arg)
                   0, "系统资源不足");
       goto close_session;
     }
+
+  /* The in-flight table, for the same reason and from the same pool.  See
+   * social_state_s::inflight: keeping it static cost the boot heap 1.7 KiB it
+   * needs before PSRAM exists.
+   */
+
+  g_social.inflight = (struct social_inflight_s *)
+    social_alloc(SOCIAL_INFLIGHT_BYTES, &g_social.inflight_psram);
+  if (g_social.inflight == NULL)
+    {
+      printf("%s: no memory for the %zu-byte inflight table\n", SOCIAL_TAG,
+             (size_t)SOCIAL_INFLIGHT_BYTES);
+      social_post(VS_APP_EVENT_SOCIAL_START_FAILED, -ENOMEM, VS_EMOTION_NONE,
+                  0, "系统资源不足");
+      goto close_session;
+    }
+
+  memset(g_social.inflight, 0, SOCIAL_INFLIGHT_BYTES);
 
   ret = vs_media_stream_open(&g_social.camera, CONFIG_VS_SOCIAL_IMAGE_WIDTH,
                              CONFIG_VS_SOCIAL_IMAGE_HEIGHT,
@@ -4502,6 +5080,12 @@ int vs_social_start(uint32_t request_id)
   g_social.advice_expired   = 0;
   g_social.advice_slots_seen   = 0;
   g_social.advice_pending_seen = 0;
+  g_social.advice_from_grace   = 0;
+  g_social.advice_rescued      = 0;
+  g_social.advice_quiet        = 0;
+  g_social.grace_expired       = 0;
+  g_social.image_unanswered    = 0;
+  g_social.release_deferred    = 0;
   g_social.emotion_blind       = 0;
   g_social.emotion_no_response = 0;
   g_social.poll_yielded     = 0;
@@ -4518,7 +5102,15 @@ int vs_social_start(uint32_t request_id)
   g_social.mic            = NULL;
   memset(g_social.audio_slot, 0, sizeof(g_social.audio_slot));
   memset(g_social.image_slot, 0, sizeof(g_social.image_slot));
-  memset(g_social.inflight, 0, sizeof(g_social.inflight));
+
+  /* The in-flight table is not cleared here and cannot be: it does not exist
+   * yet.  The session worker allocates it from PSRAM and zeroes it there, which
+   * is also the only place that knows whether the allocation succeeded.  The
+   * pointer is cleared instead, so nothing between here and that allocation can
+   * reach a table left over from the previous session.
+   */
+
+  g_social.inflight = NULL;
 
   g_social.running = true;
   pthread_mutex_unlock(&g_social.lock);

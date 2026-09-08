@@ -30,6 +30,21 @@ enum vs_app_event_e
   VS_APP_EVENT_SOCIAL_START_FAILED,
   VS_APP_EVENT_SOCIAL_ALERT,
   VS_APP_EVENT_SOCIAL_ALERT_CLEARED,
+
+  /* The cloud's spoken-advice text for an extreme moment.
+   *
+   * Its own event rather than another SOCIAL_ALERT, and the separation is the
+   * point.  An alert is the current reading and is replaced by the next one a
+   * second later; an advice is produced once per extreme run, arrives seconds
+   * after the frame that caused it, and is the only output this feature has.
+   * Carried on the alert event, it was overwritten by the next emotion result
+   * before the user could read it, and erased outright by ALERT_CLEARED.
+   *
+   * So the UI pins it: an advice stays on screen until another advice replaces
+   * it or its own dwell expires, whatever the emotion does in between.
+   */
+
+  VS_APP_EVENT_SOCIAL_ADVICE,
   VS_APP_EVENT_SOCIAL_PAUSED,
   VS_APP_EVENT_SOCIAL_RESUMED,
   VS_APP_EVENT_SOCIAL_PAUSE_FAILED,
@@ -78,6 +93,23 @@ struct vs_app_event_s
   uint32_t request_id;
   enum vs_emotion_e emotion;
   uint32_t color;
+
+  /* Whether the cloud judged this reading an extreme emotion.  Meaningful on
+   * SOCIAL_ALERT and SOCIAL_ADVICE.
+   *
+   * Sent rather than inferred from emotion here, even though the cloud's
+   * current buckets make the two agree: extreme is 生气, 反感 or 伤心 and all
+   * three are coloured red, so red and extreme now coincide.
+   *
+   * They coincided by a cloud change rather than by construction, and inferring
+   * it locally was wrong in both directions before that change -- 反感 was red
+   * and calm, 伤心 was blue and extreme -- so the status line that read
+   * "情绪升高" off VS_EMOTION_TENSE announced an alert for one and stayed silent
+   * on the other.  The verdict travels on the event so the UI does not have to
+   * track which buckets mean what.
+   */
+
+  bool extreme;
   int error;
 
   /* Meaningful only on VS_APP_EVENT_SOCIAL_STAGE.  A separate field rather

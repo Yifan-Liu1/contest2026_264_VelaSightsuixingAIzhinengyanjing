@@ -1216,8 +1216,9 @@ config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
 		calm ones clear it.
 
 		1, which means the device raises on the same evidence the cloud
-		does.  The cloud's rule is one occurrence of 生气 or one of 伤心,
-		and it opens the advice slot for that frame immediately -- so a
+		does.  The cloud's rule is one occurrence of 生气, 反感 or 伤心
+		within a ten-second window -- the whole of its red bucket -- and it
+		opens the advice slot for that moment immediately, so a
 		device that waited for a second reading was not being careful, it
 		was guaranteeing that the advice for every single-frame extreme
 		moment arrived with no alert to attach it to and was discarded.
@@ -1287,8 +1288,9 @@ config VS_SOCIAL_ALERT_MIN_CONFIDENCE
 		interface.
 
 		Nothing in the cloud's rule mentions confidence.  It is one
-		occurrence of 生气 or one of 伤心, and the cloud opens the advice
-		slot for that frame whatever the confidence was -- so every frame
+		occurrence of 生气, 反感 or 伤心 in a ten-second window, and the
+		cloud opens the advice
+		slot for that moment whatever the confidence was -- so every frame
 		this floor rejects is a frame the cloud has already committed to
 		producing advice for, and that advice then arrives with no alert to
 		attach it to and is discarded.  Exactly the failure that
@@ -1375,34 +1377,99 @@ config VS_SOCIAL_ALERT_HOLD_MS
 		should forget faster; raise it if an alert flickers off during a
 		pause in a conversation that is still tense.
 
-		A release also waits for any advice still outstanding, however
-		long this is: an alert that cleared first would make its own advice
-		arrive stale and be discarded.  VS_SOCIAL_ADVICE_TIMEOUT_MS is what
-		bounds that wait.
+		A release also waits for any message still waiting for its advice,
+		however long this is, and VS_SOCIAL_ADVICE_TIMEOUT_MS is what bounds
+		that wait.  An alert that cleared first would make its own advice
+		arrive with nothing on screen to attach to.
+
+		This wait was removed for a while, on the measurement that it held an
+		alert 18.6 s past its hold for advice that never came.  Reinstating it
+		is the other half of the advice fix: the cloud produces advice several
+		seconds after the moment, and the device's own log showed every one of
+		those arrivals being discarded because the alert had gone.  The sweep
+		below runs before the release on each poll, so an entry whose advice
+		has timed out stops holding the alert in the same pass -- which is
+		what makes the wait bounded rather than open-ended.
 
 config VS_SOCIAL_ADVICE_TIMEOUT_MS
 	int "VelaSight social advice wait (ms)"
-	default 30000
-	range 2000 120000
+	default 60000
+	range 2000 180000
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
-		How long an extreme frame's message is held waiting for the advice
-		the cloud derives from the audio around it.
+		How long a message known to belong to an extreme moment is held
+		waiting for the advice the cloud derives from the audio around it.
 
-		The interface delivers that advice under the msgId of the image it
-		judged extreme, not under any audio msgId, so the device has to keep
-		that image's id in flight to collect it -- and the interface defines
-		no terminal state for an advice that will not be sent.  A msgEvent 1
-		sub-result goes to 11 and, if the AI produces nothing, stays there.
-		Without a bound on this side such an entry is held for the rest of
-		the session, and enough of them fill
-		VS_SOCIAL_INFLIGHT_MAX with permanent waiters.
+		The interface delivers that advice under the msgId of an image, not
+		under any audio msgId, so the device has to keep that image's id in
+		flight to collect it -- and the interface defines no terminal state
+		for an advice that will not be sent.  A msgEvent 1 sub-result goes to
+		11 and, if the AI produces nothing, stays there.  Without a bound on
+		this side such an entry is held for the rest of the session, and
+		enough of them fill VS_SOCIAL_INFLIGHT_MAX with permanent waiters.
 
-		30000 is generous against the observed shape of the exchange: the
-		advice needs the audio that follows the extreme moment, which is
-		2 s per chunk plus upload plus inference.  It is deliberately longer
-		than VS_SOCIAL_ALERT_HOLD_MS, since the alert waits for this rather
-		than the other way round.
+		60000, raised from 30000 against the AI-side log of 2026-09-08.  The
+		gap from the first extreme frame of a run to the advice for that run
+		measured 6.0 s, 9.2 s, 10.8 s and 18.5 s across four sessions, and
+		the msgId the advice lands on was itself uploaded seconds before its
+		own result arrived -- so the budget this has to cover is longer than
+		the advice latency alone.  Waiting costs a table slot; giving up early
+		costs the only output an extreme moment produces.
+
+		Deliberately longer than VS_SOCIAL_ALERT_HOLD_MS, since the alert
+		waits for this rather than the other way round.
+
+		Reaching it is reported as "no advice for msg N after M ms", with
+		whether a msgEvent 1 slot was ever seen -- which is the difference
+		between a cloud that promised advice and did not send it and a frame
+		the cloud was never going to advise on.
+
+config VS_SOCIAL_ADVICE_GRACE_MS
+	int "VelaSight social advice grace window (ms)"
+	default 6000
+	range 0 60000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long a message whose own result gave no reason to expect advice
+		is kept in flight anyway, in case the cloud attaches some to it.
+
+		This exists because the device cannot predict which msgId an advice
+		will arrive under, and the previous assumption -- that it would be a
+		frame the device itself had judged extreme -- is not what the cloud
+		does.  Two findings from the AI-side log of 2026-09-08:
+
+		  The cloud's extreme rule is applied to a ten-second window, not to
+		  a frame.  Eight frames classified 害怕 -- not one of the three
+		  emotions the rule names -- were announced as extreme because the
+		  window's aggregate was 生气.  So a frame the device reads as calm
+		  can carry the advice for the moment it belongs to.
+
+		  The advice is attached to whichever msgId the cloud's pipeline is
+		  holding when the text is ready, including one whose image never
+		  classified at all.  At 14:52:59 the advice for a run landed on
+		  msgId 54, whose image had failed to download three times.
+
+		Both of those messages used to be retired the instant their result
+		arrived -- calm ones and failed ones alike -- and the advice that
+		followed a second later found nothing to attach to and was counted
+		as a result for a retired id.  That is the whole of "the device
+		almost never receives an advice".
+
+		6000 is sized from the same log: an advice is pushed within about a
+		second of the cloud handling the msgId it lands on -- at 14:52:59 the
+		gap was 0.12 s and at 14:52:44 it was 1 ms -- so four poll intervals
+		is generous.  The window is deliberately far shorter than
+		VS_SOCIAL_ADVICE_TIMEOUT_MS because these entries are speculative and
+		most will never be advised on.  An entry that does see a msgEvent 1
+		slot, or that the device judged extreme itself, is promoted to the
+		full timeout immediately.
+
+		The cost is table occupancy: at one frame every
+		VS_SOCIAL_IMAGE_INTERVAL_MS this holds roughly
+		VS_SOCIAL_ADVICE_GRACE_MS / VS_SOCIAL_IMAGE_INTERVAL_MS extra
+		entries, which is what VS_SOCIAL_INFLIGHT_MAX was raised to cover.
+		Set it to 0 to restore the old immediate-retire behaviour, which is
+		useful only for reproducing the fault.
 
 		Reaching it is reported as "no advice for msg N within M ms".  A
 		cloud that answers 30 on the advice instead -- "音频无有效声音" --
@@ -1605,17 +1672,34 @@ config VS_SOCIAL_DEAD_SESSION_STRIKES
 
 config VS_SOCIAL_INFLIGHT_MAX
 	int "VelaSight social in-flight message tracking"
-	default 16
-	range 4 32
+	default 24
+	range 4 24
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		How many uploaded msgIds are tracked while waiting for results.
 
-		Sized from the uploads that can be outstanding within one poll
-		interval, with room to spare.  When it is full the oldest entry is
-		retired unanswered, which loses one frame's emotion result and
-		nothing else -- the cloud still has the data and still counts it
-		in the end-of-session timeline.
+		24, raised from 16 to pay for VS_SOCIAL_ADVICE_GRACE_MS.  An answered
+		message is no longer retired the moment its result arrives -- it is
+		held for the grace window in case the cloud attaches an advice to it
+		-- so the table now holds the messages still awaiting a result plus
+		roughly grace / VS_SOCIAL_IMAGE_INTERVAL_MS answered ones.  At the
+		defaults that is about sixteen answered entries alongside the
+		outstanding ones, which 16 could not carry.
+
+		The range stops at VS_CLOUD_POLL_MAX_IDS, and that is a hard ceiling
+		rather than a preference.  One getResult carries at most that many
+		identifiers and the session snapshots them in arrival order, so a
+		table deeper than one request would have a tail that is never asked
+		about at all -- entries aging out having been polled zero times,
+		which is worse than not tracking them.  Raise both together.
+
+		When the table is full an entry is evicted, and the order is by what
+		the entry can still produce: one already past its deadline first,
+		then one only in its grace window, then one whose result has not
+		arrived, and a message actually waiting for advice last.  That last
+		case is logged, because it means the table is too small for the rate
+		at which this conversation is producing extreme moments and an advice
+		is being abandoned rather than merely delayed.
 
 # Stacks, one option per session thread.
 #

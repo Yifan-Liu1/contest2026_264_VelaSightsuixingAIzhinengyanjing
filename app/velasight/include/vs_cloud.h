@@ -181,9 +181,14 @@ enum vs_cloud_origin_e
  * derived from it, under the same msgId.  A caller that guessed this number
  * would either waste stack or get -E2BIG from a layer below the one that
  * documents the limit.
+ *
+ * Must be at least CONFIG_VS_SOCIAL_INFLIGHT_MAX.  The session snapshots its
+ * tracked identifiers in arrival order and stops at this limit, so an inflight
+ * table deeper than one request can carry has a tail that is never asked about
+ * -- entries that sit there until they age out, having been polled zero times.
  */
 
-#define VS_CLOUD_POLL_MAX_IDS 16
+#define VS_CLOUD_POLL_MAX_IDS 24
 
 /****************************************************************************
  * Public Types
@@ -400,13 +405,16 @@ struct vs_social_event_s
    * is what the UI raises an alert for.
    *
    * This cannot come from peer_state, which collapses calm and extreme into
-   * 20.  It comes from the cloud's own flag when one is sent, and otherwise
-   * from the cloud's rule reproduced against emotionDetail: one 生气 or one
-   * 伤心.  Note that this is not the red bucket -- red also holds 反感, which
-   * does not trigger, and 伤心 is blue -- so colour and this flag are
-   * independent and a blue frame can be extreme.  Independently, the cloud only
-   * starts an audio-advice chain for a frame it judged extreme, so a
-   * subsequent AUDIO entry for the same msgId corroborates it.
+   * 20.  It comes from the cloud's rule reproduced in cloud_classify_emotion():
+   * the red bucket, or failing that one of 生气, 反感 and 伤心 by name.  Those
+   * two tests agree under the current cloud, which colours all three extreme
+   * emotions red -- but they did not before it, when 反感 was red and calm and
+   * 伤心 was blue and extreme, so both are kept.
+   *
+   * Independently, the cloud only starts an audio-advice chain for a moment it
+   * judged extreme, so a subsequent AUDIO entry for the same msgId corroborates
+   * it -- and does so more authoritatively, since it is the cloud's own verdict
+   * rather than a rule copied from it.
    */
 
   bool extreme;
@@ -435,18 +443,22 @@ struct vs_social_event_s
  * calm/happy/tense are computed here from emotionTimeline rather than sent by
  * the cloud, because that is the shape vs_history_index_s wants.  The three
  * buckets come from the cloud's three colours: green 中立 is calm, green 愉悦
- * is happy, and both red and blue fold into tense -- blue covers 害怕, 伤心,
- * 疑惑 and 惊讶, none of which belong under calm or happy in a three-way
- * split.  They sum to 100 unless the timeline was empty, in which case all
- * three are zero.
+ * is happy, and both red and blue fold into tense -- blue covers 害怕, 疑惑 and
+ * 惊讶, none of which belong under calm or happy in a three-way split.  They sum
+ * to 100 unless the timeline was empty, in which case all three are zero.
  *
  * Which means tense is not the extreme rate, and it is the obvious thing to
- * mistake for it, and the two do not even nest: extreme is 生气 or 伤心, which
- * takes one emotion from red and one from blue, while tense is all of red plus
- * all of blue.  So a tense frame need not be extreme and every extreme frame is
- * tense, but the ratio between them says nothing.  Measured 2026-09-07, a
- * session reporting "tense 26" over 49 samples had roughly half of those
- * entries blue.
+ * mistake for it.  Under the current cloud extreme is exactly the red bucket
+ * while tense is red plus blue, so extreme frames are a subset of tense ones and
+ * the gap between the two figures is how much of the conversation was 害怕, 疑惑
+ * or 惊讶.  Measured 2026-09-07, a session reporting "tense 26" over 49 samples
+ * had roughly half of those entries blue.
+ *
+ * They have not always nested.  Before the cloud coloured all three extreme
+ * emotions red, extreme was 生气 or 伤心 -- one from red and one from blue --
+ * and the ratio between the two figures said nothing at all.  Neither number's
+ * definition is guaranteed, so read them as two separate measurements rather
+ * than as a whole and a part.
  *
  * extreme_samples below is the number that answers "how much of this
  * conversation did the cloud actually flag", and it is deliberately not folded
@@ -492,10 +504,13 @@ struct vs_cloud_minutes_s
   uint16_t emotion_samples; /* entries in emotionTimeline, classified ones */
   uint16_t audio_samples;   /* entries in audioTimeline */
 
-  /* Of emotion_samples, the ones the cloud coloured red.  The cloud's own
-   * count of extreme frames for the whole session, which is what the device's
-   * polled tally has to be judged against: polling only sees the results that
-   * arrive before a message is retired, the timeline sees all of them.
+  /* Of emotion_samples, the ones cloud_classify_emotion() calls extreme, which
+   * under the current cloud is the ones it coloured red.
+   *
+   * The cloud's own count of extreme frames for the whole session, which is what
+   * the device's polled tally has to be judged against: polling only sees the
+   * results that arrive before a message is retired, the timeline sees all of
+   * them.
    */
 
   uint16_t extreme_samples;

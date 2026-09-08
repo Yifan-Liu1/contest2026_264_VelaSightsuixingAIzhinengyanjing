@@ -135,6 +135,35 @@
 
 #define VS_COLOR_NEUTRAL 0xe8eef2u
 
+/* The emotion ring's colours when the cloud sent none.
+ *
+ * These have to be the same values cloud_classify_emotion() assigns, and for a
+ * while they were not: blue got amber here and a real blue there, so the ring
+ * changed colour depending on whether the reading came from the cloud or from
+ * the local fallback while describing the same emotion.  Named rather than
+ * spelled out at the point of use so the next divergence is at least visible.
+ */
+
+#define VS_COLOR_TENSE    0xe85d5du  /* red bucket:   生气, 反感, 伤心 */
+#define VS_COLOR_CONFUSED 0x5d8fe8u  /* blue bucket:  害怕, 疑惑, 惊讶 */
+#define VS_COLOR_HAPPY    0x48c78eu  /* green 愉悦 */
+
+/* How long the cloud's advice for an extreme moment stays on screen.
+ *
+ * An advice is produced once per extreme run and arrives six to eighteen
+ * seconds after the moment (AI-side log, 2026-09-08), so it is both scarce and
+ * late -- the opposite of the emotion readings, which arrive every second or
+ * two and are only worth the moment they describe.  It therefore gets its own
+ * dwell rather than living and dying with the alert: it is replaced by the next
+ * advice, and otherwise held for this long whatever the emotion does.
+ *
+ * Longer than VS_SOCIAL_ALERT_HOLD_MS on purpose.  The alert is a state and
+ * ends when the state does; the advice is a sentence the user has to have time
+ * to read, and an alert releasing under it is not a reason to take it away.
+ */
+
+#define VS_SOCIAL_ADVICE_PIN_MS 25000u
+
 /* How long after a failed STA association the next attempt is made.
  *
  * Every retry is a full scan, authenticate and DHCP cycle on the CP, so the
@@ -329,6 +358,30 @@ struct vs_runtime_s
   enum vs_page_e social_exit_return_page;
   enum vs_emotion_e emotion;
   uint32_t emotion_color;
+
+  /* Whether the cloud judged the current reading an extreme emotion, as sent on
+   * the event rather than inferred from emotion here.
+   *
+   * The status line used to read "情绪升高" off VS_EMOTION_TENSE, which is the
+   * red bucket, and at the time red held 反感 -- which the cloud did not treat
+   * as extreme -- while 伤心, which it did, was blue.  So the line announced an
+   * alert for one emotion that never raised one and stayed silent on one that
+   * did.  The cloud has since coloured all three extreme emotions red and the
+   * two now agree, but agreeing is not the same as being the same thing; see
+   * vs_app_event_s::extreme.
+   */
+
+  bool emotion_extreme;
+
+  /* Whether an alert is standing, as the session last reported it.
+   *
+   * Kept because the page can no longer be read as the answer: with an advice
+   * pinned, VS_PAGE_SOCIAL_ALERT stays up after the alert that opened it has
+   * cleared, so "am I on the alert page" and "is there an alert" have come
+   * apart.  The advice expiry is what needs to tell them apart.
+   */
+
+  bool alert_active;
   int error;
   char error_reason[VS_TEXT_LONG];
   bool error_retryable;
@@ -398,6 +451,21 @@ struct vs_runtime_s
   uint32_t tts_dwell_at_ms;
   struct vs_net_status_s network;
   char alert_text[VS_TEXT_LONG];
+
+  /* The cloud's advice for an extreme moment, and when to stop showing it.
+   *
+   * Separate storage from alert_text, which is the whole point.  Both used to be
+   * the same field: the advice arrived on VS_APP_EVENT_SOCIAL_ALERT and was
+   * written over alert_text, so the next emotion result -- a second or two later
+   * -- replaced it, and ALERT_CLEARED erased it outright.  An advice the cloud
+   * produced once every ten seconds was on screen for one poll interval.
+   *
+   * Now nothing but another advice writes here, and the emotion line has
+   * alert_text to itself.  VS_SOCIAL_ADVICE_PIN_MS is the dwell.
+   */
+
+  char advice_text[VS_TEXT_LONG];
+  uint32_t advice_until_ms;
   char result_text[VS_TEXT_LONG];
 };
 
@@ -910,9 +978,12 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
     {
       snapshot->emotion_color = runtime->emotion_color != 0 ?
                         runtime->emotion_color :
-                        runtime->emotion == VS_EMOTION_TENSE ? 0xe85d5d :
-                        runtime->emotion == VS_EMOTION_CONFUSED ? 0xe3ad4b :
-                        runtime->emotion == VS_EMOTION_HAPPY ? 0x48c78e :
+                        runtime->emotion == VS_EMOTION_TENSE ?
+                          VS_COLOR_TENSE :
+                        runtime->emotion == VS_EMOTION_CONFUSED ?
+                          VS_COLOR_CONFUSED :
+                        runtime->emotion == VS_EMOTION_HAPPY ?
+                          VS_COLOR_HAPPY :
                         VS_COLOR_NEUTRAL;
 
       /* Both pages, not just the alert one.  The ring is the running reading,
@@ -1083,22 +1154,45 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
                  "继续交流");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "社交中");
+
+        /* From the extreme flag, not from the colour bucket.  They match under
+         * the current cloud, which colours every extreme emotion red, but this
+         * line is about the verdict and not about the ink -- and the two have
+         * disagreed before.  See runtime->emotion_extreme.
+         */
+
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
-                 "%s", runtime->emotion == VS_EMOTION_NONE ? "观察中" :
-                  runtime->emotion == VS_EMOTION_TENSE ? "情绪升高" : "观察中");
+                 "%s", runtime->emotion_extreme ? "情绪升高" : "观察中");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "采集中");
         vs_key_set(snapshot, VS_KEY_CONFIRM, "暂停");
         vs_key_set(snapshot, VS_KEY_BACK, "按住结束");
         break;
 
       case VS_PAGE_SOCIAL_ALERT:
+
+        /* The advice wins the body when there is one, and the emotion word is
+         * what is shown until it arrives.
+         *
+         * They are not the same kind of thing and the ordering follows from
+         * that.  alert_text is one word from emotionDetail -- "生气" -- which
+         * says what was detected and nothing about what to do; the advice is a
+         * sentence the cloud derived from the surrounding speech, which is the
+         * output this whole path exists to produce.  Whenever both exist the
+         * advice is the more useful of the two, and it is also the one that
+         * arrives once rather than every couple of seconds.
+         */
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
-                 "情绪提醒");
+                 "%s", runtime->advice_text[0] != '\0' ? "情绪建议" :
+                                                         "情绪提醒");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body), "%s",
+                 runtime->advice_text[0] != '\0' ? runtime->advice_text :
                  runtime->alert_text[0] != '\0' ? runtime->alert_text :
                  "放慢语速\n先听对方说完");
-        snprintf(snapshot->status_title, sizeof(snapshot->status_title), "情绪升高");
-        snprintf(snapshot->status_value, sizeof(snapshot->status_value), "提醒");
+        snprintf(snapshot->status_title, sizeof(snapshot->status_title),
+                 "%s", runtime->alert_active ? "情绪升高" : "情绪建议");
+        snprintf(snapshot->status_value, sizeof(snapshot->status_value),
+                 "%s", runtime->advice_text[0] != '\0' ? "建议" : "提醒");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "请留意");
         snapshot->emotion = runtime->emotion;
         vs_key_set(snapshot, VS_KEY_CONFIRM, "暂停");
@@ -2034,24 +2128,58 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
       case VS_APP_EVENT_SOCIAL_ALERT:
 
         /* State unconditionally, page change only from the two pages an alert
-         * may take over.  Same split as ALERT_CLEARED below and for a stronger
-         * reason: this event also carries the cloud's advice, which is the one
-         * thing an extreme moment produces, arrives once, and is retired from
-         * the session's tracking as it is delivered.  Guarding the whole case
-         * on the page dropped it outright if the user happened to be pausing,
-         * resuming or holding the exit key when it landed.
+         * may take over.  Same split as ALERT_CLEARED below.
          *
          * Not entering the alert page from elsewhere is deliberate: a paused
          * session is not observing anyone, and an exit already under way should
          * not be interrupted.  The text and colour are still updated, so a
          * session that returns to VS_PAGE_SOCIAL_RUNNING shows the current
          * reading rather than a stale one.
+         *
+         * advice_text is deliberately not touched.  This event fires every time
+         * a result folds into the alert state, once or twice per poll interval;
+         * the advice arrives once per extreme run and has to outlive them.  It
+         * used to be carried on this event and written to the same field, which
+         * is why it was on screen for one poll and then gone.
          */
 
         runtime->emotion = event->emotion;
         runtime->emotion_color = event->color;
+        runtime->emotion_extreme = event->extreme;
+        runtime->alert_active = true;
         snprintf(runtime->alert_text, sizeof(runtime->alert_text), "%s",
                  event->text);
+
+        if (runtime->page == VS_PAGE_SOCIAL_RUNNING ||
+            runtime->page == VS_PAGE_SOCIAL_ALERT)
+          {
+            runtime->page = VS_PAGE_SOCIAL_ALERT;
+          }
+        break;
+
+      case VS_APP_EVENT_SOCIAL_ADVICE:
+
+        /* Pinned, and pinned is the requirement: once an advice is on screen the
+         * emotion moving on must not take it away, and only the next advice may
+         * replace it.
+         *
+         * So this writes advice_text and rearms its dwell, and nothing else
+         * writes advice_text at all -- not the emotion results that keep
+         * arriving, not the clear that follows them.  The alert state is left
+         * alone for the same reason in reverse: an advice is not itself an
+         * alert, and claiming one would make the "情绪升高" line outlive the
+         * emotion that earned it.
+         *
+         * emotion_extreme is set, because an advice only exists for a moment the
+         * cloud judged extreme -- and it can arrive for a message this device
+         * read as calm, which is exactly the case where the status line would
+         * otherwise say "观察中" underneath a de-escalation suggestion.
+         */
+
+        snprintf(runtime->advice_text, sizeof(runtime->advice_text), "%s",
+                 event->text);
+        runtime->advice_until_ms = vs_app_now_ms() + VS_SOCIAL_ADVICE_PIN_MS;
+        runtime->emotion_extreme = true;
 
         if (runtime->page == VS_PAGE_SOCIAL_RUNNING ||
             runtime->page == VS_PAGE_SOCIAL_ALERT)
@@ -2064,20 +2192,29 @@ static void vs_handle_app_event(struct vs_runtime_s *runtime,
 
         /* The state goes unconditionally; only the page change is guarded.
          *
-         * These three fields describe the emotion the session is reporting,
-         * which is a fact about the session and not about the page in front of
-         * it.  Guarding the whole case on the page -- as this did -- meant a
-         * clear that landed while the user was on the pausing, exiting or
-         * finalizing page was discarded, and vs_social does not resend: it has
-         * already dropped alert_active and bumped the generation.  The alert
-         * text and its colour then survived to the end of the session.
+         * These fields describe the emotion the session is reporting, which is a
+         * fact about the session and not about the page in front of it.  Guarding
+         * the whole case on the page -- as this did -- meant a clear that landed
+         * while the user was on the pausing, exiting or finalizing page was
+         * discarded, and vs_social does not resend: it has already dropped
+         * alert_active and bumped the generation.  The alert text and its colour
+         * then survived to the end of the session.
+         *
+         * advice_text survives this.  An alert is a state that has ended; the
+         * advice is a sentence the user may still be reading, and the two now
+         * expire on their own schedules.  Which is why the page only goes back
+         * when there is no advice left to show -- the main loop returns it when
+         * the dwell runs out.
          */
 
         runtime->emotion = VS_EMOTION_NONE;
         runtime->emotion_color = 0;
+        runtime->emotion_extreme = runtime->advice_text[0] != '\0';
+        runtime->alert_active = false;
         runtime->alert_text[0] = '\0';
 
-        if (runtime->page == VS_PAGE_SOCIAL_ALERT)
+        if (runtime->page == VS_PAGE_SOCIAL_ALERT &&
+            runtime->advice_text[0] == '\0')
           {
             runtime->page = VS_PAGE_SOCIAL_RUNNING;
           }
@@ -2885,7 +3022,17 @@ static void vs_handle_event(struct vs_display_s *display,
           runtime->progress = 100;
           runtime->emotion = VS_EMOTION_NONE;
           runtime->emotion_color = 0;
+          runtime->emotion_extreme = false;
+          runtime->alert_active = false;
           runtime->alert_text[0] = '\0';
+
+          /* The advice outlives an alert but not a session.  Carrying one into
+           * the next conversation would put the previous argument's suggestion
+           * in front of a user who has just started a new one.
+           */
+
+          runtime->advice_text[0] = '\0';
+          runtime->advice_until_ms = 0;
           runtime->result_text[0] = '\0';
           request_id = vs_begin_request(runtime);
 
@@ -3179,6 +3326,30 @@ int vs_app_run(void)
               vs_expire_response(&runtime);
               vs_render(display, &runtime);
             }
+        }
+
+      /* Retire a pinned advice once its dwell is up.
+       *
+       * Here rather than in an event handler because nothing sends an event for
+       * it: the advice is pinned precisely so that the emotion results and the
+       * alert clear cannot take it down, which leaves a timer as the only thing
+       * that can.  The page follows only if no alert is standing -- an alert
+       * raised while the advice was up still owns the page after it goes.
+       */
+
+      if (runtime.advice_until_ms != 0 &&
+          (int32_t)(runtime.advice_until_ms - vs_app_now_ms()) <= 0)
+        {
+          runtime.advice_until_ms = 0;
+          runtime.advice_text[0] = '\0';
+
+          if (runtime.page == VS_PAGE_SOCIAL_ALERT && !runtime.alert_active)
+            {
+              runtime.page = VS_PAGE_SOCIAL_RUNNING;
+              runtime.emotion_extreme = false;
+            }
+
+          vs_render(display, &runtime);
         }
 
       /* Arm, disarm and enforce the deadline on a social page that is waiting
