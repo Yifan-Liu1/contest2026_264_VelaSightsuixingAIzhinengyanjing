@@ -463,10 +463,8 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
                * outside the circle.  Starting at 16 puts it on the chord
                * instead of past it.
                *
-               * Only this slot moves, because only this slot is asked to hold
-               * four glyphs.  The next-key opposite it never carries more than
-               * three -- 下一条 -- so its centred text starts at x=96 and has
-               * the same 8 px of clearance this change buys here.
+               * The next key opposite it moves by the same amount, for the
+               * reasons below.
                */
 
               lv_obj_set_pos(panel->key[key], 16, VS_LOWER_TOP_Y);
@@ -474,7 +472,33 @@ static void vs_panel_set_keys(struct vs_panel_s *panel,
             }
           else if (key == VS_KEY_NEXT)
             {
-              lv_obj_set_pos(panel->key[key], 88, VS_LOWER_TOP_Y);
+              /* Mirrored about the panel centre: 16..80 on the left, 80..144
+               * here, so the two boxes are 32 px either side of x=80 and their
+               * centred text is too.
+               *
+               * This was 88, which is what the layout looked like before the
+               * back key moved.  Both keys used to sit 40 px out from the
+               * centre; moving only the left one in by half a glyph left the
+               * row visibly lopsided, with the right label 8 px further from
+               * the centre than the left one.
+               *
+               * It also fixes a clip that the earlier change missed.  The
+               * comment opposite claimed this slot never holds more than three
+               * glyphs, and 按住重置 on the hotspot page is four -- 64 px, the
+               * full width of the box, ending at x=152.  The chord at y=128 is
+               * x=16..144, so the last glyph was cut.  At 80 the box ends
+               * exactly on the chord, which is the same clearance the left key
+               * gets from starting exactly on it.
+               *
+               * The cost is that when both slots carry four glyphs -- only the
+               * hotspot page, 按住返回 and 按住重置 -- their text meets at x=80
+               * with no gap.  The chord is 128 px wide at that scanline and two
+               * four-glyph labels are 128 px, so at this row there is no
+               * arrangement that fits both and separates them; a missing gap
+               * reads better than a missing stroke.
+               */
+
+              lv_obj_set_pos(panel->key[key], 80, VS_LOWER_TOP_Y);
               lv_obj_set_width(panel->key[key], 64);
             }
           else
