@@ -559,8 +559,7 @@ bool vs_cloud_configured(void);
  * Name: vs_cloud_clock_synced
  *
  * Description:
- *   Whether CLOCK_REALTIME has been set from a cloud response's Date header
- *   this boot.
+ *   Whether vs_cloud_clock_sync() has succeeded this boot.
  *
  *   False does not mean the clock reads zero.  vela_tls.c stamps it with a
  *   hardcoded 2026-02-28 on the first handshake, so a false here with a
@@ -577,16 +576,20 @@ bool vs_cloud_clock_synced(void);
  * Description:
  *   Ask the cloud what time it is, and set CLOCK_REALTIME from the answer.
  *
- *   Every cleartext cloud response already sets the clock as a side effect,
- *   so a device that opens a social session needs no explicit call.  This
- *   exists for the moment before that: the interval between the network
- *   coming up and the first session, during which anything reading the wall
- *   clock -- a history record's date, for one -- would get vela_tls.c's
- *   constant.
+ *   This is the whole mechanism.  One exchange, once per boot, at the moment
+ *   the station comes up -- there is no opportunistic reading of the header on
+ *   the session's own traffic, because the date cannot have changed since this
+ *   ran and a clock decision on the path of every upload registration would be
+ *   work with no result.
  *
  *   Issues one small GET and ignores its status: a 404 carries a Date header
  *   exactly as a 200 does, so this does not depend on the endpoint offering
  *   any particular path.
+ *
+ *   One attempt.  A failure leaves vela_tls.c's constant in force for the rest
+ *   of the boot and says so on the console; the next time the station is
+ *   brought up -- a reconnect, a mode change -- tries again, because the latch
+ *   is only set on success.
  *
  *   Blocking, and not to be called from the UI thread.  vs_app.c calls it
  *   from the network worker, which is off that thread by construction and is

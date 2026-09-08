@@ -474,7 +474,8 @@ static uint64_t cloud_uptime_ms(void)
   return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-/* Whether this boot has already taken a date off the wire.
+/* Whether this boot has already taken a date off the wire, and whether it is
+ * currently being asked to.
  *
  * A latch rather than a magnitude test, because a magnitude test cannot see
  * the case this exists to fix.  vela_tls.c stamps CLOCK_REALTIME with the
@@ -484,13 +485,17 @@ static uint64_t cloud_uptime_ms(void)
  * that constant was 191.9 days stale, and it grows a day staler every day the
  * firmware is not rebuilt.
  *
- * So the first date this module can prove is correct wins, whatever the clock
- * currently claims.  Once per boot and no more: stepping CLOCK_REALTIME is not
- * free -- see cloud_uptime_ms() for what a mid-session step did to the upload
- * timings -- and one correction is all a session needs.
+ * The second flag is what keeps this to one exchange per boot.  The header is
+ * present on every cleartext response, so reading it opportunistically would
+ * work -- but it would also put a clock decision on the path of every upload
+ * registration and every getResult, for a value that cannot have changed since
+ * the last one.  Instead the scan is armed by vs_cloud_clock_sync() around its
+ * own request and disarmed immediately after, so the session path carries one
+ * load and test and nothing else.
  */
 
 static bool g_cloud_clock_adopted;
+static bool g_cloud_clock_wanted;
 
 /****************************************************************************
  * Name: cloud_days_from_civil
@@ -611,9 +616,14 @@ static bool cloud_clock_parse_imf(const char *value, time_t *out)
  *   clock adopted here is already correct when vela_tls.c looks, and its
  *   "Clock too old" branch stops being reached at all.
  *
- *   Called with the response header block, which is NUL-terminated by
- *   cloud_plain_http_once() but has the body immediately after it, so the
+ *   Called from cloud_plain_http_once() with the response header block, which
+ *   is NUL-terminated there but has the body immediately after it, so the
  *   search is bounded by header_end rather than by the terminator.
+ *
+ *   Does nothing unless vs_cloud_clock_sync() has armed it.  That call is the
+ *   only one that wants a clock, and it happens once, when the station comes
+ *   up; every other response reaching here is a session's own traffic, for
+ *   which re-reading a date that cannot have changed is work with no result.
  *
  ****************************************************************************/
 
@@ -625,7 +635,8 @@ static void cloud_clock_adopt(const char *header, const char *header_end)
   time_t epoch;
   struct tm tm;
 
-  if (g_cloud_clock_adopted || header == NULL || header_end == NULL)
+  if (!g_cloud_clock_wanted || g_cloud_clock_adopted ||
+      header == NULL || header_end == NULL)
     {
       return;
     }
@@ -1690,9 +1701,8 @@ static int cloud_plain_http_once(const struct cloud_url_s *url,
 
     /* The clock, from the same header block and under the same constraint as
      * the three scans above: it has to be read before the body is moved over
-     * the header.  Every cleartext response is a candidate, which is why this
-     * needs no endpoint of its own -- the first cloud call of any session
-     * carries it.  See cloud_clock_adopt().
+     * the header.  Returns immediately unless vs_cloud_clock_sync() armed it,
+     * which is once per boot, so the session path pays one test for this.
      */
 
     cloud_clock_adopt(resp, body_start);
@@ -3017,12 +3027,16 @@ int vs_cloud_clock_sync(void)
    * does -- so this works even against a gateway that has no ping endpoint,
    * which is the point of not adding one to the interface.
    *
-   * cloud_clock_adopt() has already run by the time this returns, from inside
-   * cloud_plain_http_once().  Reading the latch is how the outcome is known;
-   * there is no second parse here.
+   * Armed only across this one exchange.  cloud_clock_adopt() runs inside
+   * cloud_plain_http_once() and has already finished by the time this returns,
+   * so the latch is the result; there is no second parse here.  Disarmed
+   * unconditionally afterwards, so a failure leaves nothing behind that would
+   * make the next session's first response set the clock as a side effect.
    */
 
+  g_cloud_clock_wanted = true;
   ret = cloud_api_call("GET", "/ping", NULL, resp, sizeof(resp));
+  g_cloud_clock_wanted = false;
 
   if (g_cloud_clock_adopted)
     {
