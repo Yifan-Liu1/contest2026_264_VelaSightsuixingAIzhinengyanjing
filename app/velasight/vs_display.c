@@ -283,6 +283,13 @@ static void vs_set_bg_opa(lv_obj_t *obj, lv_opa_t opa)
     lv_obj_set_style_bg_opa(obj, opa, 0);
 }
 
+static void vs_set_arc_color(lv_obj_t *obj, lv_color_t color,
+                             lv_part_t part)
+{
+  if (!lv_color_eq(lv_obj_get_style_arc_color(obj, part), color))
+    lv_obj_set_style_arc_color(obj, color, part);
+}
+
 static bool vs_key_changed(const struct vs_softkey_s *current,
                            const struct vs_softkey_s *previous)
 {
@@ -303,7 +310,21 @@ static bool vs_content_changed(const struct vs_ui_snapshot_s *current,
          strcmp(current->content_title, previous->content_title) != 0 ||
          strcmp(current->content_body, previous->content_body) != 0 ||
          strcmp(current->content_meta, previous->content_meta) != 0 ||
-         strcmp(current->status_meta, previous->status_meta) != 0;
+         strcmp(current->status_meta, previous->status_meta) != 0 ||
+
+         /* The ring is on this panel, so its colour has to wake this panel.
+          *
+          * Without these two the ring would go stale in exactly the case it
+          * exists for: an emotion moving red to blue, or the second alert post
+          * that carries the cloud's advice, leaves page and all four strings
+          * above identical, so nothing here would fire and the left screen
+          * would keep the previous colour until something else changed.  The
+          * raise itself would have looked fine, because RUNNING to ALERT is
+          * a page change -- which is what would have made this hard to spot.
+          */
+
+         current->emotion_color != previous->emotion_color ||
+         current->emotion_ring != previous->emotion_ring;
 }
 
 static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
@@ -312,7 +333,13 @@ static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
   return current->page != previous->page ||
          current->progress != previous->progress ||
          current->progress_kind != previous->progress_kind ||
-         current->emotion_color != previous->emotion_color ||
+
+         /* emotion_color is deliberately absent: this panel no longer draws it.
+          * Leaving it here would repaint the right screen on every colour
+          * change for nothing.  The word that does change with the emotion --
+          * "观察中" against "情绪升高" -- arrives as status_value below.
+          */
+
          strcmp(current->status_title, previous->status_title) != 0 ||
          strcmp(current->status_value, previous->status_value) != 0 ||
          vs_key_changed(&current->softkey[VS_KEY_BACK],
@@ -359,6 +386,51 @@ static void vs_panel_set_progress(struct vs_panel_s *panel,
     }
   else
     vs_set_hidden(panel->progress, true);
+}
+
+/* The left screen's emotion ring.
+ *
+ * Same object and same style as the volume level ring -- vs_panel_init() builds
+ * both panels identically, so this arc already exists and already carries the
+ * 152x152 geometry, the 4 px widths and the dark track.  Only two things
+ * differ: the indicator takes the cloud's colour instead of the fixed teal,
+ * and the value is pinned full because a colour is not a quantity.
+ *
+ * The level sweep, not the hold one, and that is not only to match the volume
+ * page.  A hold ring is allowed to cross the y=108 divider because a hold owns
+ * the screen; this ring shares it with the title, the body and the short status
+ * row, and the level sweep is the one whose ends stop at y=106.
+ */
+
+static void vs_panel_set_emotion_ring(struct vs_panel_s *panel,
+                                      const struct vs_ui_snapshot_s *snapshot)
+{
+  if (!snapshot->emotion_ring)
+    {
+      vs_set_hidden(panel->progress, true);
+      return;
+    }
+
+  if (panel->ring_start != VS_LEVEL_ANGLE_START ||
+      panel->ring_end != VS_LEVEL_ANGLE_END)
+    {
+      lv_arc_set_bg_angles(panel->progress, VS_LEVEL_ANGLE_START,
+                           VS_LEVEL_ANGLE_END);
+      panel->ring_start = VS_LEVEL_ANGLE_START;
+      panel->ring_end = VS_LEVEL_ANGLE_END;
+    }
+
+  vs_set_arc_color(panel->progress, vs_color(snapshot->emotion_color),
+                   LV_PART_INDICATOR);
+  vs_set_hidden(panel->progress, false);
+
+  /* Full sweep, every frame.  lv_arc_set_value() returns early on an unchanged
+   * value, so this costs nothing after the first call -- but it has to be
+   * called, because lv_arc_set_bg_angles() above re-derives the indicator from
+   * the value and a ring left at zero would be an invisible one.
+   */
+
+  lv_arc_set_value(panel->progress, 100);
 }
 
 static void vs_panel_set_keys(struct vs_panel_s *panel,
@@ -470,7 +542,7 @@ static void vs_render_content(struct vs_panel_s *panel,
     }
   vs_set_label(panel->status_line[1], snapshot->status_meta);
   vs_set_hidden(panel->status_line[1], snapshot->status_meta[0] == '\0');
-  vs_panel_set_progress(panel, snapshot, false);
+  vs_panel_set_emotion_ring(panel, snapshot);
   vs_panel_set_keys(panel, snapshot, true);
 }
 
@@ -500,7 +572,18 @@ static void vs_render_status(struct vs_panel_s *panel,
   vs_set_label(panel->title, snapshot->status_title);
   vs_set_label(panel->body, value);
   vs_set_label(panel->meta, "");
-  vs_set_text_color(panel->body, vs_color(snapshot->emotion_color));
+
+  /* Held at the ordinary body ink, deliberately rather than by omission.
+   *
+   * This label used to be painted with snapshot->emotion_color, which is why
+   * that field needed a page gate in vs_snapshot() at all: nothing ever put the
+   * colour back, so one alert left every later page -- the summary, the history
+   * entries -- drawing its status text in alert red.  The emotion now lives in
+   * the left screen's ring, and setting this explicitly means no future
+   * path can quietly reintroduce a tint here.
+   */
+
+  vs_set_text_color(panel->body, vs_rgb(235, 242, 246));
   vs_panel_set_progress(panel, snapshot, progress &&
                         (snapshot->progress_kind == VS_PROGRESS_HOLD ||
                          snapshot->progress_kind == VS_PROGRESS_LEVEL));

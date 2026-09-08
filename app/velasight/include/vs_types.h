@@ -277,7 +277,25 @@ struct vs_ui_snapshot_s
   uint8_t progress;
   enum vs_progress_kind_e progress_kind;
   enum vs_emotion_e emotion;
+
+  /* 0xRRGGBB for the left screen's emotion ring, and only that.
+   *
+   * It used to tint the right screen's value label instead, which put the
+   * cloud's reading in the same place and the same ink as the word describing
+   * it -- so a red "提醒" was the emotion and the label at once, and every
+   * other page had to be defended against inheriting the colour.  A ring is
+   * the better carrier: it is glanceable without being read, it leaves the
+   * text alone, and it cannot leak onto a page that is not about an emotion
+   * because emotion_ring below says which pages have one.
+   */
+
   uint32_t emotion_color;
+
+  /* Whether the left screen draws that ring at all.  Set only for the two
+   * pages that are reporting an emotion; see vs_snapshot().
+   */
+
+  bool emotion_ring;
   bool history_is_blank;
   bool photo_context;
   bool error_retryable;

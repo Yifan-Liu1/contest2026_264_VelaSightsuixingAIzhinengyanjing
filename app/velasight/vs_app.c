@@ -877,6 +877,7 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
    */
 
   snapshot->emotion_color = VS_COLOR_NEUTRAL;
+  snapshot->emotion_ring = false;
 
   if (runtime->page == VS_PAGE_SOCIAL_RUNNING ||
       runtime->page == VS_PAGE_SOCIAL_ALERT)
@@ -887,6 +888,16 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
                         runtime->emotion == VS_EMOTION_CONFUSED ? 0xe3ad4b :
                         runtime->emotion == VS_EMOTION_HAPPY ? 0x48c78e :
                         VS_COLOR_NEUTRAL;
+
+      /* Both pages, not just the alert one.  The ring is the running reading,
+       * so it has to be on screen before there is anything to be alarmed
+       * about -- otherwise its appearance would itself be the alarm, and a
+       * colour that only ever means "bad" carries no information.  Until the
+       * first result lands the colour above is VS_COLOR_NEUTRAL, which is the
+       * same ink cloud_classify_emotion() gives a calm frame.
+       */
+
+      snapshot->emotion_ring = true;
     }
 
   switch (runtime->page)

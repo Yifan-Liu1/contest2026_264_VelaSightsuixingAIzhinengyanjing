@@ -393,6 +393,20 @@ struct social_inflight_s
   bool image_seen;
   bool extreme;
 
+  /* Whether a msgEvent 1 entry has ever been seen for this msgId, in any
+   * state.  Purely an observation: nothing decides anything on it.
+   *
+   * It exists because the counters could not answer the one question that
+   * matters when no advice arrives -- did the cloud open a slot at all?  The
+   * arm that handles status 11 only acts when the entry is not already extreme,
+   * which is never true for the entries actually waiting, so a slot sitting at
+   * 11 for its whole thirty seconds was invisible.  Measured 2026-09-08: ten
+   * expired waits, and no way to tell a cloud stuck at 11 from a cloud that
+   * never answered msgEvent 1 at all.
+   */
+
+  bool advice_seen;
+
   /* When the emotion arrived, so a wait for advice that the cloud never sends
    * can be given up on.  The interface defines no terminal state for a
    * msgEvent 1 that will not be answered, so the bound has to live here.
@@ -698,6 +712,43 @@ struct social_state_s
   uint32_t advice_discarded;  /* arrived, but no alert it still described */
   uint32_t advice_refused;    /* status 30 on the wait: cloud says never */
   uint32_t advice_expired;    /* VS_SOCIAL_ADVICE_TIMEOUT_MS elapsed */
+
+  /* Whether the cloud ever opened an advice slot, which the four counters
+   * above cannot say.  All of them describe a slot that reached a terminal
+   * state; none of them fires for one that stays at status 11, and status 11 is
+   * what the cloud appears to do.  Measured 2026-09-08: 0 delivered, 0
+   * discarded, 0 refused, 10 expired -- consistent both with a cloud stuck at
+   * pending and with a cloud that never answers msgEvent 1, and there was no
+   * way to choose between them.
+   *
+   * slots is per frame and is the number to read; pending is every arrival, so
+   * it grows once per poll per waiting entry and only confirms the poll really
+   * is receiving them.
+   */
+
+  uint32_t advice_slots_seen;
+  uint32_t advice_pending_seen;
+
+  /* Folded results that carried nothing to classify.
+   *
+   * These are counted because emotion_results and the minutes' own sample count
+   * are not the same measurement, and comparing them was misleading.
+   * cloud_summarize_timeline() drops a timeline entry whose colour does not map
+   * -- "an unrecognised colour is not evidence of anything" -- while this fold
+   * path has no such test, so a status 20 with no response at all becomes one
+   * more non-extreme result here and no result at all there.
+   *
+   * Measured 2026-09-08, session vs-264-c01a7208: 68 folded results with 12
+   * extreme against a timeline of 114 entries with 51 extreme.  Those rates,
+   * 17.6% and 44.7%, cannot both describe the same frames; if roughly forty of
+   * the sixty-eight carried no emotion the two agree.  blind is that number.
+   *
+   * no_response is the subset where the response object was absent entirely,
+   * as opposed to present with a colour outside the palette.
+   */
+
+  uint32_t emotion_blind;
+  uint32_t emotion_no_response;
 
   /* What the poll's deference to registrations actually did.  See the block in
    * social_poll_once() that reads them.
@@ -2907,6 +2958,23 @@ static void social_poll_once(void)
                       g_social.emotion_extreme++;
                     }
 
+                  /* Counted, not rejected.  A result with nothing to classify
+                   * still retires its msgId and still means the cloud answered,
+                   * so the fold has to happen; what was missing was any record
+                   * that it carried no emotion.  VS_EMOTION_NONE is exactly the
+                   * condition cloud_summarize_timeline() excludes, which is
+                   * what makes this counter bridge the two totals.
+                   */
+
+                  if (ev->emotion == VS_EMOTION_NONE)
+                    {
+                      g_social.emotion_blind++;
+                      if (!ev->has_response)
+                        {
+                          g_social.emotion_no_response++;
+                        }
+                    }
+
                   (void)social_emotion_step(ev, &raise, &clear);
                   emotion = ev->emotion;
                   color   = ev->color;
@@ -2949,6 +3017,23 @@ static void social_poll_once(void)
                * entry now waits for its advice instead of being retired as
                * calm, which is the part that still works after the fact.
                */
+
+              /* Recorded before the arm below, and unconditionally, because the
+               * arm below cannot see the common case.  It requires the entry
+               * not to be extreme already, which is false for every entry
+               * actually waiting for advice -- so the slots this session spends
+               * thirty seconds waiting on were the ones it never counted.
+               */
+
+              if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO)
+                {
+                  g_social.advice_pending_seen++;
+                  if (!g_social.inflight[index].advice_seen)
+                    {
+                      g_social.inflight[index].advice_seen = true;
+                      g_social.advice_slots_seen++;
+                    }
+                }
 
               if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO &&
                   g_social.inflight[index].image_seen &&
@@ -3406,6 +3491,22 @@ static void social_log_totals(void)
          (unsigned long)g_social.advice_discarded,
          (unsigned long)g_social.advice_refused,
          (unsigned long)g_social.advice_expired);
+
+  /* Whether the cloud ever opened a slot, and whether the results it did send
+   * carried anything.  The four counters above describe terminal states only,
+   * and the two totals below are what they cannot say.  See
+   * social_state_s::advice_slots_seen and ::emotion_blind.
+   */
+
+  printf("%s: advice slots: %lu opened, %lu pending result(s) seen\n",
+         SOCIAL_TAG, (unsigned long)g_social.advice_slots_seen,
+         (unsigned long)g_social.advice_pending_seen);
+
+  printf("%s: payload: %lu of %lu result(s) carried no emotion "
+         "(%lu sent no response)\n", SOCIAL_TAG,
+         (unsigned long)g_social.emotion_blind,
+         (unsigned long)g_social.emotion_results,
+         (unsigned long)g_social.emotion_no_response);
 
   /* A fourth line, and the only one here that exists to answer a question
    * rather than to describe the session.  See social_state_s's per-type
@@ -4399,6 +4500,10 @@ int vs_social_start(uint32_t request_id)
   g_social.advice_discarded = 0;
   g_social.advice_refused   = 0;
   g_social.advice_expired   = 0;
+  g_social.advice_slots_seen   = 0;
+  g_social.advice_pending_seen = 0;
+  g_social.emotion_blind       = 0;
+  g_social.emotion_no_response = 0;
   g_social.poll_yielded     = 0;
   g_social.poll_forced      = 0;
   g_social.alert_gen        = 1;
