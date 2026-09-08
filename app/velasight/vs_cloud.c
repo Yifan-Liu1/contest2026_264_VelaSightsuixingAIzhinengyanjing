@@ -61,6 +61,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -371,6 +372,41 @@ static struct cloud_state_s g_cloud;
  */
 
 static pthread_mutex_t g_cloud_keep_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/****************************************************************************
+ * Name: vs_cloud_cleartext_busy
+ *
+ * Description:
+ *   Whether the one cleartext connection is in the middle of an exchange.
+ *
+ *   A probe, not a reservation: the lock is taken and released, so by the time
+ *   the caller acts the answer may already be stale.  That is acceptable for
+ *   the only thing that asks -- see social_poll_once().  A poll that goes ahead
+ *   because it missed a register queues behind it exactly as it always did, and
+ *   a poll that skips when the register had already finished loses one cycle.
+ *   Neither is a correctness question, which is what lets this be a probe
+ *   instead of a parameter threaded through four call layers.
+ *
+ *   What it is for: registrations sit on the critical path of every uploaded
+ *   item and the poll does not, but they share one socket and this mutex, so a
+ *   poll that lands mid-register adds its whole round trip -- with a response
+ *   buffer of CONFIG_VS_SOCIAL_RESP_MAX_BYTES behind it -- to that item's cost.
+ *   Measured 2026-09-07 across sixteen report windows, registration averages
+ *   ran 69, 70, 70 ms at the low end and 240, 267, 303 ms at the high end: one
+ *   population that met no contention and one that queued behind a poll.
+ *
+ ****************************************************************************/
+
+bool vs_cloud_cleartext_busy(void)
+{
+  if (pthread_mutex_trylock(&g_cloud_keep_lock) == 0)
+    {
+      pthread_mutex_unlock(&g_cloud_keep_lock);
+      return false;
+    }
+
+  return true;
+}
 
 /****************************************************************************
  * Private Functions
@@ -1034,6 +1070,30 @@ static int cloud_connect(const char *host, const char *port)
   setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+  /* Nagle off.  Every exchange on this socket is one small request followed by
+   * a wait for its answer, which is the traffic pattern the algorithm was
+   * written to penalise: it exists to stop a stream of tiny writes filling the
+   * network with mostly-header segments, and it does that by holding a partial
+   * segment until the previous one is acknowledged.  Here there is no stream to
+   * coalesce -- the next request does not exist yet, because it depends on this
+   * one's response -- so the wait buys nothing and costs a round trip.
+   *
+   * Failure is ignored on purpose.  A stack without TCP_NODELAY still works;
+   * the request is merely slower, and refusing to connect over it would be a
+   * worse outcome than the delay.
+   *
+   * cloud_plain_http_once() also coalesces the header and body into one write,
+   * which removes the same delay from within a single request.  Neither
+   * subsumes the other: this covers the pattern across requests, that covers
+   * it inside one.
+   */
+
+  {
+    int on = 1;
+
+    (void)setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+  }
+
   if (res != NULL)
     {
       freeaddrinfo(res);
@@ -1293,18 +1353,51 @@ static int cloud_plain_http_once(const struct cloud_url_s *url,
 
 #undef CLOUD_HDR_APPEND
 
-  ret = cloud_send_all(sock, hdr, (size_t)pos);
-  if (ret < 0)
-    {
-      goto errout;
-    }
+  /* One write when the body fits behind the header, two when it does not.
+   *
+   * Not a micro-optimisation of the syscall count.  Every request on this path
+   * is a small header followed by a smaller body -- the upload registration is
+   * about 300 bytes of header and 224 of JSON -- and sending them separately
+   * is the exact shape Nagle's algorithm holds: the second write is a partial
+   * segment, so TCP keeps it until the first is acknowledged, and the request
+   * costs a round trip before the server has even seen it.
+   *
+   * hdr_cap is CLOUD_PATH_MAX + 512, about 4 KB, against a longest real body
+   * of 224 bytes, so the copy always fits for the JSON calls this exists for.
+   * The fallback is not dead code: with VS_SOCIAL_CLOUD_TLS off the presigned
+   * PUT also comes through here carrying a whole JPEG, which must not be
+   * copied and would not fit if it were.
+   *
+   * TCP_NODELAY is set in cloud_connect() as well.  Both, deliberately: the
+   * option is the general fix and this is the specific one, and a coalesced
+   * request is one segment rather than two however the socket is configured.
+   */
 
-  if (body != NULL && body_len > 0)
+  if (body != NULL && body_len > 0 &&
+      body_len <= hdr_cap - (size_t)pos)
     {
-      ret = cloud_send_all(sock, body, body_len);
+      memcpy(hdr + pos, body, body_len);
+      ret = cloud_send_all(sock, hdr, (size_t)pos + body_len);
       if (ret < 0)
         {
           goto errout;
+        }
+    }
+  else
+    {
+      ret = cloud_send_all(sock, hdr, (size_t)pos);
+      if (ret < 0)
+        {
+          goto errout;
+        }
+
+      if (body != NULL && body_len > 0)
+        {
+          ret = cloud_send_all(sock, body, body_len);
+          if (ret < 0)
+            {
+              goto errout;
+            }
         }
     }
 
@@ -2062,10 +2155,11 @@ static uint16_t cloud_json_confidence(const cJSON *obj)
  *   Turn the cloud's (emotionColor, emotionDetail) pair into the UI's
  *   vocabulary.
  *
- *   The colour is the authoritative part -- the document fixes the three
- *   buckets and enumerates which details fall in each -- so the detail is
- *   consulted only to split green, whose two members (愉悦, 中立) are the one
- *   place where a single colour spans two of the UI's emotions.
+ *   The colour drives what is shown.  The document fixes the three buckets and
+ *   enumerates which details fall in each, so the detail is consulted to split
+ *   green, whose two members (愉悦, 中立) are the one place where a single
+ *   colour spans two of the UI's emotions -- and, separately, to decide
+ *   extreme, which is no longer a property of the colour at all.
  *
  *   The RGB values are the palette vs_app.c already uses for its own
  *   defaults, so a cloud-driven colour and a locally-derived one look the
@@ -2074,9 +2168,32 @@ static uint16_t cloud_json_confidence(const cJSON *obj)
  *   something the user is meant to be able to read off the screen.
  *
  * Input Parameters:
- *   extreme - set true only for the red bucket.  This is the device's only
- *             way to tell an extreme frame from a calm one: the peer-side
- *             status collapses the cloud's 20 and 21 into a single 20.
+ *   extreme - set from the detail, because that is where the cloud's rule
+ *             lives.  It has to be derived at all because the peer-side status
+ *             collapses the cloud's 20 and 21 into a single 20, so status
+ *             cannot tell an extreme frame from a calm one.
+ *
+ *             The rule is two named emotions: 生气 or 伤心, one occurrence.
+ *             Not the red bucket, which is what this used to test and which is
+ *             wrong in both directions -- red also contains 反感, which does
+ *             not trigger, and 伤心 is blue.  So colour and extreme are
+ *             independent axes and a frame can be blue and extreme at once.
+ *
+ *             Understand what this is, because it is the weaker of the two
+ *             signals the device has.  The interface document does not define
+ *             which emotions are extreme and does not carry a flag saying so --
+ *             it only enumerates the palette.  The rule above reached this
+ *             project out of band, so reproducing it here is an inference from
+ *             detail strings against a rule that can change without the wire
+ *             format changing at all.
+ *
+ *             The document's own signal is that the cloud opens a msgEvent 1
+ *             entry under the image's msgId once it judges the frame extreme,
+ *             which is visible in its debug example and is rule-independent.
+ *             vs_social.c treats that as authoritative and ORs it over this;
+ *             see social_advice_slot_in_batch().  This inference exists so a
+ *             frame can raise an alert on the poll that first reports it,
+ *             without waiting to see whether a slot appears.
  *
  ****************************************************************************/
 
@@ -2086,7 +2203,14 @@ static void cloud_classify_emotion(const char *color, const char *detail,
 {
   *emotion = VS_EMOTION_NONE;
   *rgb = 0xe8eef2;
-  *extreme = false;
+
+  /* Independent of the colour branches below, and deliberately evaluated
+   * before them so it is obvious that no branch sets it.
+   */
+
+  *extreme = detail != NULL &&
+             (strstr(detail, "生气") != NULL ||
+              strstr(detail, "伤心") != NULL);
 
   if (color == NULL)
     {
@@ -2097,7 +2221,6 @@ static void cloud_classify_emotion(const char *color, const char *detail,
     {
       *emotion = VS_EMOTION_TENSE;
       *rgb = 0xe85d5d;
-      *extreme = true;
     }
   else if (strcasecmp(color, "blue") == 0)
     {
@@ -4653,7 +4776,8 @@ static int cloud_file_sink(void *arg, const void *data, size_t len)
 }
 
 int vs_cloud_download_to_file(const char *url, const char *path,
-                              size_t max_bytes, size_t *len)
+                              size_t max_bytes, uint32_t timeout_ms,
+                              size_t *len)
 {
   struct cloud_url_s *parsed = NULL;
   struct cloud_file_sink_s sink;
@@ -4669,12 +4793,19 @@ int vs_cloud_download_to_file(const char *url, const char *path,
   unsigned int stalls = 0;
   unsigned int requests = 0;
   bool complete = false;
+  uint64_t deadline = 0;
+  bool expired = false;
   int http;
   int ret;
 
   if (url == NULL || url[0] == '\0' || path == NULL || max_bytes == 0)
     {
       return -EINVAL;
+    }
+
+  if (timeout_ms != 0)
+    {
+      deadline = cloud_uptime_ms() + timeout_ms;
     }
 
   if (len != NULL)
@@ -4764,6 +4895,36 @@ int vs_cloud_download_to_file(const char *url, const char *path,
       };
       size_t before = sink.written;
       size_t got;
+
+      /* The bound on the transfer as a whole, checked here because this is the
+       * only place the loop is between requests and therefore the only place it
+       * can decide anything.
+       *
+       * This is what the attempt count cannot do.  CONFIG_VS_SOCIAL_DOWNLOAD_
+       * ATTEMPTS bounds consecutive *failures*, and a request that never
+       * returns never fails: measured 2026-09-08, a second window went out and
+       * the function was still inside cloud_http_ex() 107 seconds later, so
+       * stalls was still zero and the loop had made no decision at all.  The
+       * transport's own receive timeout is what eventually ends such a request,
+       * and on the TLS path that is AGENT_LLM_SOCKET_TIMEOUT_SEC -- 120 s, set
+       * in packages/ai_agent and not reachable from here.  Retrying three more
+       * times after that is four minutes of a user staring at a spinner.
+       *
+       * So: one hung window is survivable and its cost is bounded by the
+       * transport, but the transfer stops there rather than paying that cost
+       * again.  Checked before issuing rather than after returning, so the
+       * request that has already overrun is not followed by another.
+       *
+       * requests != 0 because a deadline already past on entry must not refuse
+       * a transfer that has not been attempted -- that would report a timeout
+       * for something that was never tried.
+       */
+
+      if (deadline != 0 && requests != 0 && cloud_uptime_ms() >= deadline)
+        {
+          expired = true;
+          break;
+        }
 
       if (window != 0)
         {
@@ -4933,6 +5094,22 @@ int vs_cloud_download_to_file(const char *url, const char *path,
 
   if (!complete)
     {
+      if (expired)
+        {
+          /* Reported ahead of http, which still holds whatever the last window
+           * answered and would name the symptom rather than the reason.  How
+           * far it got is the useful half: a transfer that stopped at 131072 of
+           * an unknown total is a stall, one that stopped at zero never
+           * started.
+           */
+
+          printf("%s: download of %s gave up after %zu bytes and %u "
+                 "request(s), past its %lu ms budget\n", CLOUD_TAG, path,
+                 sink.written, requests, (unsigned long)timeout_ms);
+          ret = -ETIMEDOUT;
+          goto unlink_out;
+        }
+
       if (http < 0)
         {
           /* How far it got is the whole diagnosis.  Zero means no request ever

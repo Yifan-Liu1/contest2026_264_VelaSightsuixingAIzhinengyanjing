@@ -400,8 +400,11 @@ struct vs_social_event_s
    * is what the UI raises an alert for.
    *
    * This cannot come from peer_state, which collapses calm and extreme into
-   * 20.  It is derived from the emotionColor bucket instead: red (生气,
-   * 反感) is extreme, blue and green are not.  Independently, the cloud only
+   * 20.  It comes from the cloud's own flag when one is sent, and otherwise
+   * from the cloud's rule reproduced against emotionDetail: one 生气 or one
+   * 伤心.  Note that this is not the red bucket -- red also holds 反感, which
+   * does not trigger, and 伤心 is blue -- so colour and this flag are
+   * independent and a blue frame can be extreme.  Independently, the cloud only
    * starts an audio-advice chain for a frame it judged extreme, so a
    * subsequent AUDIO entry for the same msgId corroborates it.
    */
@@ -438,11 +441,15 @@ struct vs_social_event_s
  * three are zero.
  *
  * Which means tense is not the extreme rate, and it is the obvious thing to
- * mistake for it.  Only red is extreme by this interface; blue is four
- * emotions that are merely not pleasant.  Measured 2026-09-07, a session
- * reporting "tense 26" over 49 samples had roughly half of those entries blue.
+ * mistake for it, and the two do not even nest: extreme is 生气 or 伤心, which
+ * takes one emotion from red and one from blue, while tense is all of red plus
+ * all of blue.  So a tense frame need not be extreme and every extreme frame is
+ * tense, but the ratio between them says nothing.  Measured 2026-09-07, a
+ * session reporting "tense 26" over 49 samples had roughly half of those
+ * entries blue.
+ *
  * extreme_samples below is the number that answers "how much of this
- * conversation was actually 生气 or 反感", and it is deliberately not folded
+ * conversation did the cloud actually flag", and it is deliberately not folded
  * into the three percentages: those are persisted in vs_history_index_s and
  * shown on a screen with room for three figures, and changing their meaning
  * would silently reinterpret every record already on the card.
@@ -587,6 +594,24 @@ enum vs_cloud_origin_e vs_cloud_origin(void);
 
 void vs_cloud_endpoint(const char **host, uint16_t *port,
                        const char **base_path, bool *tls);
+
+/* True while the single cleartext connection is carrying an exchange.
+ *
+ * For deciding whether to start a request that can wait.  Every device-facing
+ * endpoint shares one socket -- see vs_cloud.c for why that is deliberate
+ * rather than an oversight -- so a caller that has the option of coming back
+ * later can use this to stay out of the way of one that does not.
+ *
+ * A probe and not a reservation.  It answers about the instant it was called
+ * and nothing holds afterwards, so a caller must treat a false as "probably
+ * free" and be correct anyway if it turns out not to be.  The only caller,
+ * vs_social.c's poll, simply blocks as it always did in that case.
+ *
+ * Always false when the interface is configured for TLS, which does not use
+ * that socket at all.
+ */
+
+bool vs_cloud_cleartext_busy(void);
 
 /****************************************************************************
  * Name: vs_cloud_new_session_id
@@ -825,24 +850,39 @@ void vs_cloud_release(unsigned char *data, bool from_psram);
  *   from memory and leaves it where it can be raised.
  *
  * Input Parameters:
- *   path      - file to create or truncate.  Its directory must exist.
- *   max_bytes - refuse a body larger than this, leaving no file behind.  This
- *               is CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES for the spoken minutes.
- *   len       - optional; receives the bytes written.
+ *   path       - file to create or truncate.  Its directory must exist.
+ *   max_bytes  - refuse a body larger than this, leaving no file behind.  This
+ *                is CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES for the spoken minutes.
+ *   timeout_ms - give up once the transfer as a whole has run this long.  0
+ *                means no bound.  Checked between windows, so it does not cut
+ *                off a request already in flight -- what it prevents is the
+ *                next one.  See the deadline check in the loop for why the
+ *                attempt count could not do this on its own.
+ *   len        - optional; receives the bytes written.
  *
  * Returned Value:
  *   0 on success, and only then does a file exist at path: every failure path
  *   unlinks the partial one, so a caller cannot play half a download it
  *   thought had failed.
  *
- *   -EFBIG when the body exceeded max_bytes, -ENOSPC when the filesystem
- *   filled, -EIO when the peer closed before Content-Length was reached,
- *   -EPROTO for a chunked body on the cleartext path, which is not decoded.
+ *   Note what that does *not* cover: while this function is still running, a
+ *   partial file is on the card under the caller's chosen name, because the
+ *   sink flushes as it goes and the unlink only happens on the way out.  A
+ *   caller whose path is one another thread might open -- a history record's
+ *   audio, say -- must download to a name nothing plays and rename on success.
+ *   Measured 2026-09-08: the UI's browse page auto-played a record whose
+ *   download was still in flight and reported the truncated file as unplayable.
+ *
+ *   -ETIMEDOUT when timeout_ms elapsed, -EFBIG when the body exceeded
+ *   max_bytes, -ENOSPC when the filesystem filled, -EIO when the peer closed
+ *   before Content-Length was reached, -EPROTO for a chunked body on the
+ *   cleartext path, which is not decoded.
  *
  ****************************************************************************/
 
 int vs_cloud_download_to_file(const char *url, const char *path,
-                              size_t max_bytes, size_t *len);
+                              size_t max_bytes, uint32_t timeout_ms,
+                              size_t *len);
 
 /****************************************************************************
  * Name: vs_cloud_server_to_peer

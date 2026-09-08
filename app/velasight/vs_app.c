@@ -86,17 +86,35 @@
 #define VS_SOCIAL_FINALIZE_STAGE_TIMEOUT_MS \
   (CONFIG_VS_SOCIAL_FINALIZE_TIMEOUT_MS + 20000)
 
-#ifndef CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS
-#  define CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS 90000
+#ifndef CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS 60000
 #endif
 
 /* The spoken-minutes download, derived from the worker's own budget for the
  * same reason as the poll above: raising one without the other would make this
  * the inner bound and cut off a transfer that was still allowed to run.
+ *
+ * With one extra term, because this step has a bound the others do not: a
+ * request the peer stops answering is ended by the transport's receive timeout,
+ * not by the download, and on the TLS path that is AGENT_LLM_SOCKET_TIMEOUT_SEC
+ * in packages/ai_agent.  So the worst honest case here is the download's own
+ * budget plus one silent request, and this has to outlast the sum.
+ *
+ * Measured 2026-09-08 when it did not: this was 90000, the page deadline was
+ * therefore 110 s, and 110 s is inside the transport's 120 s.  A window went
+ * silent and the page aborted the session 12.6 s before the read would have
+ * failed -- so the download's own timeout, its attempt count and the retry the
+ * error page offered were all unreachable by construction, and the session
+ * thread stayed inside the transfer with g_social.running still true.
+ *
+ * Written as the sum rather than as a number chosen against it, so raising
+ * either inner bound carries this with it.
  */
 
+#define VS_SOCIAL_TRANSPORT_STALL_MS (AGENT_LLM_SOCKET_TIMEOUT_SEC * 1000)
+
 #define VS_SOCIAL_FETCH_STAGE_TIMEOUT_MS \
-  (CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS + 20000)
+  (CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS + VS_SOCIAL_TRANSPORT_STALL_MS + 20000)
 
 /* How long a browsed record has to stay on screen before its spoken minutes
  * start playing.

@@ -1038,6 +1038,45 @@ config VS_SOCIAL_DOWNLOAD_WINDOW_BYTES
 		configured: a 400, 403 or 501 on the first window drops to a
 		single unwindowed request and says so in the log.
 
+config VS_SOCIAL_DOWNLOAD_TIMEOUT_MS
+	int "VelaSight download overall budget (ms)"
+	default 60000
+	range 0 240000
+	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
+	---help---
+		How long a whole download may run before it is given up on, however
+		many windows that took.  Zero means no bound, which is what this
+		code did before the option existed.
+
+		This is the bound VS_SOCIAL_DOWNLOAD_ATTEMPTS cannot provide.  That
+		count stops consecutive *failures*, and a request that never
+		returns never fails.  Measured 2026-09-08 fetching ttsMinutes: the
+		first window landed in 2.4 s at 53 KB/s, the second went out, and
+		nothing came back for 107 s -- the attempt count was still zero
+		because no attempt had finished, and the loop had made no decision
+		at all.
+
+		What ends such a request is the transport's own receive timeout,
+		and on the TLS path that is AGENT_LLM_SOCKET_TIMEOUT_SEC in
+		packages/ai_agent: 120 s, not reachable from this application.  So
+		one hung window costs two minutes whatever this is set to.  What
+		this decides is whether the next three then cost six more.
+
+		60000 against a transfer measured at 53 KB/s for its fast prefix,
+		which is 3 MB of budget for a file around 600 KB -- generous for
+		any transfer that is progressing at all, and short enough that a
+		stalled one has already exceeded it by the time the transport
+		reports.  It is checked between windows, so it never cuts off a
+		request in flight; it stops the one after.
+
+		The finalizing page's own deadline for this step is derived from
+		this value -- VS_SOCIAL_FETCH_STAGE_TIMEOUT_MS in vs_app.c adds one
+		transport stall and a margin on top -- so raising this carries the
+		page with it and the ordering cannot be got wrong by changing one of
+		them.  That ordering is the whole point: a page that gives up first
+		aborts the session while the layer below is still on its way to
+		saying what went wrong.
+
 config VS_SOCIAL_DOWNLOAD_ATTEMPTS
 	int "VelaSight download attempts per window"
 	default 4
@@ -1057,9 +1096,12 @@ config VS_SOCIAL_DOWNLOAD_ATTEMPTS
 		partial delivery instead would not terminate at all: a window that
 		hands over one byte and then stalls forever would reset it forever.
 
-		Note that the finalizing page has its own bound over the top of
-		this one, VS_SOCIAL_FETCH_TIMEOUT_MS, and that a download retrying
-		into a wall will hit that first.
+		Note that this is not the outermost bound and is not the one that
+		stops a download that has hung rather than failed.  A request the
+		peer stops answering does not fail until the transport's receive
+		timeout ends it, and this count is not consulted until then; what
+		bounds the transfer as a whole is
+		VS_SOCIAL_DOWNLOAD_TIMEOUT_MS.
 
 config VS_TTS_CHUNK_BYTES
 	int "VelaSight audio playback read block (bytes)"
@@ -1136,29 +1178,6 @@ config VS_TTS_PRELOAD_MAX_BYTES
 		Raise it above zero only if a card regresses to the speeds
 		described above.
 
-config VS_SOCIAL_FETCH_TIMEOUT_MS
-	int "VelaSight spoken minutes download timeout (ms)"
-	default 90000
-	range 10000 300000
-	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
-	---help---
-		How long the finalizing page waits for the spoken minutes to
-		download before treating the transfer as wedged.
-
-		Not enforced by the download itself -- the transport already ends
-		a stalled connection on VS_SOCIAL_IO_TIMEOUT_MS, and a transfer
-		that is merely slow is still progress.  This is the UI's
-		no-progress deadline for that step, and it is deliberately the
-		longest of them: the file's size is not known in advance and it is
-		the one step whose duration scales with how much the other side
-		had to say.
-
-		Sized against measurement rather than guessed.  On 2026-09-07 a
-		138 KB prefix took 16.4 s, and that was with the camera still
-		streaming and taking CPU from the transfer; the camera is now
-		released before this step runs.  90 s covers a file several times
-		that size on a link several times worse.
-
 config VS_HISTORY_TTS_DWELL_MS
 	int "VelaSight history auto-play dwell (ms)"
 	default 2000
@@ -1189,17 +1208,28 @@ config VS_TTS_STACKSIZE
 
 config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
 	int "VelaSight social alert confirmation readings"
-	default 2
+	default 1
 	range 1 10
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		How many extreme readings raise an alert, and how many consecutive
 		calm ones clear it.
 
-		Without this the screen changes colour on single-reading noise.
-		The cloud itself does not debounce at all -- it opens an advice
-		slot on the first red frame -- so this is the device deciding that
-		one reading is not enough to interrupt someone.
+		1, which means the device raises on the same evidence the cloud
+		does.  The cloud's rule is one occurrence of 生气 or one of 伤心,
+		and it opens the advice slot for that frame immediately -- so a
+		device that waited for a second reading was not being careful, it
+		was guaranteeing that the advice for every single-frame extreme
+		moment arrived with no alert to attach it to and was discarded.
+		Measured 2026-09-08 at 2: three extreme frames produced one alert,
+		the cloud owed advice on two runs, and nothing was delivered.
+
+		Raising it above 1 is a deliberate decision to be stricter than the
+		cloud, and it has that cost attached.  What it buys is protection
+		from single-reading noise, which is real -- the confidence
+		distribution this model produces is 0.37 to 0.67 -- but
+		VS_SOCIAL_ALERT_MIN_CONFIDENCE is the knob for that, and it does not
+		throw the advice away.
 
 		"Readings", not "frames", and not "consecutive" on the raise side.
 		It used to require N extreme results in a row and was reset by any
@@ -1209,8 +1239,8 @@ config VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
 		detected continuously across roughly nineteen seconds with no
 		misclassification anywhere in between -- and one stray green in the
 		middle of a real argument reset the count to zero.  The raise side
-		now counts readings inside
-		VS_SOCIAL_ALERT_WINDOW_MS instead.
+		now counts readings inside VS_SOCIAL_ALERT_WINDOW_MS instead, which
+		at 1 makes the window irrelevant but keeps the option meaningful.
 
 		2 against a cloud that would fire on 1: two independent readings
 		agreeing is the least this can ask for and still be a filter, and
@@ -1246,49 +1276,55 @@ config VS_SOCIAL_ALERT_WINDOW_MS
 
 config VS_SOCIAL_ALERT_MIN_CONFIDENCE
 	int "VelaSight social alert minimum confidence (percent)"
-	default 40
+	default 0
 	range 0 100
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		How sure the cloud has to be about an extreme reading before it
 		counts towards raising an alert.
 
-		The interface sends a confidence with every emotion result -- as a
-		string, "0.95" -- and the device parsed it, carried it and then
-		never looked at it, so a red at 0.5 weighed the same as one at
-		0.95 in a decision made from only a couple of readings.
+		0, which disables the check, and 0 is the value that matches the
+		interface.
 
-		Applies to raising only.  A low-confidence red still counts as
-		"still extreme" for VS_SOCIAL_ALERT_HOLD_MS, so a run of unsure
-		readings holds an existing alert open without being able to start
-		one.  Raising interrupts the user; holding does not.
+		Nothing in the cloud's rule mentions confidence.  It is one
+		occurrence of 生气 or one of 伤心, and the cloud opens the advice
+		slot for that frame whatever the confidence was -- so every frame
+		this floor rejects is a frame the cloud has already committed to
+		producing advice for, and that advice then arrives with no alert to
+		attach it to and is discarded.  Exactly the failure that
+		VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS at 2 used to cause, in a narrower
+		slice.
 
-		A result with no confidence field at all is always accepted: a
-		server that omits it must not silently switch the feature off.
-
-		0 disables the check.
-
-		40 is measured, not chosen.  The interface example shows "0.95" and
-		this was first set to 60 on the strength of it, which turned out to
-		be above the entire range this model actually produces.  Two
-		sessions, 2026-09-07:
+		The history is worth keeping because it shows how expensive
+		guessing this was.  60 was chosen from the document's "0.95"
+		example and turned out to sit above the entire range the model
+		produces:
 
 		  R0000021, 28 classified frames: 0.37 to 0.67, median 0.55, none
 		  at or above 0.70, only 37% at or above 0.60.
-		  19:55 session, every one of the 7 red frames: 40, 42, 44, 45, 46,
-		  47, 57.  Highest 57.
+		  19:55 session, every one of the 7 extreme frames: 40, 42, 44, 45,
+		  46, 47, 57.  Highest 57.
 
-		So the floor rejected all seven reds, no alert was raised all
-		session, and the one advice the cloud did produce was discarded on
-		arrival for want of an alert to attach it to -- the feature could
-		not fire at any point.  At 40 those same seven all pass, the second
-		of them lands 6.3 s after the first and inside
-		VS_SOCIAL_ALERT_WINDOW_MS, and the advice arrives 5.9 s after that
-		with the alert still held by VS_SOCIAL_ALERT_COOLDOWN_MS.
+		At 60 the floor rejected all seven, no alert was raised all
+		session, and the one advice the cloud produced was discarded --
+		the feature could not fire at any point.  At 40 the first alert in
+		the project's history was raised, on a frame scoring 42.  At 0 the
+		device stops second-guessing the cloud entirely.
 
-		Raise it again if the model's confidence range moves up.  Judge it
-		against the "extreme frame ignored, confidence N below M" lines,
-		which print the real distribution one line per frame.
+		Setting it above 0 is a deliberate choice to be stricter than the
+		cloud, with the discarded-advice cost attached.  What it buys is
+		protection from single-frame noise; what it costs is visible in the
+		advice_discarded count.  Judge it against the "extreme frame
+		ignored, confidence N below M" lines, which print the real
+		distribution one frame per line.
+
+		Applies to raising only either way.  A low-confidence extreme frame
+		still counts as "still extreme" for VS_SOCIAL_ALERT_HOLD_MS, so a
+		run of unsure readings holds an existing alert open without being
+		able to start one.  Raising interrupts the user; holding does not.
+
+		A result with no confidence field at all is always accepted: a
+		server that omits it must not silently switch the feature off.
 
 config VS_SOCIAL_ALERT_COOLDOWN_MS
 	int "VelaSight social alert cooldown (ms)"
@@ -1403,23 +1439,44 @@ config VS_SOCIAL_AUDIO_QUEUE_SLOTS
 
 config VS_SOCIAL_IMAGE_QUEUE_SLOTS
 	int "VelaSight social image upload queue depth (frames)"
-	default 2
+	default 4
 	range 1 8
 	depends on LVX_USE_DEMO_CONTEST2026_264_VELASIGHT
 	---help---
 		How many captured frames may wait for the uploader.  Full means
 		the oldest is dropped and the sampler slows down.
 
-		Deliberately shallow, and shallower than the four slots images
-		used to share with audio.  Each slot can hold 160 KB of PSRAM,
-		and an emotion result is about the moment it was sampled: a queue
-		that holds a backlog spends the uplink on faces that have stopped
-		being current.  Two slots means what reaches the cloud is the
-		newest frame plus at most one predecessor.
+		Shallow on purpose: an emotion result is about the moment it was
+		sampled, so a queue that holds a long backlog spends the uplink on
+		faces that have stopped being current.
+
+		Two was too shallow, and the reason is the worker count rather
+		than the depth itself.  With VS_SOCIAL_UPLOAD_WORKERS at 2, both
+		slots are emptied the instant both workers are free and refilled
+		while both are busy, so the queue is either empty or overflowing
+		and the sampler is driven by whichever it hit last.  Measured
+		2026-09-07 across two sessions: three drop events each, and the
+		sampler spent most of both sessions in the slow half of its range
+		walking back from them.
+
+		Four decouples the two.  What it costs is frame age, and that cost
+		is now bounded and paid honestly: an item carries the capture
+		instant in vs_cloud_media_packet_s::produced_ms, so a frame that
+		waited an extra slot is still reported to the cloud with the
+		timestamp of the moment it was taken, not the moment it was sent.
+		Before that field existed, deepening this queue would have skewed
+		the emotion timeline; now it only delays a result.
+
+		The bound: at the measured transfer rate a slot is about one
+		second, so four slots is a worst-case age of a few seconds against
+		a VS_SOCIAL_ALERT_WINDOW_MS of 20 s.  Do not raise it much further
+		without revisiting that comparison -- the point of the queue is to
+		absorb jitter, not to store a conversation.
 
 		Overflow is not only absorbed here, it is fed back:
 		CONFIG_VS_SOCIAL_IMAGE_INTERVAL_MAX_MS describes how far the
-		sampler backs off when this fills.
+		sampler backs off when this fills, and social_state_s's
+		image_floor_ms remembers the rate that did it.
 
 config VS_SOCIAL_IMAGE_INTERVAL_MAX_MS
 	int "VelaSight social image sampling floor when the queue backs up (ms)"

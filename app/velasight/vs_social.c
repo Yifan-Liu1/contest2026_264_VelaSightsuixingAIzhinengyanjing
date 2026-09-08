@@ -120,14 +120,24 @@
 #  define CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES 8388608
 #endif
 
+#ifndef CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS
+#  define CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS 60000
+#endif
 
 
-/* Nothing here bounds the spoken-minutes download itself: the transport's own
- * CONFIG_VS_SOCIAL_IO_TIMEOUT_MS ends a transfer that has stalled, and a
- * transfer that is merely slow is still progress.  What catches a download that
- * neither finishes nor fails is the UI's per-stage deadline -- see
- * VS_SOCIAL_FETCH_STAGE_TIMEOUT_MS in vs_app.c, which is expressed against
- * CONFIG_VS_SOCIAL_FETCH_TIMEOUT_MS so the two cannot drift apart.
+
+/* Three bounds sit over the spoken-minutes download, nested, and the nesting is
+ * what makes any of them work.  Innermost is the transport's receive timeout,
+ * which is the only thing that can end a request the peer has stopped
+ * answering.  Then CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS, checked between
+ * windows, which stops the transfer paying that cost a second time.  Outermost
+ * is the UI's per-stage deadline, VS_SOCIAL_FETCH_STAGE_TIMEOUT_MS in vs_app.c,
+ * derived from the middle one plus one transport stall so it cannot end up
+ * inside it.
+ *
+ * It was inside it.  Measured 2026-09-08: the page's 110 s fired 12.6 s before
+ * the transport's 120 s, so the download's own timeout and its attempt count
+ * were both unreachable and an abort arrived instead of a diagnosis.
  */
 
 /* How the two progress lines are throttled.
@@ -142,8 +152,23 @@
 #define SOCIAL_UPLOAD_REPORT_EVERY 10
 #define SOCIAL_DROP_REPORT_MS      5000
 
+/* How many consecutive poll cycles may be given up to let a registration have
+ * the cleartext connection to itself.  See social_poll_once().
+ *
+ * Two, against CONFIG_VS_SOCIAL_POLL_INTERVAL_MS of 1500, so the worst case is
+ * a result arriving 3 s later than it would have.  That is far inside the
+ * windows anything acts on -- VS_SOCIAL_ALERT_WINDOW_MS is 20 s and
+ * VS_SOCIAL_ADVICE_TIMEOUT_MS is 30 s -- while the registrations it protects
+ * are on the critical path of an item each.
+ *
+ * The sweep and the stale-alert release run before the yield is even
+ * considered, so a yielded cycle still ages the alert state on time.
+ */
+
+#define SOCIAL_POLL_YIELD_MAX 2
+
 #ifndef CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS
-#  define CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS 2
+#  define CONFIG_VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS 1
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_ALERT_WINDOW_MS
@@ -151,7 +176,7 @@
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_ALERT_MIN_CONFIDENCE
-#  define CONFIG_VS_SOCIAL_ALERT_MIN_CONFIDENCE 40
+#  define CONFIG_VS_SOCIAL_ALERT_MIN_CONFIDENCE 0
 #endif
 
 #ifndef CONFIG_VS_SOCIAL_ALERT_COOLDOWN_MS
@@ -540,6 +565,35 @@ struct social_state_s
   uint64_t upload_register_ms;
   uint64_t upload_transfer_ms;
 
+  /* The transfer half again, split by what was in it, with the byte counts
+   * that go with it.  This is a measurement, not a control input: nothing
+   * reads it but the log line.
+   *
+   * It exists to settle one question that decides what is worth optimising
+   * next.  A transfer's cost is either the bytes on the wire or the round trip
+   * around them, and the two call for opposite work -- compress harder, or
+   * overlap more requests -- so guessing wrong means building the wrong thing.
+   * An image is about 12.9 KB and an audio chunk about 6 KB, so the same
+   * measurement on both is a two-to-one byte ratio at a fixed request cost:
+   *
+   *   put(audio) ~ put(image)          latency-bound.  Concurrency helps,
+   *                                    smaller frames do not.
+   *   put(audio) ~ put(image) / 2      bandwidth-bound.  The reverse.
+   *
+   * The evidence so far is indirect and points at latency -- 26% smaller
+   * frames bought 22% faster transfers, and an audio-heavy report window was
+   * measured slower per item than an image-heavy one -- but that window figure
+   * included the registration, so it cannot separate the two halves.  This
+   * can.
+   */
+
+  uint64_t upload_image_put_ms;
+  uint64_t upload_audio_put_ms;
+  uint64_t upload_image_bytes;
+  uint64_t upload_audio_bytes;
+  uint32_t upload_image_count;
+  uint32_t upload_audio_count;
+
   /* Messages awaiting results. */
 
   struct social_inflight_s inflight[CONFIG_VS_SOCIAL_INFLIGHT_MAX];
@@ -586,27 +640,6 @@ struct social_state_s
   uint8_t  extreme_have;
   uint8_t  calm_streak;
   bool     alert_active;
-
-  /* Whether the advice for the alert now standing has already been shown.
-   * Cleared on every raise, because it is a property of one alert.
-   *
-   * This is what bounds the wait described on social_awaiting_advice().  That
-   * wait is right while the advice is still coming and wrong once it has
-   * arrived, and the difference matters because the two timers disagree by a
-   * lot: an alert is meant to release VS_SOCIAL_ALERT_HOLD_MS (12 s) after the
-   * last extreme frame, but an entry keeps waiting for
-   * VS_SOCIAL_ADVICE_TIMEOUT_MS (30 s), and the cloud advises once per extreme
-   * run rather than once per red frame -- so most of those waits are for advice
-   * that was never coming.
-   *
-   * Replaying the 2026-09-07 19:55 session against the fixed confidence floor,
-   * the last red frame was at 19:55:57 and the five entries behind it swept out
-   * one by one until 19:56:28.  The alert would have sat on screen for 31 s
-   * after the conversation calmed, holding for advice it had already been
-   * given at 19:55:44.
-   */
-
-  bool     alert_advised;
   uint64_t alert_since_ms;
 
   /* What the cloud actually answered, counted so a session can be read as a
@@ -622,8 +655,29 @@ struct social_state_s
    */
 
   uint32_t emotion_results;   /* msgEvent 0 results folded in, once each */
-  uint32_t emotion_extreme;   /* of those, red */
-  uint32_t emotion_low_conf;  /* red, but under the confidence floor */
+  uint32_t emotion_extreme;   /* of those, extreme by either signal */
+  uint32_t emotion_low_conf;  /* extreme, but under the confidence floor */
+
+  /* How the two extreme signals compare, which is the only way to tell whether
+   * the out-of-band rule still matches what the cloud is doing.
+   *
+   * by_slot counts frames the document's signal caught and the emotionDetail
+   * rule did not -- so a rising by_slot means the rule reproduced in
+   * cloud_classify_emotion() has drifted from the cloud's, and the comment
+   * naming 生气 and 伤心 needs revisiting.  Zero means the two agree.
+   *
+   * late is the subset of those that arrived a poll too late to raise on; see
+   * the VS_CLOUD_PEER_ADVICE_PENDING arm.
+   */
+
+  uint32_t emotion_extreme_slot;
+  uint32_t emotion_extreme_late;
+
+  /* Results for an id no longer tracked.  See the unmatched arm of the poll
+   * loop: this is where a cloud signal can still go missing.
+   */
+
+  uint32_t poll_unmatched;
   uint32_t results_repeated;  /* results the cloud re-sent, ignored here */
   uint32_t failed_results;    /* peer status 30, whatever its real reason */
   uint32_t alerts_raised;
@@ -635,8 +689,9 @@ struct social_state_s
    * Measured 2026-09-07: "advice 0 delivered / 7 missed" was, in fact, one
    * advice sent by the cloud and thrown away here, plus six frames the cloud
    * was never going to advise on -- it advises once per extreme run, on the
-   * last frame of it, not once per red frame.  Read as six cloud failures it
-   * pointed at the wrong side entirely; discarded is the number to act on.
+   * last frame of it, not once per extreme frame.  Read as six cloud
+   * failures it pointed at the wrong side entirely; discarded is the number to
+   * act on.
    */
 
   uint32_t advice_delivered;  /* reached the screen */
@@ -644,17 +699,27 @@ struct social_state_s
   uint32_t advice_refused;    /* status 30 on the wait: cloud says never */
   uint32_t advice_expired;    /* VS_SOCIAL_ADVICE_TIMEOUT_MS elapsed */
 
+  /* What the poll's deference to registrations actually did.  See the block in
+   * social_poll_once() that reads them.
+   *
+   * Written from the session thread only, so unlocked increments there are
+   * safe; read by social_log_totals() on the same thread.
+   */
+
+  uint32_t poll_yielded;      /* cycles given up so a register could go first */
+  uint32_t poll_forced;       /* busy, but out of yields, so it went anyway */
+
   /* When the last extreme frame arrived, which is what releases an alert that
    * the calm streak cannot.
    *
-   * The streak needs three consecutive frames the cloud judged calm, and those
-   * are not what a session mostly receives.  A frame with no usable face comes
-   * back as status 30 and is retired without touching either streak -- the
-   * ordinary case, per social_poll_once() -- and a frame whose result never
-   * arrives at all is retired unanswered by social_inflight_add().  Measured
-   * 2026-09-07: 43 images uploaded produced 7 emotionTimeline entries and 15
-   * unanswered ids, so three consecutive calm results is a coincidence rather
-   * than an expectation.
+   * The streak needs SOCIAL_ALERT_NEEDED consecutive frames the cloud judged
+   * calm, and calm results are not most of what a session receives.  A frame
+   * with no usable face comes back as status 30 and is retired without touching
+   * either streak -- the ordinary case, per social_poll_once() -- and a frame
+   * whose result never arrives at all is retired by social_inflight_add()'s
+   * eviction.  Measured 2026-09-08: 72 images uploaded produced 25 results of
+   * which 42 were status 30, so a run of consecutive calm results is a
+   * coincidence rather than an expectation even now that the run is short.
    *
    * The consequence was that an alert raised once stayed on screen for the rest
    * of the session however calm the conversation became.  So "no longer
@@ -1381,55 +1446,33 @@ static void social_queue_flush(void)
 
 /* True when this entry has been told it is extreme and is still waiting for the
  * advice that follows.  Called with the lock held.
+ *
+ * One decision reads this: the eviction below will not throw such an entry away
+ * while it has an alternative, because that entry is the only thing that can
+ * collect what the cloud produces for an extreme moment.
+ *
+ * The alert release used to consult it too, through a social_awaiting_advice()
+ * helper that has been removed along with the term.  The idea was that an alert
+ * clearing before its advice arrived would make that advice stale and
+ * discarded -- true, but it traded a certainty for a possibility.  Measured
+ * 2026-09-08: the last extreme frame landed at 10:19:01.9, so
+ * VS_SOCIAL_ALERT_HOLD_MS put the release at 10:19:13.9, and the alert actually
+ * cleared at 10:19:31.888 -- six milliseconds after the last entry's
+ * VS_SOCIAL_ADVICE_TIMEOUT_MS sweep, 18.6 s late, for advice that never came.
+ * Against that, the one advice this cloud has ever delivered arrived 5.9 s
+ * after its frame, well inside the 12 s hold, so the wait bought nothing even
+ * in the case it was written for.  Under the current cloud rule -- one 生气 or
+ * one 伤心, one occurrence -- extreme frames are frequent enough that an 18 s
+ * over-hold would leave the alert up almost continuously.
+ *
+ * So the hold is the hold, and a late advice is discarded and counted as such.
+ * If advice_discarded starts climbing, that is the evidence for reconsidering,
+ * and it is a number now rather than an argument.
  */
 
 static bool social_inflight_waiting(const struct social_inflight_s *entry)
 {
   return entry->image_seen && entry->extreme;
-}
-
-/* True when any tracked message is still waiting for its advice.  Called with
- * the lock held.
- *
- * Two decisions read this.  The eviction below will not throw such an entry
- * away while it has an alternative, and the alert will not release itself while
- * one exists -- an alert that cleared first would make its own advice arrive
- * stale and be discarded, which loses the only thing the cloud produces for an
- * extreme moment.
- */
-
-static bool social_awaiting_advice(void)
-{
-  uint8_t i;
-
-  for (i = 0; i < g_social.inflight_count; i++)
-    {
-      if (social_inflight_waiting(&g_social.inflight[i]))
-        {
-          return true;
-        }
-    }
-
-  return false;
-}
-
-/* True when nothing an alert is owed is still outstanding, so it is free to
- * release on its own timers.  Called with the lock held.
- *
- * Both release paths ask this and neither asks it directly, because they used to
- * and the two copies are exactly the kind of pair that drifts -- one of them
- * already shipped without the ring reset the other had.
- *
- * The advised term is what keeps VS_SOCIAL_ALERT_HOLD_MS meaningful.  Waiting
- * protects an advice that has not arrived; once one has been shown for this
- * alert there is nothing left to protect, and continuing to wait would hold the
- * screen for the rest of the run's entries as they time out one by one.  See
- * social_state_s::alert_advised for what that measured.
- */
-
-static bool social_alert_may_release(void)
-{
-  return g_social.alert_advised || !social_awaiting_advice();
 }
 
 /* Drop one entry by index.  Called with the lock held. */
@@ -2087,6 +2130,27 @@ static void *social_upload_worker(void *arg)
         g_social.upload_register_ms += result.register_ms;
         g_social.upload_transfer_ms += result.transfer_ms;
 
+        /* Only a transfer that actually happened.  payload_sent is false for
+         * the mock cloud's untransferable URL, and counting a skipped PUT as a
+         * 0 ms one would report the link as faster than it is.
+         */
+
+        if (result.payload_sent)
+          {
+            if (slot.type == VS_CLOUD_MEDIA_IMAGE)
+              {
+                g_social.upload_image_put_ms += result.transfer_ms;
+                g_social.upload_image_bytes  += slot.len;
+                g_social.upload_image_count++;
+              }
+            else
+              {
+                g_social.upload_audio_put_ms += result.transfer_ms;
+                g_social.upload_audio_bytes  += slot.len;
+                g_social.upload_audio_count++;
+              }
+          }
+
         /* Images only.  An audio msgId cannot answer anything this session
          * acts on -- the cloud attaches an extreme frame's advice to the
          * image's msgId, not to any audio one -- so tracking it spent a slot
@@ -2243,6 +2307,57 @@ static void *social_upload_worker(void *arg)
  * Emotion debounce
  ****************************************************************************/
 
+/****************************************************************************
+ * Name: social_advice_slot_in_batch
+ *
+ * Description:
+ *   Whether this batch of results carries a msgEvent 1 entry for msg_id.
+ *
+ *   This is the interface document's own way of saying "I judged that frame
+ *   extreme", and it is the strongest signal the device has.  The cloud opens
+ *   an advice slot under the *image's* msgId as soon as it decides, and the
+ *   document's debug example shows the pair arriving together:
+ *
+ *     // 返回图片结果，但是极端情绪的建议未生成
+ *     {msgId:1, status:20, msgEvent:0, response:{red, 生气, 0.95}}
+ *     {msgId:1, status:11, msgEvent:1}
+ *
+ *   Why this rather than the emotion detail.  The document never states which
+ *   emotions are extreme -- it only enumerates the palette -- so the detail
+ *   test in cloud_classify_emotion() encodes a rule that arrived out of band
+ *   and can change on the cloud without the wire format changing at all.  This
+ *   cannot: whatever the rule becomes, the slot appearing means the cloud
+ *   applied it and answered yes.
+ *
+ *   Any state counts, not just 11.  A slot that has already failed (status 30,
+ *   "音频无有效声音") or already answered (21) is still a slot that was opened,
+ *   which is still the cloud having judged the frame extreme.
+ *
+ *   Scanned rather than pre-collected because the ordering of entries within a
+ *   batch is not specified: the image result may be processed before or after
+ *   its slot appears in the same array.  A scan is order-independent, and the
+ *   array is at most two entries per polled id.
+ *
+ ****************************************************************************/
+
+static bool social_advice_slot_in_batch(
+                             const struct vs_social_event_s *events,
+                             size_t count, const char *msg_id)
+{
+  size_t i;
+
+  for (i = 0; i < count; i++)
+    {
+      if (events[i].msg_event == VS_CLOUD_MSG_EVENT_AUDIO &&
+          strcmp(events[i].msg_id, msg_id) == 0)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
 /* Fold one image result into the alert state and say what the UI should be
  * told.  Called with the lock held.
  *
@@ -2308,7 +2423,6 @@ static bool social_emotion_step(const struct vs_social_event_s *event,
           now - oldest <= CONFIG_VS_SOCIAL_ALERT_WINDOW_MS)
         {
           g_social.alert_active   = true;
-          g_social.alert_advised  = false;
           g_social.alert_since_ms = now;
 
           /* A new alert invalidates advice still in flight for the previous
@@ -2348,8 +2462,7 @@ static bool social_emotion_step(const struct vs_social_event_s *event,
 
   if (g_social.alert_active &&
       g_social.calm_streak >= SOCIAL_ALERT_NEEDED &&
-      now - g_social.alert_since_ms >= CONFIG_VS_SOCIAL_ALERT_COOLDOWN_MS &&
-      social_alert_may_release())
+      now - g_social.alert_since_ms >= CONFIG_VS_SOCIAL_ALERT_COOLDOWN_MS)
     {
       g_social.alert_active = false;
       g_social.alert_gen++;
@@ -2464,8 +2577,7 @@ static bool social_alert_release_stale(void)
 
   if (g_social.alert_active &&
       now - g_social.alert_since_ms >= CONFIG_VS_SOCIAL_ALERT_COOLDOWN_MS &&
-      now - g_social.alert_extreme_ms >= CONFIG_VS_SOCIAL_ALERT_HOLD_MS &&
-      social_alert_may_release())
+      now - g_social.alert_extreme_ms >= CONFIG_VS_SOCIAL_ALERT_HOLD_MS)
     {
       g_social.alert_active = false;
 
@@ -2535,6 +2647,65 @@ static void social_poll_once(void)
     {
       return;
     }
+
+  /* Stay out of a registration's way when there is one.
+   *
+   * The poll and the upload registrations share one cleartext connection and
+   * one mutex, and they are not equally urgent: a registration is on the
+   * critical path of the item being uploaded, while a poll only asks about
+   * results that will still be there next cycle.  Landing on top of a
+   * registration charges that item this poll's entire round trip, which for a
+   * response of up to CONFIG_VS_SOCIAL_RESP_MAX_BYTES is not small.  Measured
+   * 2026-09-07: registration averages split into a 69-70 ms population and a
+   * 240-303 ms one, the second being the polls.
+   *
+   * Bounded, and the bound is the point.  vs_cloud_cleartext_busy() is a probe
+   * whose answer can be stale and, if the counter behind it were ever wrong,
+   * could be stale permanently -- so yielding is capped at
+   * SOCIAL_POLL_YIELD_MAX consecutive cycles, after which this poll goes ahead
+   * and blocks like it always did.  A starved poll would stall the alert
+   * decision and the advice sweep, which is a worse failure than a slow upload.
+   *
+   * The consecutive count is a function-static: only social_poll_once() reads
+   * or writes it and only the session thread runs it, so it needs neither the
+   * lock nor a home in g_social, and a stale value across sessions costs at
+   * most one cycle of not yielding.  The session totals are separate and do
+   * live in g_social, because they are read by social_log_totals() on the same
+   * thread but from a different function.
+   *
+   * Both are counted, and the pair is the whole point of measuring this.  The
+   * first version of this shipped with no log at all, so the board run that
+   * followed could not say whether it had ever fired -- and its registration
+   * timings got worse rather than better, which is a result that means nothing
+   * without knowing which of the two things happened.  yields against forced
+   * says it directly: a session with yields and no forced is the poll always
+   * finding room to step aside, forced climbing means it is being held off
+   * hard enough to hit SOCIAL_POLL_YIELD_MAX and go anyway.
+   */
+
+  {
+    static unsigned int yielded;
+
+    if (vs_cloud_cleartext_busy())
+      {
+        if (yielded < SOCIAL_POLL_YIELD_MAX)
+          {
+            yielded++;
+            g_social.poll_yielded++;
+            return;
+          }
+
+        /* Out of yields and the connection is still busy, so this poll takes
+         * its turn in the queue.  Counted separately: this is the case the
+         * bound exists for, and a session full of them is a session where
+         * yielding bought nothing.
+         */
+
+        g_social.poll_forced++;
+      }
+
+    yielded = 0;
+  }
 
   /* Snapshot the identifiers under the lock, then release it: the GET blocks
    * for a round trip and the uploader has to keep making progress.
@@ -2611,6 +2782,16 @@ static void social_poll_once(void)
 
         if (!matched)
           {
+            /* Counted rather than ignored.  A result for an id this device is
+             * no longer tracking is how the cloud's extreme signal can still be
+             * lost: a frame retired as calm has its slot opened afterwards, and
+             * by then there is nothing left to attach it to.  The batch scan in
+             * EMOTION_DONE below closes that for the same-batch case, which is
+             * the one the document's example shows; this number is how a
+             * later-batch case would make itself known.
+             */
+
+            g_social.poll_unmatched++;
             pthread_mutex_unlock(&g_social.lock);
             continue;
           }
@@ -2654,6 +2835,25 @@ static void social_poll_once(void)
                 }
               else
                 {
+                  /* The cloud's own verdict, ORed over the rule reproduced from
+                   * emotionDetail.  See social_advice_slot_in_batch() for why
+                   * the slot is the authoritative half: the document defines
+                   * the slot and does not define the rule.
+                   *
+                   * Written back into ev->extreme rather than kept beside it,
+                   * because social_emotion_step() reads the event and this has
+                   * to be the value it sees.  ev points into the poll scratch,
+                   * which is this thread's own working copy.
+                   */
+
+                  if (!ev->extreme &&
+                      social_advice_slot_in_batch(scratch->events, got,
+                                                  ev->msg_id))
+                    {
+                      ev->extreme = true;
+                      g_social.emotion_extreme_slot++;
+                    }
+
                   /* Recorded before the step below, because the step's release
                    * decision asks whether anything is waiting for advice and
                    * this entry may be the answer.
@@ -2692,6 +2892,37 @@ static void social_poll_once(void)
                 }
               break;
 
+            case VS_CLOUD_PEER_ADVICE_PENDING:
+
+              /* An advice slot the batch scan above did not already account
+               * for, which means it arrived in a later poll than its image
+               * result.  The entry is still tracked, so the cloud's verdict can
+               * still be recorded even though the moment to raise on it has
+               * passed.
+               *
+               * This case existed in the status mapping and nowhere else: the
+               * switch had no arm for it, so every one of these fell through
+               * default and the document's own extreme signal was discarded.
+               *
+               * Marking rather than raising, deliberately.  A msgEvent 1 entry
+               * carries no response -- no emotionDetail, no colour, no
+               * confidence -- so an alert raised from it alone would have
+               * nothing to put on the screen.  What marking buys is that the
+               * entry now waits for its advice instead of being retired as
+               * calm, which is the part that still works after the fact.
+               */
+
+              if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO &&
+                  g_social.inflight[index].image_seen &&
+                  !g_social.inflight[index].extreme)
+                {
+                  g_social.inflight[index].extreme = true;
+                  g_social.emotion_extreme++;
+                  g_social.emotion_extreme_slot++;
+                  g_social.emotion_extreme_late++;
+                }
+              break;
+
             case VS_CLOUD_PEER_ADVICE_DONE:
               if (ev->msg_event == VS_CLOUD_MSG_EVENT_AUDIO)
                 {
@@ -2709,8 +2940,9 @@ static void social_poll_once(void)
                    * The equality this replaces admitted the first case and
                    * rejected the second, and the second is the one the
                    * interface produces: advice is delivered under "图片序列最后
-                   * 检测到极端情绪的最后一张图片" -- the last red frame of the
-                   * run, not the frame that happened to raise the alert.  With
+                   * 检测到极端情绪的最后一张图片" -- the last extreme
+                   * frame of the run, not the frame that happened to raise the
+                   * alert.  With
                    * VS_SOCIAL_ALERT_DEBOUNCE_WINDOWS at 2 the run usually
                    * continues past the raise, so the frame the cloud advises on
                    * is usually one taken during the alert, and the test threw
@@ -2722,12 +2954,6 @@ static void social_poll_once(void)
                     {
                       deliver_advice = true;
                       g_social.advice_delivered++;
-
-                      /* This alert has had its say, so it stops holding the
-                       * release back for the other entries in the same run.
-                       */
-
-                      g_social.alert_advised = true;
                       snprintf(text, sizeof(text), "%s", ev->suggestion);
                       emotion = VS_EMOTION_TENSE;
                     }
@@ -3111,6 +3337,19 @@ static void social_log_totals(void)
          (unsigned long)g_social.failed_results,
          (unsigned long)g_social.alerts_raised);
 
+  /* Which of the two extreme signals did the work.  by_slot is the document's
+   * own signal catching a frame the emotionDetail rule missed, so anything
+   * other than zero means the out-of-band rule has drifted from the cloud's;
+   * late is the part of that which arrived too late to raise on, and unmatched
+   * is results for ids already retired.  See social_advice_slot_in_batch().
+   */
+
+  printf("%s: extreme signal: %lu by advice slot (%lu of them late), "
+         "%lu result(s) for a retired id\n", SOCIAL_TAG,
+         (unsigned long)g_social.emotion_extreme_slot,
+         (unsigned long)g_social.emotion_extreme_late,
+         (unsigned long)g_social.poll_unmatched);
+
   /* A third line, because the four outcomes are not interchangeable and the
    * single "missed" they used to share hid which side was at fault.
    *
@@ -3129,6 +3368,54 @@ static void social_log_totals(void)
          (unsigned long)g_social.advice_discarded,
          (unsigned long)g_social.advice_refused,
          (unsigned long)g_social.advice_expired);
+
+  /* A fourth line, and the only one here that exists to answer a question
+   * rather than to describe the session.  See social_state_s's per-type
+   * transfer counters: the mean PUT for each media type against its mean size
+   * says whether a transfer costs its bytes or costs its round trip, and those
+   * two answers call for opposite work.  Whole-session means rather than the
+   * ten-upload window, because a window holds too few of either type to
+   * average.
+   *
+   * KB/s is printed for both so the comparison does not have to be done by
+   * hand: two similar rates mean bandwidth, and a rate that rises with size
+   * means the fixed cost dominates.
+   */
+
+  {
+    uint32_t images = g_social.upload_image_count;
+    uint32_t audios = g_social.upload_audio_count;
+
+    printf("%s: transfer: image %lu x %lu B in %lu ms avg (%.1f KB/s), "
+           "audio %lu x %lu B in %lu ms avg (%.1f KB/s)\n", SOCIAL_TAG,
+           (unsigned long)images,
+           (unsigned long)(images > 0 ?
+                           g_social.upload_image_bytes / images : 0),
+           (unsigned long)(images > 0 ?
+                           g_social.upload_image_put_ms / images : 0),
+           g_social.upload_image_put_ms > 0 ?
+             (double)g_social.upload_image_bytes * 1000.0 /
+             (double)g_social.upload_image_put_ms / 1024.0 : 0.0,
+           (unsigned long)audios,
+           (unsigned long)(audios > 0 ?
+                           g_social.upload_audio_bytes / audios : 0),
+           (unsigned long)(audios > 0 ?
+                           g_social.upload_audio_put_ms / audios : 0),
+           g_social.upload_audio_put_ms > 0 ?
+             (double)g_social.upload_audio_bytes * 1000.0 /
+             (double)g_social.upload_audio_put_ms / 1024.0 : 0.0);
+  }
+
+  /* And whether the poll stepping aside for registrations did anything.  Read
+   * against the "reg" half of the upload report: yields with no forced and a
+   * flat register time means the deference is working, forced climbing means
+   * the registrations are dense enough that SOCIAL_POLL_YIELD_MAX is reached
+   * and the poll queues behind them anyway.
+   */
+
+  printf("%s: poll: %lu cycle(s) yielded to a register, %lu forced through\n",
+         SOCIAL_TAG, (unsigned long)g_social.poll_yielded,
+         (unsigned long)g_social.poll_forced);
 }
 
 /****************************************************************************
@@ -3279,7 +3566,9 @@ static int social_fetch_minutes_audio(const char *url, const char *record_key,
                                       char *path_out, size_t path_cap)
 {
   char path[VS_TTS_PATH_MAX];
+  char temp[VS_TTS_PATH_MAX];
   size_t file_len = 0;
+  size_t stem;
   uint64_t began;
   int ret;
 
@@ -3307,19 +3596,69 @@ static int social_fetch_minutes_audio(const char *url, const char *record_key,
 
   social_minutes_dir(path);
 
+  /* Fetch to a name nothing plays, then rename.
+   *
+   * The download writes as it goes, so for the length of the transfer there is
+   * a partial file wherever it was told to put it -- and
+   * vs_history_audio_path() names exactly the file the UI's browse page
+   * auto-plays.  Those two facts met on 2026-09-08: the fetch stalled, the
+   * finalizing page timed out and dropped the user on the history entry this
+   * session had just written, the dwell timer expired, and vs_tts opened
+   * 131072 bytes of an unfinished WAV and reported it unplayable (-61).  The
+   * record was on the card and correct; only its audio was half-written, and
+   * nothing in the naming said so.
+   *
+   * ".TMP" rather than a dotfile or a subdirectory: the volume is VFAT and
+   * vs_history_audio_path() documents that "R" plus seven digits is exactly
+   * eight characters to stay 8.3-safe, so swapping the extension keeps that
+   * property and keeps the temporary beside its record.  Nothing looks for
+   * .TMP -- vs_history_audio_path() always says .WAV -- so a leftover from a
+   * power cut is invisible rather than audible, and the unlink below clears it
+   * on the next attempt for the same record.
+   */
+
+  snprintf(temp, sizeof(temp), "%s", path);
+  stem = strlen(temp);
+  if (stem < 4)
+    {
+      return -EINVAL;
+    }
+
+  snprintf(temp + stem - 4, sizeof(temp) - (stem - 4), ".TMP");
+  (void)unlink(temp);
+
   began = social_now_ms();
-  ret = vs_cloud_download_to_file(url, path,
+  ret = vs_cloud_download_to_file(url, temp,
                                   CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES,
+                                  CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS,
                                   &file_len);
   if (ret < 0)
     {
-      /* -EFBIG is the interesting one: it means the spoken minutes outgrew
-       * CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES, which is a number to raise
-       * rather than a fault to chase.  Say so specifically.
+      /* Two worth naming.  -EFBIG means the spoken minutes outgrew
+       * CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES, which is a number to raise rather
+       * than a fault to chase.  -ETIMEDOUT means the transfer ran past
+       * CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS, the bound that keeps this step
+       * inside the finalizing page's own budget -- if it is being hit routinely
+       * the two want raising together, in that order.
        */
 
       printf("%s: spoken minutes not fetched: %d%s\n", SOCIAL_TAG, ret,
-             ret == -EFBIG ? " (raise VS_SOCIAL_DOWNLOAD_MAX_BYTES)" : "");
+             ret == -EFBIG ? " (raise VS_SOCIAL_DOWNLOAD_MAX_BYTES)" :
+             ret == -ETIMEDOUT ? " (raise VS_SOCIAL_DOWNLOAD_TIMEOUT_MS)" : "");
+      return ret;
+    }
+
+  /* Only now does the name anything plays exist.  rename() over an existing
+   * file is atomic on this filesystem, and the only thing that could be there
+   * is a previous attempt at the same record.
+   */
+
+  if (rename(temp, path) < 0)
+    {
+      ret = -errno;
+      printf("%s: cannot publish the audio for %s: %d\n", SOCIAL_TAG,
+             record_key, ret);
+      (void)unlink(temp);
       return ret;
     }
 
@@ -3975,6 +4314,17 @@ int vs_social_start(uint32_t request_id)
   g_social.upload_register_ms = 0;
   g_social.upload_transfer_ms = 0;
 
+  /* Not reset by the ten-upload report, unlike the three above: these are
+   * whole-session means and the window is too short to average either type.
+   */
+
+  g_social.upload_image_put_ms = 0;
+  g_social.upload_audio_put_ms = 0;
+  g_social.upload_image_bytes  = 0;
+  g_social.upload_audio_bytes  = 0;
+  g_social.upload_image_count  = 0;
+  g_social.upload_audio_count  = 0;
+
   /* Zero here as well as where the workers are spawned.  A session that failed
    * before reaching the spawn loop would otherwise leave the previous one's
    * count behind for social_stop_producers() to join stale handles from.
@@ -3995,6 +4345,9 @@ int vs_social_start(uint32_t request_id)
   g_social.finalize_began_ms = 0;
   g_social.emotion_results  = 0;
   g_social.emotion_extreme  = 0;
+  g_social.emotion_extreme_slot = 0;
+  g_social.emotion_extreme_late = 0;
+  g_social.poll_unmatched   = 0;
   g_social.emotion_low_conf = 0;
   g_social.results_repeated = 0;
   g_social.failed_results   = 0;
@@ -4003,12 +4356,13 @@ int vs_social_start(uint32_t request_id)
   g_social.advice_discarded = 0;
   g_social.advice_refused   = 0;
   g_social.advice_expired   = 0;
+  g_social.poll_yielded     = 0;
+  g_social.poll_forced      = 0;
   g_social.alert_gen        = 1;
   g_social.extreme_head     = 0;
   g_social.extreme_have     = 0;
   g_social.calm_streak      = 0;
   g_social.alert_active     = false;
-  g_social.alert_advised    = false;
   g_social.alert_since_ms   = 0;
   g_social.alert_extreme_ms = 0;
   memset(g_social.extreme_at, 0, sizeof(g_social.extreme_at));
