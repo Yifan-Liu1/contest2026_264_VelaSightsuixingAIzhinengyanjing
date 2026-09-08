@@ -854,10 +854,26 @@ void vs_cloud_release(unsigned char *data, bool from_psram);
  *   max_bytes  - refuse a body larger than this, leaving no file behind.  This
  *                is CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES for the spoken minutes.
  *   timeout_ms - give up once the transfer as a whole has run this long.  0
- *                means no bound.  Checked between windows, so it does not cut
- *                off a request already in flight -- what it prevents is the
- *                next one.  See the deadline check in the loop for why the
- *                attempt count could not do this on its own.
+ *                means no bound.  Bounds the transfer as a whole, not each
+ *                request: it is checked between windows *and* once per record
+ *                inside one, which is what makes it a bound at all.  See
+ *                cloud_file_sink() for the trickling stall that is invisible
+ *                to a per-read timeout, and the deadline check in the loop for
+ *                why the attempt count could not do this on its own.
+ *   cancel     - optional; asked once per record while a request is in flight,
+ *                and the transfer stops with -ECANCELED the first time it
+ *                answers true.  NULL means the transfer cannot be interrupted.
+ *
+ *                This exists because nothing else can reach a download that is
+ *                already running.  A caller that can be told to stop from
+ *                another thread -- vs_social_abort() from the UI thread, say --
+ *                has no other way to make that reach a blocking read, and
+ *                without it an abort is invisible until the transfer ends by
+ *                itself, which is the one case that may take arbitrarily long.
+ *
+ *                Called from the transport's thread, so it must be cheap and
+ *                must not reach for a lock the aborting thread could be
+ *                holding across its own call into this download.
  *   len        - optional; receives the bytes written.
  *
  * Returned Value:
@@ -873,15 +889,17 @@ void vs_cloud_release(unsigned char *data, bool from_psram);
  *   Measured 2026-09-08: the UI's browse page auto-played a record whose
  *   download was still in flight and reported the truncated file as unplayable.
  *
- *   -ETIMEDOUT when timeout_ms elapsed, -EFBIG when the body exceeded
- *   max_bytes, -ENOSPC when the filesystem filled, -EIO when the peer closed
- *   before Content-Length was reached, -EPROTO for a chunked body on the
- *   cleartext path, which is not decoded.
+ *   -ECANCELED when cancel() answered true, -ETIMEDOUT when timeout_ms
+ *   elapsed, -EFBIG when the body exceeded max_bytes, -ENOSPC when the
+ *   filesystem filled, -EIO when the peer closed before Content-Length was
+ *   reached, -EPROTO for a chunked body on the cleartext path, which is not
+ *   decoded.
  *
  ****************************************************************************/
 
 int vs_cloud_download_to_file(const char *url, const char *path,
                               size_t max_bytes, uint32_t timeout_ms,
+                              bool (*cancel)(void),
                               size_t *len);
 
 /****************************************************************************

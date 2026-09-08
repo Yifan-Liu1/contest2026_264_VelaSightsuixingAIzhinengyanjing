@@ -4626,6 +4626,16 @@ struct cloud_file_sink_s
   bool over;   /* refused because the budget was reached */
   int err;     /* errno from write(), 0 when there was none */
 
+  /* The transfer's deadline and the caller's "stop now" question, both asked
+   * once per record instead of once per window.  This is the only place either
+   * can be asked while a request is in flight; see cloud_file_sink().
+   */
+
+  uint64_t deadline;
+  bool (*cancel)(void);
+  bool expired;   /* refused because the deadline passed */
+  bool cancelled; /* refused because the caller asked to stop */
+
   /* The aggregation buffer.  NULL is a supported state and means "write every
    * record straight through", which is what happens when PSRAM could not spare
    * the block -- slow, but a slow download beats a failed one.
@@ -4722,6 +4732,53 @@ static int cloud_file_sink(void *arg, const void *data, size_t len)
   const unsigned char *p = data;
   size_t remaining = len;
 
+  /* The deadline and the cancel question, asked here because this is the only
+   * code of ours that runs while a request is in flight.
+   *
+   * The loop in vs_cloud_download_to_file() checks the same deadline, but only
+   * between windows, and a window is CONFIG_VS_SOCIAL_DOWNLOAD_WINDOW_BYTES --
+   * 128 KB -- before it returns.  Measured 2026-09-08: the first window of the
+   * spoken minutes landed in 6.2 s at 21 KB/s, the second went out, and the UI
+   * stage budget ended the session 193.7 s later having printed nothing.
+   *
+   * Neither bound fired, and the second one is the part worth understanding.
+   * Not the loop's, because the loop was never reached.  But not the
+   * transport's own receive timeout either: AGENT_LLM_SOCKET_TIMEOUT_SEC is
+   * per read, so a peer that trickles a few bytes at a time resets it forever
+   * while never delivering the 128 KB the window is waiting for.  A stall that
+   * dribbles is invisible to every timeout except one counted against the
+   * transfer as a whole, which is what this is.
+   *
+   * This sink is called once per TLS record -- about 1.4 KB on a 1500-byte
+   * path -- so asking here bounds the transfer at roughly that granularity
+   * rather than at 128 KB, which is close enough to immediate.
+   *
+   * The cancel question is here for a related reason.  vs_social_abort() runs
+   * on the UI thread and can wake the camera and the microphone, but it cannot
+   * interrupt a read in progress, so an abort during a download used to be
+   * invisible until the transfer ended on its own -- which is exactly the case
+   * that has no bound.  Asking the caller once per record is what lets an
+   * abort reach a transfer at all.
+   *
+   * Both are reported through the state rather than the return value, for the
+   * same reason as every other refusal here: the transport collapses them into
+   * one code and the caller has to be able to tell a timeout from a full card.
+   * Asked before the budget check below, so a transfer that is out of time
+   * says so even when this record would also have overrun.
+   */
+
+  if (sink->deadline != 0 && cloud_uptime_ms() >= sink->deadline)
+    {
+      sink->expired = true;
+      return -1;
+    }
+
+  if (sink->cancel != NULL && sink->cancel())
+    {
+      sink->cancelled = true;
+      return -1;
+    }
+
   /* Checked before writing, not after.  Stopping once the file is already too
    * large would still have spent the storage.
    */
@@ -4777,6 +4834,7 @@ static int cloud_file_sink(void *arg, const void *data, size_t len)
 
 int vs_cloud_download_to_file(const char *url, const char *path,
                               size_t max_bytes, uint32_t timeout_ms,
+                              bool (*cancel)(void),
                               size_t *len)
 {
   struct cloud_url_s *parsed = NULL;
@@ -4817,6 +4875,19 @@ int vs_cloud_download_to_file(const char *url, const char *path,
   sink.fd = -1;
   sink.max_bytes = max_bytes;
   sink.next_report = CLOUD_DOWNLOAD_REPORT_STRIDE;
+
+  /* After the memset, which is the only reason this is not up beside the
+   * deadline it copies.  Both of these are what let the sink stop a transfer
+   * from inside a window; setting them earlier would have them zeroed here and
+   * the bound would be silently absent while still compiling.
+   *
+   * The same deadline lives in two places on purpose: the loop refuses to
+   * issue another window past it, the sink stops the one already running.  See
+   * cloud_file_sink() for why either alone is not a bound.
+   */
+
+  sink.deadline = deadline;
+  sink.cancel   = cancel;
 
   /* The write aggregation buffer.  Optional by design: cloud_file_sink() falls
    * back to writing each record straight through when this is NULL, which is
@@ -4944,7 +5015,13 @@ int vs_cloud_download_to_file(const char *url, const char *path,
        * window, so it ends the loop and is reported below.
        */
 
-      if (sink.over || sink.err != 0)
+      /* A sink refusal is an answer about the download, not about this window,
+       * so it ends the loop rather than spending an attempt.  expired and
+       * cancelled join over and err here because a resumed window would walk
+       * straight back into the condition that just stopped this one.
+       */
+
+      if (sink.over || sink.err != 0 || sink.expired || sink.cancelled)
         {
           break;
         }
@@ -5057,6 +5134,17 @@ int vs_cloud_download_to_file(const char *url, const char *path,
    * past the budget that just rejected it.
    */
 
+  /* Folded together so the reporting below has one question to ask.  The sink
+   * and the loop can each reach the deadline first and they mean the same
+   * thing; a sink refusal also leaves complete false, so nothing downstream
+   * mistakes a stopped transfer for a finished one.
+   */
+
+  if (sink.expired)
+    {
+      expired = true;
+    }
+
   if (complete && !sink.over && sink.err == 0 &&
       cloud_file_flush(&sink) < 0)
     {
@@ -5094,6 +5182,20 @@ int vs_cloud_download_to_file(const char *url, const char *path,
 
   if (!complete)
     {
+      if (sink.cancelled)
+        {
+          /* Ahead of expired, because an abort during the last moments of the
+           * budget is still an abort, and reporting a timeout would send the
+           * next reader looking at the network for a problem that was a button
+           * press.
+           */
+
+          printf("%s: download of %s abandoned after %zu bytes and %u "
+                 "request(s)\n", CLOUD_TAG, path, sink.written, requests);
+          ret = -ECANCELED;
+          goto unlink_out;
+        }
+
       if (expired)
         {
           /* Reported ahead of http, which still holds whatever the last window

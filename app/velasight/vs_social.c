@@ -2308,6 +2308,44 @@ static void *social_upload_worker(void *arg)
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: social_download_cancelled
+ *
+ * Description:
+ *   Whether a download in progress should stop, asked by vs_cloud's body sink
+ *   once per record.
+ *
+ *   This is how an abort reaches a transfer.  vs_social_abort() runs on the UI
+ *   thread and can wake the camera and the microphone, but a read already in
+ *   flight is not something it can interrupt -- so before this existed, an
+ *   abort during the spoken-minutes fetch did nothing observable until the
+ *   transfer ended on its own.  Measured 2026-09-08 that was 193.7 s, and the
+ *   session's totals stayed unprinted for all of it because the thread that
+ *   prints them was inside the read.
+ *
+ *   Deliberately not taking g_social.lock, for two reasons.  It runs once per
+ *   record on a transfer that may be megabytes, and the lock it would be taking
+ *   is the one the poll loop and both upload workers are already contending
+ *   for.  More importantly it cannot be known from here whether some future
+ *   caller starts a download with the lock held, and this mutex is not
+ *   recursive, so a lock here would turn that into a deadlock instead of a
+ *   review comment.
+ *
+ *   The read is of one bool that only ever goes false to true within a session,
+ *   so both answers are safe: a stale false costs one more record before the
+ *   next call asks again, and no interleaving can produce a spurious true.
+ *   Read through a volatile lvalue so the load is guaranteed to happen rather
+ *   than being assumed loop-invariant -- the indirect call from vs_cloud.c
+ *   already forces it in practice, but that is a property of the call site
+ *   rather than of this function, and this is where the guarantee belongs.
+ *
+ ****************************************************************************/
+
+static bool social_download_cancelled(void)
+{
+  return *(const volatile bool *)&g_social.abort;
+}
+
+/****************************************************************************
  * Name: social_advice_slot_in_batch
  *
  * Description:
@@ -3631,20 +3669,25 @@ static int social_fetch_minutes_audio(const char *url, const char *record_key,
   ret = vs_cloud_download_to_file(url, temp,
                                   CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES,
                                   CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS,
+                                  social_download_cancelled,
                                   &file_len);
   if (ret < 0)
     {
-      /* Two worth naming.  -EFBIG means the spoken minutes outgrew
+      /* Three worth naming.  -EFBIG means the spoken minutes outgrew
        * CONFIG_VS_SOCIAL_DOWNLOAD_MAX_BYTES, which is a number to raise rather
        * than a fault to chase.  -ETIMEDOUT means the transfer ran past
        * CONFIG_VS_SOCIAL_DOWNLOAD_TIMEOUT_MS, the bound that keeps this step
        * inside the finalizing page's own budget -- if it is being hit routinely
-       * the two want raising together, in that order.
+       * the two want raising together, in that order.  -ECANCELED is not a
+       * fault at all: the user or the stage budget asked for the session to
+       * stop and the transfer let go, which is the whole point of passing a
+       * cancel predicate.
        */
 
       printf("%s: spoken minutes not fetched: %d%s\n", SOCIAL_TAG, ret,
              ret == -EFBIG ? " (raise VS_SOCIAL_DOWNLOAD_MAX_BYTES)" :
-             ret == -ETIMEDOUT ? " (raise VS_SOCIAL_DOWNLOAD_TIMEOUT_MS)" : "");
+             ret == -ETIMEDOUT ? " (raise VS_SOCIAL_DOWNLOAD_TIMEOUT_MS)" :
+             ret == -ECANCELED ? " (session aborted)" : "");
       return ret;
     }
 
