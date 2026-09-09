@@ -288,6 +288,57 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
     }
 
     syslog(LOG_INFO, "[%s] TLS connected to %s:%s\n", TAG, host, port);
+
+    /* What the handshake actually negotiated, and whether it left anything a
+     * later one could reuse.
+     *
+     * Measured 2026-09-09 the handshake was 710 ms of a 1173 ms open, three
+     * fifths of it, against a dns+tcp of 172 ms that puts the round trip near
+     * 150 ms.  Two round trips of that do not add up to 710, so the remainder is
+     * local arithmetic -- and this build has no MBEDTLS_*_ALT backend, so the
+     * curve and the signature check are software on a Cortex-M33.  These three
+     * facts are what tell the difference between the two ways of shortening it.
+     *
+     *   version      decides how many round trips a full handshake costs and how
+     *                many a resumed one saves.  TLS 1.3 is not compiled into
+     *                this build, so this is expected to read TLSv1.2 and the
+     *                full handshake to be two round trips.
+     *   ciphersuite  names the key exchange, which is where the local time goes.
+     *                An ECDHE suite pays a scalar multiplication per connection
+     *                that a resumed session skips entirely.
+     *   session      whether the server gave this client something to resume
+     *                with.  MBEDTLS_SSL_SESSION_TICKETS is compiled in, so a
+     *                failure here is the server declining rather than the client
+     *                being unable, and it is the one thing that decides whether
+     *                caching sessions is worth implementing at all.
+     *
+     * The probe copies the session and frees it immediately: nothing caches yet,
+     * and finding out whether a cache could work should not depend on having
+     * built one.  Only on the instrumented path, so the batch path keeps its
+     * previous behaviour exactly.
+     */
+
+    if (timing != NULL) {
+        mbedtls_ssl_session probe;
+        int saved;
+
+        mbedtls_ssl_session_init(&probe);
+        saved = mbedtls_ssl_get_session(&ctx->ssl, &probe);
+
+        syslog(LOG_INFO, "[%s] TLS %s / %s, resumable=%s\n", TAG,
+            mbedtls_ssl_get_version(&ctx->ssl),
+            mbedtls_ssl_get_ciphersuite(&ctx->ssl),
+            saved == 0 ? "yes" : "no");
+
+        if (saved != 0) {
+            syslog(LOG_INFO,
+                "[%s] no reusable session: get_session -0x%04x\n",
+                TAG, -saved);
+        }
+
+        mbedtls_ssl_session_free(&probe);
+    }
+
     return 0;
 }
 
