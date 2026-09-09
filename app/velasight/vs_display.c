@@ -31,6 +31,29 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_MAIN_Y            35
 #define VS_MAIN_WIDTH        136
 #define VS_MAIN_HEIGHT       71
+
+/* The same box pulled inside the emotion ring.
+ *
+ * The ring's inner edge is 72 px from (80,80).  A box's highest scanline is its
+ * narrowest, so that row is what has to fit: at y=35 the edge is at
+ * x = 80 +/- sqrt(72^2 - 45^2), i.e. 23.8 and 136.2.  A 112 px label centred in
+ * itself puts a full seven-glyph line at exactly x=24..136, which clears that
+ * by two tenths of a pixel -- true but not worth trusting against an
+ * antialiased arc.
+ *
+ * Dropping the top to y=39 buys the room instead: the edge there is at
+ * sqrt(72^2 - 41^2), i.e. x=20.8 and 139.2, so the same line clears by 3.2 px
+ * at both ends.  The height comes down by the same 4 px to keep the bottom at
+ * y=106, above the divider, and 67 px still holds the four 16 px lines that 71
+ * did.
+ *
+ * Seven glyphs a line rather than eight, then, and only while the ring is up.
+ */
+
+#define VS_MAIN_RING_X       24
+#define VS_MAIN_RING_Y       39
+#define VS_MAIN_RING_WIDTH   112
+#define VS_MAIN_RING_HEIGHT  67
 #define VS_LOWER_TOP_Y       110
 #define VS_LOWER_BOTTOM_Y    130
 #define VS_LOWER_ROW_HEIGHT  18
@@ -534,9 +557,17 @@ static void vs_render_content(struct vs_panel_s *panel,
                               const struct vs_ui_snapshot_s *snapshot)
 {
   /* The wider upper row carries metadata; the lower row carries the short
-   * status moved from the right screen. */
+   * status moved from the right screen.
+   *
+   * History joins volume on the wide row.  The specification gives that row
+   * "date, time or longer meta information", and a history record's date is
+   * both: "26-09-09 10:15" is fourteen ASCII glyphs, 112 px at this font's
+   * 8.0 px advance, which the 104 px narrow row clipped at both ends.  It was
+   * worse before vs_social.c dropped the century -- sixteen glyphs, 128 px --
+   * and widening alone would have left that exactly equal to the box.
+   */
 
-  if (snapshot->page == VS_PAGE_VOLUME)
+  if (snapshot->page == VS_PAGE_VOLUME || snapshot->page == VS_PAGE_HISTORY)
     {
       lv_obj_set_pos(panel->meta, VS_META_WIDE_X, VS_LOWER_TOP_Y);
       lv_obj_set_width(panel->meta, VS_META_WIDE_WIDTH);
@@ -545,6 +576,30 @@ static void vs_render_content(struct vs_panel_s *panel,
     {
       lv_obj_set_pos(panel->meta, VS_META_X, VS_LOWER_TOP_Y);
       lv_obj_set_width(panel->meta, VS_META_WIDTH);
+    }
+
+  /* The body gives way to the ring, and only while the ring is there.
+   *
+   * The advice box is 136 px at x=12 spanning y=35..106, and the ring's inner
+   * edge at y=35 is at x=23.8 and x=136.2.  The two overlapped at both upper
+   * corners, which is exactly where a first line of advice starts.  The text is
+   * what moves, because the ring is how this page reports the reading that
+   * produced the advice in the first place.
+   *
+   * See VS_MAIN_RING_X for where the numbers come from.  Restored in full the
+   * moment the ring goes, so a session with no extreme reading -- and every
+   * other page that borrows this box -- reads exactly as it did before.
+   */
+
+  if (snapshot->emotion_ring)
+    {
+      lv_obj_set_pos(panel->body, VS_MAIN_RING_X, VS_MAIN_RING_Y);
+      lv_obj_set_size(panel->body, VS_MAIN_RING_WIDTH, VS_MAIN_RING_HEIGHT);
+    }
+  else
+    {
+      lv_obj_set_pos(panel->body, VS_MAIN_X, VS_MAIN_Y);
+      lv_obj_set_size(panel->body, VS_MAIN_WIDTH, VS_MAIN_HEIGHT);
     }
 
   /* The ring crosses this row, so the two cannot share it.

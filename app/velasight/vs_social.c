@@ -4154,18 +4154,37 @@ static int social_persist_minutes(const struct vs_cloud_minutes_s *minutes,
   /* The clock may never have been set: this board has no RTC, and SNTP is not
    * on the social path.  A wrong date is still more useful than none -- it
    * orders the records correctly within a boot -- so it is written rather than
-   * left blank, and the year makes it obvious when it is not real.
+   * left blank.
+   *
+   * Two digits of year, because the row this lands in is 128 px wide at its
+   * widest and velasight_font_16_ui advances 8.0 px per ASCII glyph: the
+   * four-digit form is sixteen glyphs, exactly 128 px, and was being clipped at
+   * both ends.  Fourteen glyphs is 112 px and leaves 8 px either side.  The
+   * century is the one part of a date nobody reads off a 160 px screen.
+   *
+   * It used to say the year made a wrong date obvious.  That stopped being
+   * true: the constant vela_tls.c forces when the clock is unset is in 2026,
+   * so the year now looks entirely reasonable and only the month and day are
+   * wrong.  Whether the clock is real is reported where it is decided --
+   * vs_cloud.c's sync line -- rather than inferred from this string.
    */
 
   now = time(NULL);
   if (localtime_r(&now, &tm) != NULL)
     {
-      snprintf(index.date, sizeof(index.date), "%04d-%02d-%02d %02d:%02d",
-               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
-               tm.tm_min);
+      snprintf(index.date, sizeof(index.date), "%02d-%02d-%02d %02d:%02d",
+               (tm.tm_year + 1900) % 100, tm.tm_mon + 1, tm.tm_mday,
+               tm.tm_hour, tm.tm_min);
     }
 
-  snprintf(index.title, sizeof(index.title), "面对面交流");
+  /* Three glyphs, because the title box is 64 px wide and this font advances
+   * 16.0 px per CJK glyph: the five-glyph form was 80 px and lost a glyph off
+   * each end.  Three is 48 px, centred at x=56..104, which also clears the
+   * bezel -- the screen's chord at the title row's highest scanline runs
+   * x=45..115.
+   */
+
+  snprintf(index.title, sizeof(index.title), "面对面");
   snprintf(index.summary, sizeof(index.summary), "%s",
            minutes->summary[0] != '\0' ? minutes->summary : "本次没有生成摘要");
 

@@ -259,39 +259,58 @@ static int velasight_social_probe(unsigned int seconds)
   return 1;
 }
 
+/****************************************************************************
+ * Name: velasight_set_timezone
+ *
+ * Description:
+ *   Put the local zone in the environment, for localtime_r().
+ *
+ *   vs_social.c dates a history record with localtime_r(), and without this it
+ *   reads UTC.  CONFIG_LIBC_TZDIR points at /etc/zoneinfo, which this image
+ *   does not carry, so tzset() finds no TZ, falls back to TZDEFAULT, fails to
+ *   load that too, and gmtload() settles on "UTC0".  Every step of that chain
+ *   is allowed to fail quietly, so nothing reports it.
+ *
+ *   Called from both entry points, which is the whole point of it being a
+ *   function.  The first version set TZ at the top of main() only, and main()
+ *   is not how this program starts: bk7258_bringup.c calls
+ *   velasight_autostart() directly, so the boot path never went through it and
+ *   the dates stayed eight hours early.  main() runs only for the nsh
+ *   subcommands, and those write records too.
+ *
+ *   The value is the one the project already chose -- AGENT_TIMEZONE in
+ *   packages/ai_agent/include/agent_config.h -- rather than a second opinion
+ *   spelled out here.  It is repeated instead of included because that header
+ *   belongs to a package this application does not otherwise depend on, and
+ *   because agent_main() is the only thing that reads it, which velasight
+ *   never goes through either.  A POSIX TZ string needs no database, and the
+ *   specification inverts the sign, so UTC+8 is written "CST-8".
+ *
+ *   Setting it before task_create() covers the created task twice over: it
+ *   inherits a copy of this environment through env_dup(), and tzset() here
+ *   has already installed the zone in libc's own state, which a flat build
+ *   shares between tasks.
+ *
+ ****************************************************************************/
+
+static void velasight_set_timezone(void)
+{
+  if (setenv("TZ", "CST-8", 1) != 0)
+    {
+      printf("velasight: cannot set TZ (%d); dates will read as UTC\n", errno);
+      return;
+    }
+
+  tzset();
+}
+
 int main(int argc, FAR char *argv[])
 {
   /* Before any subcommand, because every one of them can write a history
    * record and each would otherwise date it eight hours early.
-   *
-   * localtime_r() is what vs_social.c formats a record's displayed date with,
-   * and on this board it was returning UTC.  CONFIG_LIBC_TZDIR points at
-   * /etc/zoneinfo, which this image does not carry, so tzset() found no TZ in
-   * the environment, fell back to TZDEFAULT, failed to load that too, and
-   * gmtload() settled on "UTC0".  Nothing reported any of it.
-   *
-   * The value is the one the project already chose -- AGENT_TIMEZONE in
-   * packages/ai_agent/include/agent_config.h -- rather than a second opinion
-   * spelled out here.  It is repeated instead of included because that header
-   * belongs to a package this application does not otherwise depend on, and
-   * because agent_main() is the only thing that sets it: velasight is started
-   * from nsh, not from there, so nothing had ever put TZ in this task's
-   * environment.  A POSIX TZ string needs no database, and the sign is
-   * inverted by that specification, so UTC+8 is written "CST-8".
-   *
-   * Latent until now.  The clock was reading vela_tls.c's hardcoded date, so
-   * a record's timestamp was months wrong and being eight hours out on top of
-   * that changed nothing anybody could see.
    */
 
-  if (setenv("TZ", "CST-8", 1) == 0)
-    {
-      tzset();
-    }
-  else
-    {
-      printf("velasight: cannot set TZ (%d); dates will read as UTC\n", errno);
-    }
+  velasight_set_timezone();
 
   /* "velasight cloudprobe" drives one complete session against the
    * configured /contest/v1 endpoint and prints what happened, without
@@ -358,6 +377,19 @@ static int velasight_task(int argc, FAR char *argv[])
 int velasight_autostart(void)
 {
   int pid;
+
+  /* This, not main(), is how the program starts on a board: bk7258_bringup.c
+   * declares velasight_autostart() weak and calls it once the framebuffers are
+   * up.  main() is reached only by typing "velasight ..." at nsh.  Anything
+   * that has to be true for the running application therefore has to be done
+   * here as well, and the timezone is the first thing that turned out to be in
+   * that category -- set in main() alone, it never took.
+   *
+   * Before the task exists, so the copy env_dup() hands it already has TZ in
+   * it.
+   */
+
+  velasight_set_timezone();
 
   pid = task_create("velasight", SCHED_PRIORITY_DEFAULT, 8192,
                     velasight_task, NULL);
