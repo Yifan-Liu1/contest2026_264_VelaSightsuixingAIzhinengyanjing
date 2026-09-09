@@ -21,6 +21,25 @@ enum vs_history_kind_e
   VS_HISTORY_KIND_COUNT
 };
 
+/* What a social record is called.  Every one of them carries the same string,
+ * because the title says which kind of session it was and not which session:
+ * it is a label for the kind, not information about the record.
+ *
+ * Here rather than spelled out at each end, because both ends need it and they
+ * are in different translation units -- vs_social.c writes it into the record,
+ * and vs_app.c puts it on the screen without reading the record's copy back.
+ * Reading it back is what went wrong: the title used to be five glyphs, the box
+ * that holds it is 64 px, this font advances 16.0 px per CJK glyph, and every
+ * record already on a board kept the old five whatever the running firmware
+ * said.  Shortening the string alone could only ever fix records not yet
+ * written.
+ *
+ * Three glyphs is 48 px, centred at x=56..104 in that box, and the screen's
+ * chord at the title row's highest scanline runs x=45..115.
+ */
+
+#define VS_HISTORY_SOCIAL_TITLE "面对面"
+
 /* One compact index entry.  The full JSON body is stored in a separate file
  * and is opened only by worker/Web threads; UI snapshots only copy this
  * structure and never touch SD-NAND.

@@ -1,6 +1,7 @@
 #include <nuttx/config.h>
 #include <nuttx/sched.h>
 
+#include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -917,6 +918,39 @@ static const char *vs_assistant_error_reason(int error)
     }
 }
 
+/****************************************************************************
+ * Name: vs_history_date_short
+ *
+ * Description:
+ *   A record's date with the century dropped, for the one row that shows it.
+ *
+ *   The record keeps all four digits -- see vs_social.c -- because that is the
+ *   durable copy.  The screen cannot afford them: the row is 128 px at its
+ *   widest and velasight_font_16_ui advances 8.0 px per ASCII glyph, so
+ *   "2026-09-09 10:15" is sixteen glyphs and exactly 128 px, equal to the box
+ *   and to the screen's chord at that row's lowest scanline.  Fourteen glyphs
+ *   is 112 px and leaves 8 px either side.
+ *
+ *   Trimmed here rather than at the point the record is written, so that
+ *   records written by an earlier firmware show the short form too.  Anything
+ *   that is not four digits and a dash is passed through untouched, which
+ *   covers a blank date and leaves room for the format to change again.
+ *
+ ****************************************************************************/
+
+static const char *vs_history_date_short(const char *date)
+{
+  if (isdigit((int)(unsigned char)date[0]) &&
+      isdigit((int)(unsigned char)date[1]) &&
+      isdigit((int)(unsigned char)date[2]) &&
+      isdigit((int)(unsigned char)date[3]) && date[4] == '-')
+    {
+      return date + 2;
+    }
+
+  return date;
+}
+
 static void vs_snapshot(struct vs_runtime_s *runtime,
                         struct vs_ui_snapshot_s *snapshot)
 {
@@ -1026,12 +1060,32 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
          * they can only reboot.
          */
 
+        /* The constant, not the record's copy of it.  This page only ever
+         * shows VS_HISTORY_KIND_SOCIAL, every one of those carries the same
+         * title, and reading the stored string back meant a record written by
+         * an older firmware kept that firmware's wording -- and its width.
+         * The three records on a board at the time this changed still said
+         * 面对面交流 at five glyphs in a box that holds four.
+         *
+         * The date and the summary below stay as stored, because those really
+         * are per-record.
+         */
+
         snprintf(snapshot->content_title, sizeof(snapshot->content_title),
-                 "%s", have_current ? current.title : "历史");
+                 "%s", have_current ? VS_HISTORY_SOCIAL_TITLE : "历史");
         snprintf(snapshot->content_body, sizeof(snapshot->content_body),
                  "%s", have_current ? current.summary : "记录暂时读不出\n按键翻页重试");
+        /* The precision bounds what the compiler cannot.  Passing current.date
+         * directly, gcc knew the source was one 40-byte field; through a
+         * function returning a pointer into it, nothing says the string ends
+         * before the struct does, so it widened the bound to date, title and
+         * summary together -- 209 bytes into a region of 40, and a
+         * -Wformat-truncation warning for a call that cannot truncate.
+         */
+
         snprintf(snapshot->content_meta, sizeof(snapshot->content_meta),
-                 "%s", have_current ? current.date : "");
+                 "%.*s", (int)sizeof(current.date) - 1, have_current ?
+                 vs_history_date_short(current.date) : "");
         snprintf(snapshot->status_title, sizeof(snapshot->status_title), "历史");
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
                  "%02u/%02u", runtime->index + 1,
