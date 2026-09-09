@@ -599,6 +599,35 @@ static void *vs_network_start_worker(void *arg)
   if (ret == 0 && !worker->reset_ap_password && worker->mode == VS_NET_STA)
     {
       (void)vs_cloud_clock_sync();
+
+      /* And the ASR endpoint's name, for the same reason and in the same place.
+       *
+       * Once resolution and the TCP connect were finally separate figures, the
+       * first 询问 after a boot reported dns=893 ms and every one after it
+       * reported dns=0: a single query, cached for an hour, whose only fault was
+       * being on the path the user waits on.  It is the same query either way,
+       * so the fix is not to make it faster but to make it happen here, where
+       * this thread is already several seconds into association, DHCP and a
+       * clock sync and nothing is waiting on it.
+       *
+       * After the clock sync rather than before it, so a board that cannot
+       * resolve at all still reports that through the sync's own failure first,
+       * which is the older and more informative message of the two.
+       *
+       * Before the event below, which delays the UI's Wi-Fi indicator by the
+       * length of one lookup.  Worth it: the alternative leaves a window where
+       * the user has been told the network is up and can press 询问 into a
+       * warm-up that has not finished, which would run two queries for one name
+       * and save nothing.  The UI is not blocked either way -- it keeps
+       * rendering and taking keys throughout, on its own thread.
+       *
+       * Runs on every station bring-up, not just the first, because the cache
+       * entry expires and this is also the path a retry and a reconnect take.
+       * Excluded from the access-point branch by the same condition that
+       * excludes the clock sync, and for the same reason: nothing to reach.
+       */
+
+      vs_voice_prewarm_dns();
     }
 
   pthread_mutex_lock(&g_app_events.lock);
@@ -2671,12 +2700,10 @@ static void vs_handle_event(struct vs_display_s *display,
                 request.request_id = vs_begin_request(runtime);
                 ask_index_ms = vs_app_now_ms() - ask_t0;
 
-                /* Destination page and key highlight first, then the start.
-                 * The state written here is what the round is about to be in,
-                 * so the frame is honest before vs_voice_start() runs rather
-                 * than after: arming reports "正在准备" until the microphone
-                 * is actually open, which is the same thing it reported when
-                 * this was set on the way out of a successful start.
+                /* The state the round is about to be in, written before either
+                 * of the two things below so that whichever paints, paints an
+                 * honest frame: arming reports "正在准备" until the microphone
+                 * is actually open.
                  *
                  * Safe to publish the request id ahead of the worker: nothing
                  * can post against it until the worker exists, and a late
@@ -2685,9 +2712,28 @@ static void vs_handle_event(struct vs_display_s *display,
 
                 runtime->voice_arming = true;
                 runtime->page = VS_PAGE_VOICE_LISTENING;
-                ask_render_ms = vs_app_now_ms();
-                vs_render_now(display, runtime);
-                ask_render_ms = vs_app_now_ms() - ask_render_ms;
+
+                /* The worker first, the repaint second, which is the opposite of
+                 * how this read until the segment timing said what each costs.
+                 *
+                 * The repaint is 110 ms of synchronous flush over QSPI and the
+                 * spawn is 1 to 2 ms, and painting first meant the connection
+                 * did not start until the glass was done.  Started first, the
+                 * two overlap: the worker spends its first half second waiting
+                 * on three network round trips, and the flush fits inside that.
+                 *
+                 * It is not free, because the worker outranks this thread --
+                 * VS_PRIORITY_VOICE is SCHED_FIFO five above it -- so nothing
+                 * here runs again until the worker blocks.  What that costs is
+                 * the worker's own prefix ahead of its first socket call, which
+                 * is the conversation reset and three buffer allocations and
+                 * measured 19 to 23 ms across five runs.  So the frame lands
+                 * about 20 ms later than it did and the device hears about 110 ms
+                 * sooner, and 20 ms is not a frame anyone sees arrive.
+                 *
+                 * The photo path deliberately keeps the old order; its comment
+                 * says why, and the reason does not apply here.
+                 */
 
                 ask_start_ms = vs_app_now_ms();
                 if (vs_voice_start(&request) != 0)
@@ -2699,32 +2745,44 @@ static void vs_handle_event(struct vs_display_s *display,
                      * terminal event but has not cleared busy yet -- not
                      * something to put an error page in front of the user for.
                      *
-                     * Painted here rather than left to the loop so the frame
-                     * above does not linger for a refresh period.  The two
-                     * failures that can be hit are mutex-only paths, so the
-                     * page the user actually sees does not change.
+                     * Only the state is undone here.  The repaint below is the
+                     * one that publishes it, so this path now paints the page
+                     * the user ends on once, instead of flashing the listening
+                     * frame for 110 ms on the way to it.
                      */
 
                     runtime->voice_arming = false;
                     runtime->page = vs_browse_page(runtime);
                     vs_cancel_request(runtime);
-                    vs_render_now(display, runtime);
                   }
 
                 ask_start_ms = vs_app_now_ms() - ask_start_ms;
+
+                ask_render_ms = vs_app_now_ms();
+                vs_render_now(display, runtime);
+                ask_render_ms = vs_app_now_ms() - ask_render_ms;
 
                 /* Printed after the handover so it cannot delay the frame the
                  * user is waiting on.  Read it against vs_voice's own line: the
                  * two together cover the whole wait apart from the input task's
                  * queue latency, which is what is left if these do not add up.
+                 *
+                 * The fields are in execution order, so start now precedes
+                 * render.  Two of the three read differently since the swap.
+                 * start is no longer just the spawn: the worker preempts this
+                 * thread the moment it exists, so this now measures the spawn
+                 * plus that prefix and should read around 20 ms where it used to
+                 * read 1.  And the total is no longer the wait before the worker
+                 * starts -- only index and start are, since render is spent
+                 * alongside the ASR open rather than ahead of it.
                  */
 
                 printf("velasight: ask handled in %lu ms "
-                       "(index=%lu render=%lu start=%lu)\n",
+                       "(index=%lu start=%lu render=%lu)\n",
                        (unsigned long)(vs_app_now_ms() - ask_t0),
                        (unsigned long)ask_index_ms,
-                       (unsigned long)ask_render_ms,
-                       (unsigned long)ask_start_ms);
+                       (unsigned long)ask_start_ms,
+                       (unsigned long)ask_render_ms);
               }
             else if (event->key == VS_KEY_NEXT)
               {
@@ -2790,6 +2848,13 @@ static void vs_handle_event(struct vs_display_s *display,
                  * honour it is to paint before the capture is asked for: the
                  * worker that opens /dev/video0 outranks this thread, so once
                  * it is running this frame would wait for it.
+                 *
+                 * The order is the reverse of the 询问 path's on purpose.  There
+                 * the worker's first act is a socket call it blocks on within
+                 * about 20 ms, so starting it first hides the repaint behind the
+                 * connection.  Here its first act is a camera capture, which is
+                 * not a wait this thread gets to run inside, and the frame it
+                 * would delay is the one the rule is about.
                  */
 
                 runtime->page = VS_PAGE_PHOTO_CAPTURE;

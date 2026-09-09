@@ -245,6 +245,49 @@ static void asr_warm_resolve(const char* host, const char* port)
     }
 }
 
+/* Fill the DNS cache for this endpoint before anything needs it.
+ *
+ * The figure this exists to move: with resolution and the connect finally
+ * separated, five runs on 2026-09-09 measured dns at 893, 0, 0, 0 and 0 ms.
+ * One lookup per cache lifetime, and the run that pays for it is the first
+ * 询问 after a boot -- 893 of that open's 1969 ms, against 493 ms for the runs
+ * that found the answer already there.  Nothing about the lookup is slow
+ * because of this client; it is one query to a nameserver, and the only thing
+ * wrong with it is when it happens.
+ *
+ * Deliberately the same call the connect path makes.  What has to hold for this
+ * to work is that the entry this leaves is the entry mbedtls_net_connect()'s own
+ * lookup goes looking for, and that is a statement about the name and the hints
+ * matching -- so both come from one function rather than from two that agree
+ * today.  Change the family here and the connect path changes with it.
+ *
+ * Says nothing about credentials, opens no connection, and does not depend on
+ * volc_asr_init() or on a registered backend, because the caller cannot promise
+ * any of that: the thread that knows the network just came up runs alongside the
+ * one that initialises voice, in no fixed order.
+ *
+ * The caller owes one thing: not the UI thread.  This blocks for as long as the
+ * query takes, which is the whole point -- the cost is not removed, it is moved
+ * to a thread where nobody is waiting on it.
+ *
+ * Timed and logged rather than silent, because the number is the evidence.  A
+ * line here and a dns=0 on the next open is the fix working; a line here and a
+ * large dns anyway means the eight-entry cache lost the answer in between, which
+ * is a different problem with a different fix.  Failure is not reported, for the
+ * same reason asr_warm_resolve() does not report it: the open that follows will
+ * resolve, or fail, entirely on its own.
+ */
+
+void volc_asr_prewarm_dns(void)
+{
+    uint32_t mark = asr_now_ms();
+
+    asr_warm_resolve(AGENT_DOUBAO_ASR_HOST, AGENT_DOUBAO_ASR_PORT);
+    syslog(LOG_INFO, "[%s] prewarmed %s in %lums\n", TAG,
+        AGENT_DOUBAO_ASR_HOST,
+        (unsigned long)(asr_now_ms() - mark));
+}
+
 /* timing may be NULL, which is what the batch path passes: it has its own
  * infer/e2e measurements and does not need the breakdown.
  */

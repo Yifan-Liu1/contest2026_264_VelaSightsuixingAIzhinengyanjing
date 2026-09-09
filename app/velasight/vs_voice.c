@@ -554,6 +554,24 @@ bool vs_voice_ready(void)
   return ready;
 }
 
+/* Straight through to the backend, and that is the point of it existing.
+ *
+ * The name to resolve and the hints to resolve it with belong to volc_asr.c,
+ * which is also what the round trip this saves happens inside; a copy of them
+ * here would agree until one of the two changed.  What this layer adds is only
+ * that vs_app.c keeps talking to packages/ai_agent through this module, the way
+ * every other call into it already does.
+ *
+ * No g_voice.lock and no g_voice.opened check.  It reads none of that state, and
+ * requiring the subsystem to be up would tie the warm-up to a task the caller
+ * has no ordering relationship with.
+ */
+
+void vs_voice_prewarm_dns(void)
+{
+  volc_asr_prewarm_dns();
+}
+
 void vs_voice_open(void)
 {
   int ret;

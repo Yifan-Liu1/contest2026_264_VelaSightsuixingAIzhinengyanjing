@@ -52,6 +52,25 @@ void vs_voice_open(void);
 
 bool vs_voice_ready(void);
 
+/* Resolve the ASR endpoint's name ahead of the first round that needs it.
+ *
+ * Measured on the board, that resolution was 893 ms of the first 询问 after a
+ * boot and 0 ms on every one after it, because NuttX caches the answer.  This
+ * pays it somewhere the user is not waiting.
+ *
+ * Two things the caller owes.  Not the UI thread: this blocks for as long as the
+ * query takes.  And not before the link has a nameserver it can reach -- see
+ * vs_network_adopt_dns(), without which the query fails in about two
+ * milliseconds and warms nothing.  vs_network_start_worker() satisfies both.
+ *
+ * Deliberately independent of vs_voice_ready(): the network worker and the voice
+ * init task run concurrently in no fixed order, so requiring one from the other
+ * would make the warm-up land or not land depending on which won.  Nothing here
+ * touches credentials or voice state.
+ */
+
+void vs_voice_prewarm_dns(void);
+
 /* Re-read the durable provisioning record and refresh the live MiMo and
  * Volcengine providers.  When a conversation is active the request is
  * coalesced and applied after its worker finishes, before another worker may
