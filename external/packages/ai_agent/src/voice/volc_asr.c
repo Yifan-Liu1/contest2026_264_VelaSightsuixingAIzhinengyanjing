@@ -50,6 +50,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,19 +130,79 @@ static int asr_entropy_func(void* data, unsigned char* output, size_t len)
  * remove, so its size decides which of those is worth building -- and it was the
  * one number nothing recorded.
  *
- * connect_ms covers resolution and the TCP round trip together, because
- * mbedtls_net_connect() does both and does not say where it spent the time.
- * Separating them means resolving here and passing the address on as a literal,
- * which changes how the connection is made rather than what is recorded about
- * it, and is not worth doing until this figure says the pair is the problem.
+ * Resolution and the connect are now separate figures, and the reason they had
+ * to be is that together they were the largest and least stable term: three runs
+ * on 2026-09-09 measured 172, 171 and 791 ms for the pair.  A fourfold spread
+ * has two candidate explanations that call for opposite work -- a name lookup
+ * that missed its cache, or a TCP connect that lost a SYN on a link whose IOB
+ * pool was observed down to 55 of 60 in the same session -- and one figure
+ * covering both cannot choose between them.
+ *
+ * The split is measurement only.  mbedtls_net_connect() is still handed the
+ * hostname and still iterates every address it resolves, which is what makes a
+ * v6-first answer on a v4-only link work; resolving here and passing a literal
+ * on would have taken that away.  What this does instead is resolve once first
+ * and time it, so that the resolution inside the connect is a cache hit and the
+ * connect figure is the connect.
+ *
+ * That depends on NuttX caching answers, and it does: CONFIG_NETDB_DNSCLIENT is
+ * enabled with eight entries and an hour of lifetime, and gethostentbyname_r()
+ * consults that cache before it queries.  So the extra call costs a cache lookup
+ * rather than a second query.  Were the cache ever turned off, dns_ms would stay
+ * honest and tcp_ms would start including a query of its own.
  */
 
 struct asr_open_timing_s {
     uint32_t seed_ms;      /* mbedtls_ctr_drbg_seed, entropy included */
-    uint32_t connect_ms;   /* name resolution and the TCP connect */
+    uint32_t dns_ms;       /* name resolution alone; 0 on the proxy path */
+    uint32_t tcp_ms;       /* the connect alone, or the tunnel on the proxy path */
     uint32_t handshake_ms; /* config, setup and mbedtls_ssl_handshake */
     bool proxied;          /* went through a CONNECT tunnel instead */
+    bool offered;          /* a cached TLS session was offered for resumption */
 };
+
+/* The one TLS session this client keeps, for resumption.
+ *
+ * Worth keeping because of what the first measurements said about the handshake:
+ * 557 to 720 ms across three runs against a round trip near 150 ms, so most of
+ * it is not the network.  This build compiles no MBEDTLS_*_ALT backend and the
+ * server picked TLS-ECDHE-RSA-WITH-CHACHA20-POLY1305-SHA256, so every connection
+ * was paying for a P-256 scalar multiplication and an RSA-2048 signature check
+ * in software on a Cortex-M33.  A resumed handshake skips both and one round
+ * trip with them.  The server offers the material to do it: the probe added with
+ * the timing reported resumable=yes on every run.
+ *
+ * Credentials are deliberately not part of the key.  They travel inside the
+ * tunnel -- the Authorization header on the upgrade and the appid/token in the
+ * first request frame -- so a session says nothing about who is using it and a
+ * credential change does not invalidate one.  This is the difference between
+ * resuming a session and pre-opening a whole ASR stream: the second carries a
+ * full_client_request built from credentials read at the time and would go stale
+ * when they changed.
+ *
+ * One entry, because there is one endpoint.  Guarded because unlike the
+ * credential statics beside it this outlives a call, and the cost of a mutex
+ * held across two copies is not worth reasoning about the alternative.
+ */
+
+static pthread_mutex_t s_tls_session_lock = PTHREAD_MUTEX_INITIALIZER;
+static mbedtls_ssl_session s_tls_session;
+static bool s_tls_session_valid;
+
+/* Forget the cached session.  Called when a handshake that offered it failed,
+ * which is the only way this client learns that what it held was not usable.
+ */
+
+static void asr_session_drop(void)
+{
+    pthread_mutex_lock(&s_tls_session_lock);
+    if (s_tls_session_valid) {
+        mbedtls_ssl_session_free(&s_tls_session);
+        s_tls_session_valid = false;
+    }
+
+    pthread_mutex_unlock(&s_tls_session_lock);
+}
 
 static uint32_t asr_now_ms(void)
 {
@@ -152,6 +214,35 @@ static uint32_t asr_now_ms(void)
 
     return (uint32_t)((uint64_t)ts.tv_sec * 1000u
         + (uint64_t)ts.tv_nsec / 1000000u);
+}
+
+/* Resolve host so that the connect after it does not have to.
+ *
+ * The result is thrown away on purpose.  This is not a lookup the connection
+ * uses -- mbedtls_net_connect() does its own, and keeping that is what preserves
+ * its walk over every address a name answers with.  This call exists to move the
+ * cost of resolution out of the connect's figure and into one of its own, and it
+ * is free to do so because the answer lands in NuttX's DNS cache where the
+ * connect's lookup will find it.
+ *
+ * Failure is not reported.  If a name cannot be resolved here the connect will
+ * fail on its own and say so, with its own error, exactly as it did before this
+ * function existed; returning something would only invite a second opinion about
+ * a decision that is not this function's to make.
+ */
+
+static void asr_warm_resolve(const char* host, const char* port)
+{
+    struct addrinfo hints;
+    struct addrinfo* res = NULL;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) == 0) {
+        freeaddrinfo(res);
+    }
 }
 
 /* timing may be NULL, which is what the batch path passes: it has its own
@@ -186,13 +277,24 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
     }
 
     /* If proxy is enabled, open a CONNECT tunnel first */
-    mark = asr_now_ms();
     if (http_proxy_is_enabled()) {
         int port_num = atoi(port);
-        int tunnel_fd = proxy_open_tunnel(host, port_num, 30000);
+        int tunnel_fd;
 
         if (timing != NULL) {
             timing->proxied = true;
+        }
+
+        /* No resolution figure on this path: the proxy resolves the name, and
+         * the tunnel is a hop plus its own request rather than a connect, so it
+         * is recorded as one number and flagged as a different measurement
+         * instead of being compared against a direct connect.
+         */
+
+        mark = asr_now_ms();
+        tunnel_fd = proxy_open_tunnel(host, port_num, 30000);
+        if (timing != NULL) {
+            timing->tcp_ms = asr_now_ms() - mark;
         }
 
         if (tunnel_fd < 0) {
@@ -204,23 +306,24 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
         syslog(LOG_INFO, "[%s] Using proxy tunnel fd=%d for %s:%s\n",
             TAG, tunnel_fd, host, port);
     } else {
+        mark = asr_now_ms();
+        asr_warm_resolve(host, port);
+        if (timing != NULL) {
+            timing->dns_ms = asr_now_ms() - mark;
+        }
+
+        mark = asr_now_ms();
         ret = mbedtls_net_connect(&ctx->net, host, port,
             MBEDTLS_NET_PROTO_TCP);
+        if (timing != NULL) {
+            timing->tcp_ms = asr_now_ms() - mark;
+        }
+
         if (ret != 0) {
             syslog(LOG_ERR, "[%s] net_connect %s:%s: -0x%04x\n",
                 TAG, host, port, -ret);
             return -ECONNREFUSED;
         }
-    }
-
-    /* Recorded whichever branch ran.  A tunnel and a direct connect are not the
-     * same measurement -- the tunnel adds a hop and its own request -- so the
-     * flag says which figure this is rather than leaving the two to be compared
-     * as though they were alike.
-     */
-
-    if (timing != NULL) {
-        timing->connect_ms = asr_now_ms() - mark;
     }
 
     mark = asr_now_ms();
@@ -269,13 +372,71 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
     mbedtls_ssl_set_bio(&ctx->ssl, &ctx->net,
         mbedtls_net_send, mbedtls_net_recv, NULL);
 
+    /* Offer what the last handshake left, if it left anything.
+     *
+     * set_session copies, so the cache is not handed out and the lock is only
+     * held across that copy.  A server that declines the ticket does not fail
+     * the handshake -- it simply does not resume, and mbedtls carries on with a
+     * full one -- so there is no fallback to write here, only a figure that
+     * comes back large instead of small.
+     */
+
+    {
+        bool offered = false;
+
+        pthread_mutex_lock(&s_tls_session_lock);
+        if (s_tls_session_valid
+            && mbedtls_ssl_set_session(&ctx->ssl, &s_tls_session) == 0) {
+            offered = true;
+        }
+
+        pthread_mutex_unlock(&s_tls_session_lock);
+
+        if (timing != NULL) {
+            timing->offered = offered;
+        }
+    }
+
     while ((ret = mbedtls_ssl_handshake(&ctx->ssl)) != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ
             && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
             syslog(LOG_ERR, "[%s] handshake: -0x%04x\n", TAG, -ret);
+
+            /* Drop what was offered.  A handshake that fails while resuming is
+             * the only evidence this client gets that the material it kept is no
+             * longer usable, and keeping it would make the next attempt fail the
+             * same way.  Unconditional because a full handshake failing has
+             * nothing to do with the cache and dropping an entry costs one
+             * handshake, while keeping a bad one costs every one after it.
+             */
+
+            asr_session_drop();
             return -EIO;
         }
     }
+
+    /* Keep what this handshake produced, resumed or not.
+     *
+     * Saved on every success rather than only the first, because a server may
+     * issue a fresh ticket on a resumed handshake and the one just used may be
+     * single-use; re-reading it here is what keeps a long-lived device resuming
+     * rather than resuming once.
+     */
+
+    pthread_mutex_lock(&s_tls_session_lock);
+    if (s_tls_session_valid) {
+        mbedtls_ssl_session_free(&s_tls_session);
+        s_tls_session_valid = false;
+    }
+
+    mbedtls_ssl_session_init(&s_tls_session);
+    if (mbedtls_ssl_get_session(&ctx->ssl, &s_tls_session) == 0) {
+        s_tls_session_valid = true;
+    } else {
+        mbedtls_ssl_session_free(&s_tls_session);
+    }
+
+    pthread_mutex_unlock(&s_tls_session_lock);
 
     /* Config, setup and the handshake as one figure.  They are separable but
      * there is no reason to: the first two are local work with no round trip in
@@ -289,54 +450,34 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
 
     syslog(LOG_INFO, "[%s] TLS connected to %s:%s\n", TAG, host, port);
 
-    /* What the handshake actually negotiated, and whether it left anything a
-     * later one could reuse.
+    /* What this handshake negotiated, whether a session was offered to it, and
+     * whether one is now held for the next.
      *
-     * Measured 2026-09-09 the handshake was 710 ms of a 1173 ms open, three
-     * fifths of it, against a dns+tcp of 172 ms that puts the round trip near
-     * 150 ms.  Two round trips of that do not add up to 710, so the remainder is
-     * local arithmetic -- and this build has no MBEDTLS_*_ALT backend, so the
-     * curve and the signature check are software on a Cortex-M33.  These three
-     * facts are what tell the difference between the two ways of shortening it.
+     * Read offered against handshake_ms, because that pair is the whole test of
+     * whether resumption is working.  offered=no with a large figure is the first
+     * connection after a boot and is expected to be slow.  offered=yes with a
+     * small figure is a resumed handshake.  offered=yes with a figure as large as
+     * a full one means the server took the ticket and declined to resume, which
+     * looks like nothing at all in the log unless these two are read together.
      *
-     *   version      decides how many round trips a full handshake costs and how
-     *                many a resumed one saves.  TLS 1.3 is not compiled into
-     *                this build, so this is expected to read TLSv1.2 and the
-     *                full handshake to be two round trips.
-     *   ciphersuite  names the key exchange, which is where the local time goes.
-     *                An ECDHE suite pays a scalar multiplication per connection
-     *                that a resumed session skips entirely.
-     *   session      whether the server gave this client something to resume
-     *                with.  MBEDTLS_SSL_SESSION_TICKETS is compiled in, so a
-     *                failure here is the server declining rather than the client
-     *                being unable, and it is the one thing that decides whether
-     *                caching sessions is worth implementing at all.
-     *
-     * The probe copies the session and frees it immediately: nothing caches yet,
-     * and finding out whether a cache could work should not depend on having
-     * built one.  Only on the instrumented path, so the batch path keeps its
-     * previous behaviour exactly.
+     * The version and the ciphersuite stay because they are what make the figure
+     * interpretable at all: TLS 1.2 puts a full handshake at two round trips and
+     * a resumed one at one, and an ECDHE suite is what says the difference
+     * between them is arithmetic and not just a round trip.
      */
 
     if (timing != NULL) {
-        mbedtls_ssl_session probe;
-        int saved;
+        bool held;
 
-        mbedtls_ssl_session_init(&probe);
-        saved = mbedtls_ssl_get_session(&ctx->ssl, &probe);
+        pthread_mutex_lock(&s_tls_session_lock);
+        held = s_tls_session_valid;
+        pthread_mutex_unlock(&s_tls_session_lock);
 
-        syslog(LOG_INFO, "[%s] TLS %s / %s, resumable=%s\n", TAG,
+        syslog(LOG_INFO, "[%s] TLS %s / %s, offered=%s held=%s\n", TAG,
             mbedtls_ssl_get_version(&ctx->ssl),
             mbedtls_ssl_get_ciphersuite(&ctx->ssl),
-            saved == 0 ? "yes" : "no");
-
-        if (saved != 0) {
-            syslog(LOG_INFO,
-                "[%s] no reusable session: get_session -0x%04x\n",
-                TAG, -saved);
-        }
-
-        mbedtls_ssl_session_free(&probe);
+            timing->offered ? "yes" : "no",
+            held ? "yes" : "no");
     }
 
     return 0;
@@ -1186,26 +1327,36 @@ volc_asr_stream_t* volc_asr_stream_open(void)
 
     /* One line, every segment, in the order they happen.
      *
-     * Read it against the question it exists to settle.  A large handshake is
-     * the case for caching the TLS session, which is cheap and carries no
-     * protocol risk.  A large connect is the case for caching the resolved
-     * address, and says to split that figure next.  A small total is the case
-     * for leaving the connection alone and looking upstream instead -- at the
-     * key-press-to-worker path in vs_voice.c, which is measured separately.
+     * What each figure is for, now that the first three runs have narrowed the
+     * question down:
      *
-     * upgrade is one round trip and is therefore the cheapest estimate of the
-     * link's RTT this path produces; the others are worth reading relative to
-     * it.  request should be near zero, since send_full_client_request() writes
-     * a frame and does not wait for an answer.
+     *   dns        resolution alone, and the reason it is alone.  The pair it was
+     *              part of measured 172, 171 and 791 ms, and a fourfold spread
+     *              could have been a lookup or a lost SYN.  This says which.
+     *              NuttX caches answers for an hour, so a large figure here twice
+     *              in a row means the eight-entry cache is being evicted by the
+     *              other hosts this device talks to.
+     *   tcp        the connect alone.  Large here is the link, not the name --
+     *              a retransmitted SYN, or an IOB pool with nothing left in it.
+     *              On the proxy path this is the tunnel instead and dns is zero.
+     *   handshake  read with the offered flag on the line above.  Small means a
+     *              session was resumed; large with offered=yes means the server
+     *              declined to.
+     *   upgrade    one round trip plus the server's own work on it, and the
+     *              cheapest estimate of the link's RTT this path produces.  Not
+     *              something the device can shorten.
+     *   request    should stay near zero: the frame is written and not waited on.
      */
 
     syslog(LOG_INFO,
         "[%s] stream: session opened in %lums "
-        "(init=%lu seed=%lu %s=%lu handshake=%lu upgrade=%lu request=%lu)\n",
+        "(init=%lu seed=%lu dns=%lu %s=%lu handshake=%lu "
+        "upgrade=%lu request=%lu)\n",
         TAG, (unsigned long)(asr_now_ms() - open_t0),
         (unsigned long)init_ms, (unsigned long)timing.seed_ms,
-        timing.proxied ? "tunnel" : "dns+tcp",
-        (unsigned long)timing.connect_ms,
+        (unsigned long)timing.dns_ms,
+        timing.proxied ? "tunnel" : "tcp",
+        (unsigned long)timing.tcp_ms,
         (unsigned long)timing.handshake_ms,
         (unsigned long)upgrade_ms, (unsigned long)request_ms);
     return s;
