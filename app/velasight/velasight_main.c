@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "include/vs_app.h"
@@ -260,6 +261,38 @@ static int velasight_social_probe(unsigned int seconds)
 
 int main(int argc, FAR char *argv[])
 {
+  /* Before any subcommand, because every one of them can write a history
+   * record and each would otherwise date it eight hours early.
+   *
+   * localtime_r() is what vs_social.c formats a record's displayed date with,
+   * and on this board it was returning UTC.  CONFIG_LIBC_TZDIR points at
+   * /etc/zoneinfo, which this image does not carry, so tzset() found no TZ in
+   * the environment, fell back to TZDEFAULT, failed to load that too, and
+   * gmtload() settled on "UTC0".  Nothing reported any of it.
+   *
+   * The value is the one the project already chose -- AGENT_TIMEZONE in
+   * packages/ai_agent/include/agent_config.h -- rather than a second opinion
+   * spelled out here.  It is repeated instead of included because that header
+   * belongs to a package this application does not otherwise depend on, and
+   * because agent_main() is the only thing that sets it: velasight is started
+   * from nsh, not from there, so nothing had ever put TZ in this task's
+   * environment.  A POSIX TZ string needs no database, and the sign is
+   * inverted by that specification, so UTC+8 is written "CST-8".
+   *
+   * Latent until now.  The clock was reading vela_tls.c's hardcoded date, so
+   * a record's timestamp was months wrong and being eight hours out on top of
+   * that changed nothing anybody could see.
+   */
+
+  if (setenv("TZ", "CST-8", 1) == 0)
+    {
+      tzset();
+    }
+  else
+    {
+      printf("velasight: cannot set TZ (%d); dates will read as UTC\n", errno);
+    }
+
   /* "velasight cloudprobe" drives one complete session against the
    * configured /contest/v1 endpoint and prints what happened, without
    * opening the displays or taking the input keys.
