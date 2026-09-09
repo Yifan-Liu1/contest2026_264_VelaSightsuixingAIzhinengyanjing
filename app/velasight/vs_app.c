@@ -2621,6 +2621,27 @@ static void vs_handle_event(struct vs_display_s *display,
                 struct vs_voice_request_s request;
                 struct vs_history_index_s current;
 
+                /* The last unlit stretch of the wait before "请说话".
+                 *
+                 * vs_voice.c measures from vs_voice_start() and volc_asr.c
+                 * breaks its own share down, and between them they account for
+                 * every millisecond after this handler hands over -- 1294 ms of
+                 * it on 2026-09-09, of which 1262 was the ASR open.  What no
+                 * number covered is the work this handler does first, on the UI
+                 * thread and before the worker exists: a history index read that
+                 * goes to SD-NAND, and a vs_render_now() that flushes both
+                 * panels synchronously over QSPI.
+                 *
+                 * Both are plausible tens of milliseconds and neither had ever
+                 * been timed, so they were the only place left for the gap the
+                 * board log shows ahead of volc_asr's first line.
+                 */
+
+                uint32_t ask_t0 = vs_app_now_ms();
+                uint32_t ask_index_ms;
+                uint32_t ask_render_ms;
+                uint32_t ask_start_ms;
+
                 if (vs_history_get_index(VS_HISTORY_KIND_SOCIAL,
                                          runtime->index, &current) < 0)
                   {
@@ -2648,6 +2669,7 @@ static void vs_handle_event(struct vs_display_s *display,
                 runtime->voice_ending = false;
                 runtime->result_text[0] = '\0';
                 request.request_id = vs_begin_request(runtime);
+                ask_index_ms = vs_app_now_ms() - ask_t0;
 
                 /* Destination page and key highlight first, then the start.
                  * The state written here is what the round is about to be in,
@@ -2663,8 +2685,11 @@ static void vs_handle_event(struct vs_display_s *display,
 
                 runtime->voice_arming = true;
                 runtime->page = VS_PAGE_VOICE_LISTENING;
+                ask_render_ms = vs_app_now_ms();
                 vs_render_now(display, runtime);
+                ask_render_ms = vs_app_now_ms() - ask_render_ms;
 
+                ask_start_ms = vs_app_now_ms();
                 if (vs_voice_start(&request) != 0)
                   {
                     /* Same outcome as before: the press is dropped and the
@@ -2685,6 +2710,21 @@ static void vs_handle_event(struct vs_display_s *display,
                     vs_cancel_request(runtime);
                     vs_render_now(display, runtime);
                   }
+
+                ask_start_ms = vs_app_now_ms() - ask_start_ms;
+
+                /* Printed after the handover so it cannot delay the frame the
+                 * user is waiting on.  Read it against vs_voice's own line: the
+                 * two together cover the whole wait apart from the input task's
+                 * queue latency, which is what is left if these do not add up.
+                 */
+
+                printf("velasight: ask handled in %lu ms "
+                       "(index=%lu render=%lu start=%lu)\n",
+                       (unsigned long)(vs_app_now_ms() - ask_t0),
+                       (unsigned long)ask_index_ms,
+                       (unsigned long)ask_render_ms,
+                       (unsigned long)ask_start_ms);
               }
             else if (event->key == VS_KEY_NEXT)
               {
@@ -2734,6 +2774,10 @@ static void vs_handle_event(struct vs_display_s *display,
                     break;
                   }
 
+                uint32_t ask_t0 = vs_app_now_ms();
+                uint32_t ask_render_ms;
+                uint32_t ask_start_ms;
+
                 memset(&request, 0, sizeof(request));
                 request.ctx = VS_VOICE_CTX_PHOTO;
 
@@ -2749,14 +2793,32 @@ static void vs_handle_event(struct vs_display_s *display,
                  */
 
                 runtime->page = VS_PAGE_PHOTO_CAPTURE;
+                ask_render_ms = vs_app_now_ms();
                 vs_render_now(display, runtime);
+                ask_render_ms = vs_app_now_ms() - ask_render_ms;
 
+                ask_start_ms = vs_app_now_ms();
                 if (vs_voice_start(&request) != 0)
                   {
                     runtime->page = VS_PAGE_HISTORY_BLANK;
                     vs_cancel_request(runtime);
                     vs_render_now(display, runtime);
                   }
+
+                ask_start_ms = vs_app_now_ms() - ask_start_ms;
+
+                /* No index read on this path -- there is no record to reference
+                 * -- so the handler is only the repaint and the spawn.  The
+                 * capture this path adds is inside the worker, ahead of the ASR
+                 * open, and shows up as the gap between vs_voice's to_listen and
+                 * its asr+mic figures.
+                 */
+
+                printf("velasight: photo ask handled in %lu ms "
+                       "(render=%lu start=%lu)\n",
+                       (unsigned long)(vs_app_now_ms() - ask_t0),
+                       (unsigned long)ask_render_ms,
+                       (unsigned long)ask_start_ms);
               }
             else if (event->key == VS_KEY_NEXT)
               {
