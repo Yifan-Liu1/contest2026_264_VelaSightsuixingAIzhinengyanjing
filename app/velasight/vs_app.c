@@ -2722,14 +2722,22 @@ static void vs_handle_event(struct vs_display_s *display,
                  * two overlap: the worker spends its first half second waiting
                  * on three network round trips, and the flush fits inside that.
                  *
-                 * It is not free, because the worker outranks this thread --
-                 * VS_PRIORITY_VOICE is SCHED_FIFO five above it -- so nothing
-                 * here runs again until the worker blocks.  What that costs is
-                 * the worker's own prefix ahead of its first socket call, which
-                 * is the conversation reset and three buffer allocations and
-                 * measured 19 to 23 ms across five runs.  So the frame lands
-                 * about 20 ms later than it did and the device hears about 110 ms
-                 * sooner, and 20 ms is not a frame anyone sees arrive.
+                 * The worker outranks this thread -- VS_PRIORITY_VOICE is
+                 * SCHED_FIFO five above it, on a single core -- so it takes the
+                 * processor the moment pthread_create() activates it and nothing
+                 * here runs again until it blocks.  That was expected to cost
+                 * this handler the worker's prefix, and it does not: measured on
+                 * the board the spawn still returns in 1 ms, because the prefix
+                 * is three allocations and a conversation start that blocks
+                 * almost at once rather than work that holds the core.  The
+                 * 20-odd millisecond gap between vs_voice_start() and the ASR
+                 * open is time the worker spends waiting, which is exactly the
+                 * time this thread gets the repaint done in.
+                 *
+                 * So the swap costs nothing measurable and the frame lands when
+                 * it used to.  Measured 2026-09-09: the spawn returned at 1 ms,
+                 * the repaint ran 137 ms, and the ASR open had already been
+                 * under way for 111 ms of that by the time the glass was done.
                  *
                  * The photo path deliberately keeps the old order; its comment
                  * says why, and the reason does not apply here.
@@ -2768,13 +2776,13 @@ static void vs_handle_event(struct vs_display_s *display,
                  * queue latency, which is what is left if these do not add up.
                  *
                  * The fields are in execution order, so start now precedes
-                 * render.  Two of the three read differently since the swap.
-                 * start is no longer just the spawn: the worker preempts this
-                 * thread the moment it exists, so this now measures the spawn
-                 * plus that prefix and should read around 20 ms where it used to
-                 * read 1.  And the total is no longer the wait before the worker
-                 * starts -- only index and start are, since render is spent
-                 * alongside the ASR open rather than ahead of it.
+                 * render, and the total no longer means what it did: only index
+                 * and start are spent ahead of the worker now, since render runs
+                 * alongside the ASR open instead of in front of it.  Which makes
+                 * index plus start the whole of this handler's contribution to
+                 * the wait -- 1 ms of it, measured -- and vs_voice's own
+                 * "listening after" figure very nearly the complete press-to-
+                 * listening number rather than a part of it.
                  */
 
                 printf("velasight: ask handled in %lu ms "
@@ -2849,12 +2857,14 @@ static void vs_handle_event(struct vs_display_s *display,
                  * worker that opens /dev/video0 outranks this thread, so once
                  * it is running this frame would wait for it.
                  *
-                 * The order is the reverse of the 询问 path's on purpose.  There
-                 * the worker's first act is a socket call it blocks on within
-                 * about 20 ms, so starting it first hides the repaint behind the
-                 * connection.  Here its first act is a camera capture, which is
-                 * not a wait this thread gets to run inside, and the frame it
-                 * would delay is the one the rule is about.
+                 * The order is the reverse of the 询问 path's on purpose.  Both
+                 * spawn a worker that outranks this thread; the difference is
+                 * what the worker does with the core once it has it.  There it
+                 * blocks within a millisecond and spends the next half second
+                 * waiting on round trips, so starting it first hides the repaint
+                 * inside the connection.  Here it captures a frame, which is not
+                 * a wait this thread gets to run inside, and the frame it would
+                 * delay is the one the rule is about.
                  */
 
                 runtime->page = VS_PAGE_PHOTO_CAPTURE;
