@@ -14,6 +14,7 @@
 #include <netutils/dhcpd.h>
 #include <netutils/netlib.h>
 #include <wireless/wapi.h>
+#include <nuttx/net/dns.h>
 #include <nuttx/wireless/wireless.h>
 
 #include <arch/board/board.h>
@@ -481,6 +482,125 @@ static int vs_network_take_save_failure(struct vs_network_s *network)
   return status;
 }
 
+#ifdef CONFIG_NETDB_DNSCLIENT
+
+/****************************************************************************
+ * Name: vs_network_note_nameserver
+ *
+ * Description:
+ *   dns_foreach_nameserver() callback.  Copies out the first IPv4 entry.
+ *   Returning 0 keeps the walk going, which is what the resolver's own
+ *   dns_check_nameserver() does; only a negative value would stop it.
+ *
+ ****************************************************************************/
+
+static int vs_network_note_nameserver(FAR void *arg,
+                                      FAR struct sockaddr *addr,
+                                      socklen_t addrlen)
+{
+  FAR struct in_addr *first = arg;
+
+  if (first->s_addr == 0 && addr != NULL && addr->sa_family == AF_INET &&
+      addrlen >= (socklen_t)sizeof(struct sockaddr_in))
+    {
+      *first = ((FAR struct sockaddr_in *)addr)->sin_addr;
+    }
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name: vs_network_adopt_dns
+ *
+ * Description:
+ *   Give the resolver a nameserver this link can actually answer for.
+ *
+ *   netlib_obtain_ipv4addr() installs one only when the DHCP reply carried a
+ *   DNS option -- its call is guarded by ds->dnsaddr.s_addr != 0.  When the
+ *   reply carried none, nothing fails and nothing is logged: the resolver
+ *   simply keeps the address it was linked with.  It is never empty, either,
+ *   because g_dns_servers[] is initialised from
+ *   CONFIG_NETDB_DNSSERVER_IPv4ADDR with g_dns_nservers starting at 1, so
+ *   there is no "no nameserver" state to detect and getaddrinfo() fails
+ *   against an address from a subnet nothing here routes to.
+ *
+ *   Measured 2026-09-08: the board held 10.64.233.23 with 10.0.0.1 in that
+ *   slot.  getaddrinfo() failed in about 2 ms -- far too fast for the 30 s
+ *   CONFIG_NETDB_DNSCLIENT_RECV_TIMEOUT, so the query never left -- and for
+ *   the whole boot the clock sync and every social open returned
+ *   -EHOSTUNREACH with only "cannot resolve" to show for it.
+ *
+ *   The substitute is the default router, which DHCP did supply.  Consumer
+ *   access points and phone hotspots forward DNS on the gateway address; that
+ *   is an assumption, but a better one than an address on a subnet this
+ *   interface has no route to.
+ *
+ *   Narrow on purpose.  A network that configured the resolver is left alone,
+ *   including one that handed out an off-link public server, and so is a
+ *   network where the linked-in address happens to sit on this subnet and may
+ *   genuinely answer.  Only the "nobody told us anything and the placeholder
+ *   is unreachable" case is touched.
+ *
+ ****************************************************************************/
+
+static void vs_network_adopt_dns(const struct in_addr *address)
+{
+  struct in_addr netmask;
+  struct in_addr router;
+  struct in_addr server;
+  char text[INET_ADDRSTRLEN];
+  int ret;
+
+  server.s_addr = 0;
+  (void)dns_foreach_nameserver(vs_network_note_nameserver, &server);
+
+#ifdef CONFIG_NETDB_DNSSERVER_IPv4
+  if (server.s_addr != 0 &&
+      server.s_addr != htonl(CONFIG_NETDB_DNSSERVER_IPv4ADDR))
+    {
+      return;
+    }
+#else
+  if (server.s_addr != 0)
+    {
+      return;
+    }
+#endif
+
+  memset(&netmask, 0, sizeof(netmask));
+  if (server.s_addr != 0 &&
+      netlib_get_ipv4netmask("wlan0", &netmask) >= 0 && netmask.s_addr != 0 &&
+      ((server.s_addr ^ address->s_addr) & netmask.s_addr) == 0)
+    {
+      return;
+    }
+
+  memset(&router, 0, sizeof(router));
+  ret = netlib_get_dripv4addr("wlan0", &router);
+  if (ret < 0 || router.s_addr == 0)
+    {
+      printf("velasight: DHCP carried no DNS and there is no default router "
+             "either; host names will not resolve\n");
+      return;
+    }
+
+  ret = netlib_set_ipv4dnsaddr(&router);
+  if (ret < 0)
+    {
+      printf("velasight: cannot install the router as the DNS server: %d\n",
+             ret);
+      return;
+    }
+
+  if (inet_ntop(AF_INET, &router, text, sizeof(text)) != NULL)
+    {
+      printf("velasight: DHCP carried no DNS, resolving through the router "
+             "%s instead\n", text);
+    }
+}
+
+#endif /* CONFIG_NETDB_DNSCLIENT */
+
 static int vs_network_apply_sta(struct vs_network_s *network)
 {
   struct wpa_wconfig_s wifi;
@@ -587,6 +707,16 @@ static int vs_network_apply_sta(struct vs_network_s *network)
       (void)wapi_set_ifdown(network->sock, "wlan0");
       return vs_network_failed(network, "STA地址格式", ret);
     }
+
+  /* Before anything announces the station as usable, and before the clock
+   * sync that vs_app.c runs the moment this returns.  Not fatal: a board that
+   * cannot resolve still serves the setup page on the address just read, which
+   * is how a wrong SSID gets corrected.
+   */
+
+#ifdef CONFIG_NETDB_DNSCLIENT
+  vs_network_adopt_dns(&address);
+#endif
 
   ret = vs_network_start_provisioning(network);
   if (ret < 0)

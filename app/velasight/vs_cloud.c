@@ -3040,7 +3040,23 @@ bool vs_cloud_clock_synced(void)
 
 int vs_cloud_clock_sync(void)
 {
-  char resp[96];
+  /* Sized for the whole exchange, not just the status line.  The staging
+   * gateway's header block is 224 bytes on its own, and
+   * cloud_plain_http_once() reads the header into this buffer and only calls
+   * cloud_clock_adopt() after it has found the "\r\n\r\n" that ends it -- so a
+   * buffer too small to hold the block never reaches the scan at all.  It
+   * bails out with -EPROTO instead, which this function used to report as an
+   * unreachable endpoint.  The first version of this used 96 bytes and
+   * therefore could not have set the clock on any network.
+   *
+   * On the stack rather than through cloud_alloc(): the other callers
+   * allocate because their responses run to kilobytes, this one is a fixed
+   * 250-odd bytes, and 512 of the worker's 8192-byte stack costs the boot heap
+   * that docs/SKILLS.md 3.7 is about exactly nothing -- unlike a static
+   * buffer, which would come straight out of it.
+   */
+
+  char resp[512];
   int ret;
 
   if (g_cloud_clock_adopted)
@@ -3050,6 +3066,12 @@ int vs_cloud_clock_sync(void)
 
   if (!g_cloud.configured)
     {
+      /* Logged, because the whole point of this function is that a boot which
+       * does not reach it leaves every timestamp wrong, and a silent return
+       * makes that indistinguishable from never having been called.
+       */
+
+      printf("%s: clock not synced: no endpoint configured yet\n", CLOUD_TAG);
       return -ENODATA;
     }
 
@@ -3074,17 +3096,19 @@ int vs_cloud_clock_sync(void)
       return 0;
     }
 
-  /* Named rather than silent, because the two reasons this fails want
-   * different actions.  A transport error is a network that is not up yet
-   * after all.  A clean exchange that produced no clock means the endpoint is
-   * TLS -- the header block on that path is parsed inside vela_tls.c, where
-   * this module cannot reach it -- and the stale constant is still in force.
+  /* Each reason wants a different action, so each is named and the errno goes
+   * out with it.  Lumping them together as "unreachable" is what made the
+   * 96-byte buffer above survive as long as it did: a gateway answering
+   * perfectly and a gateway that does not exist produced the same line.
    */
 
-  printf("%s: clock not synced from the cloud (%s); timestamps will carry "
+  printf("%s: clock not synced from the cloud (%s, %d); timestamps will carry "
          "vela_tls.c's forced date\n", CLOUD_TAG,
-         ret < 0 ? "endpoint unreachable" : "endpoint is TLS, header "
-         "unreachable from here");
+         ret == -EHOSTUNREACH ? "host name did not resolve" :
+         ret == -EPROTO ? "response header did not fit or was malformed" :
+         ret < 0 ? "endpoint unreachable" :
+         "answered without a Date header, or the endpoint is TLS and its "
+         "header block is parsed inside vela_tls.c", ret);
   return ret < 0 ? ret : -ENOTSUP;
 }
 
@@ -3234,6 +3258,24 @@ int vs_cloud_social_open(struct vs_cloud_session_s *session)
   if (!g_cloud.configured)
     {
       return -ENODATA;
+    }
+
+  /* Second and last chance at the clock.  vs_app.c asks for it the instant the
+   * station reports ready, which is roughly 75 ms after DHCP returns -- early
+   * enough to lose to a resolver that is not usable yet, and when it loses,
+   * every record written and every timestamp sent for the rest of the boot
+   * carries vela_tls.c's constant.
+   *
+   * Here rather than on a timer or a retry loop because this is the one point
+   * where being a few hundred milliseconds late costs nothing and a correction
+   * still lands before the session commits to a date: the body below is the
+   * first thing in the session to read the clock, so opening, uploading and
+   * closing all agree.  A single boolean test once the clock is already set.
+   */
+
+  if (!vs_cloud_clock_synced())
+    {
+      (void)vs_cloud_clock_sync();
     }
 
   /* Last chance to upgrade a provisional identifier to the MAC-derived one:
