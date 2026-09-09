@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/include/vs_history.h
+ *
+ * The on-device record store: kinds, key format, index entry and API.
+ *
+ * SOCIAL and CHAT have independent key spaces, so a kind always travels with a
+ * key.  The index entry is deliberately compact and self-contained: UI
+ * snapshots copy it whole and never touch SD-NAND, while the full JSON body
+ * lives in a separate file that only worker and Web threads open.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_HISTORY_H
 #define __APP_VELASIGHT_INCLUDE_VS_HISTORY_H
 

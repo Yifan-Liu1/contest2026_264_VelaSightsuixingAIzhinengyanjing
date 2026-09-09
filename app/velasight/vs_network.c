@@ -1,3 +1,16 @@
+/****************************************************************************
+ * app/velasight/vs_network.c
+ *
+ * Wi-Fi role switching, addressing, and the provisioning listener's lifetime.
+ *
+ * The station and access-point paths are deliberately sequential: the access
+ * point's resources are released before association begins, so that a failed
+ * association or DHCP still leaves the next toggle able to enter AP mode and
+ * serve the setup page.  Each step blocks until it has really happened, which
+ * is why callers run this off the UI thread.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 
 #include <arpa/inet.h>

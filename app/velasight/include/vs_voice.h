@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/include/vs_voice.h
+ *
+ * The voice assistant's request shape and lifecycle.
+ *
+ * A request names its context -- an idle question, a photo question, a
+ * follow-up on a history record -- because that is what decides which
+ * prompt and which attachments the round carries.  The DNS prewarm is
+ * separate so the first round does not pay for resolution on the ask path.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_VOICE_H
 #define __APP_VELASIGHT_INCLUDE_VS_VOICE_H
 

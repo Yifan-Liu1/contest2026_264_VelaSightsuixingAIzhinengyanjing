@@ -1,3 +1,16 @@
+/****************************************************************************
+ * app/velasight/include/vs_media.h
+ *
+ * Camera access in the two shapes this application needs.
+ *
+ * One-shot JPEG capture for the voice assistant's photo questions, and a
+ * continuous frame stream for a social session's uploads.  They are separate
+ * interfaces because their lifetimes are: the first opens and closes around a
+ * single frame, the second stays open for the length of a session and is woken
+ * and stopped from another thread.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_MEDIA_H
 #define __APP_VELASIGHT_INCLUDE_VS_MEDIA_H
 

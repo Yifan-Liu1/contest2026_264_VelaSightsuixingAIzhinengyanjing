@@ -4,6 +4,8 @@
  * CP mailbox_channel.c accepts only CHNL_STATE_COM_FAIL in hdr.state.
  * ACK_STATE_COMPLETE belongs to word 3 (ack_state), not hdr.state.  Putting
  * value 2 in hdr.state leaves the peer's IPC socket stuck RX_IN_PROCESS.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
 
 #include <stdio.h>

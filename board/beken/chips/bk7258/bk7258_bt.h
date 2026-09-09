@@ -1,5 +1,7 @@
 /****************************************************************************
  * BK7258 Bluetooth transport and NuttX lower-half interfaces.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
 
 #ifndef __VENDOR_BEKEN_CHIPS_BK7258_BK7258_BT_H

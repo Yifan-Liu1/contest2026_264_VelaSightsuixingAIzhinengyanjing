@@ -52,6 +52,8 @@
  * of any GPIO/pin/protocol correctness. See this board's defconfig
  * (CONFIG_BOARD_LOOPSPERMSEC=12000, an unverified estimate pending
  * on-hardware scope/logic-analyzer calibration) for the fix.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef __VENDOR_BEKEN_CHIPS_BK7258_INCLUDE_BK7258_I2C1_H

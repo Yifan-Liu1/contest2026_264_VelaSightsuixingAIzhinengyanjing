@@ -1,3 +1,16 @@
+/****************************************************************************
+ * app/velasight/vs_display.c
+ *
+ * LVGL rendering for the two round panels.
+ *
+ * Both screens are 160x160 circles, so every box here is sized against a
+ * chord rather than a rectangle, and the arithmetic is spelled out at each
+ * constant.  Painting is diffed against the previous snapshot: LVGL
+ * invalidates on every property write, and this display is driven over SPI at
+ * roughly 26 ms a frame, so writing an unchanged value is not free.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 
 #include <errno.h>

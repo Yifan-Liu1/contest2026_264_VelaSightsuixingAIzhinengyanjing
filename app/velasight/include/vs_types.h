@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/include/vs_types.h
+ *
+ * The vocabulary shared by every module in this application.
+ *
+ * Keys, pages, history views, network modes and states, Wi-Fi failure reasons,
+ * and the UI snapshot that carries all of it to the display.  Kept in one
+ * header because the snapshot is the boundary between the UI thread and the
+ * workers, and a type that crosses that boundary cannot belong to either side.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_TYPES_H
 #define __APP_VELASIGHT_INCLUDE_VS_TYPES_H
 

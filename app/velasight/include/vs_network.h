@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/include/vs_network.h
+ *
+ * Opaque handle for the Wi-Fi role, and the calls that change or report it.
+ *
+ * Requesting a mode is synchronous and blocking -- vs_network_request_mode()
+ * returns only once the station holds an address or the access point is
+ * serving -- so callers run it off the UI thread.  Events that arrive in
+ * between are drained by vs_network_process_events().
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_NETWORK_H
 #define __APP_VELASIGHT_INCLUDE_VS_NETWORK_H
 

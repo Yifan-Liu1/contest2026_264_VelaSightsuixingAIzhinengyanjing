@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/vs_config.c
+ *
+ * Loads the Wi-Fi settings, waiting for the store to exist first.
+ *
+ * SD-NAND is mounted on a delay after boot, so this runs before the
+ * provisioning record is necessarily readable.  It waits rather than failing,
+ * and falls back to the Kconfig defaults only when the wait itself times out
+ * -- a first boot has no record to find.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 
 #include <errno.h>

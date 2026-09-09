@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/include/vs_config.h
+ *
+ * The persisted Wi-Fi settings, and the one call that loads them.
+ *
+ * Holds both roles' credentials in one record because a single provisioning
+ * store carries both.  ap_password_random is what keeps entering AP mode free
+ * of I/O: a device that has been an access point before reuses its cached
+ * passphrase instead of drawing and writing a new one.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_CONFIG_H
 #define __APP_VELASIGHT_INCLUDE_VS_CONFIG_H
 

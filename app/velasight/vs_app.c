@@ -1,3 +1,16 @@
+/****************************************************************************
+ * app/velasight/vs_app.c
+ *
+ * The UI thread: event loop, page state machine, and snapshot builder.
+ *
+ * Everything that changes what is on the glass happens here, on one thread.
+ * Workers -- network, voice, social, media -- never touch the display; they
+ * post events and this loop decides what the next snapshot looks like.  That
+ * is the whole reason the snapshot exists: blocking work stays off the thread
+ * that has to keep repainting.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 #include <nuttx/sched.h>
 

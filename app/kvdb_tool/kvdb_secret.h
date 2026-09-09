@@ -1,5 +1,7 @@
 /****************************************************************************
  * Secret-key classification shared by the kvdb CLI and host tests.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
 
 #ifndef __APP_KVDB_TOOL_KVDB_SECRET_H

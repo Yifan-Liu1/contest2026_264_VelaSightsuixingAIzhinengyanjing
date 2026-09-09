@@ -1,3 +1,17 @@
+/****************************************************************************
+ * app/velasight/include/vs_display.h
+ *
+ * Opaque handle for the pair of 160x160 round panels, and the calls that drive
+ * them.
+ *
+ * Rendering is snapshot-driven: the UI thread hands over a complete
+ * vs_ui_snapshot_s and this module decides what changed.  vs_display_flush()
+ * exists because vs_display_tick() honours LVGL's refresh period, so a frame
+ * rendered just before a blocking call would still be queued when the block
+ * began -- and a progress page nobody sees is the same as no progress page.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_DISPLAY_H
 #define __APP_VELASIGHT_INCLUDE_VS_DISPLAY_H
 

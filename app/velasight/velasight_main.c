@@ -1,3 +1,23 @@
+/****************************************************************************
+ * app/velasight/velasight_main.c
+ *
+ * Entry points, and the subcommands that let the cloud path be tested without
+ * a screen.
+ *
+ * velasight_autostart() is how a board starts this program: bk7258_bringup.c
+ * declares it weak and calls it once both framebuffers are up.  main() is
+ * reached only by typing "velasight ..." at an nsh prompt, which is why
+ * anything that has to hold for the running application -- the timezone, for
+ * one -- is done in both.
+ *
+ * "cloudprobe" drives one complete session against the configured endpoint and
+ * "social" runs the real thing with camera and microphone, both without the
+ * displays or the keys.  They are subcommands rather than separate programs
+ * because the cloud client is compiled into this one, and a second PROGNAME
+ * would mean a second link of the same objects.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 
 #include <errno.h>

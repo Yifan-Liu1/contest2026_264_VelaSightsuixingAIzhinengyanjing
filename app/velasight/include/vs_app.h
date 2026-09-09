@@ -1,3 +1,16 @@
+/****************************************************************************
+ * app/velasight/include/vs_app.h
+ *
+ * The application's event vocabulary and its two entry points.
+ *
+ * Declares the event kinds workers post to the UI thread, the social session's
+ * stage enum, the event record itself, and the queue calls around it.  Also
+ * declares velasight_autostart(), which is how a board starts this program --
+ * bk7258_bringup.c calls it weakly once the framebuffers are up, and main() is
+ * reached only from an nsh prompt.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #ifndef __APP_VELASIGHT_INCLUDE_VS_APP_H
 #define __APP_VELASIGHT_INCLUDE_VS_APP_H
 

@@ -1,5 +1,7 @@
 /****************************************************************************
  * BK7258 AP-side Wi-Fi controller-interface driver.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
 
 #include <nuttx/config.h>

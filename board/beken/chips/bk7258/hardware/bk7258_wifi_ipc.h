@@ -1,5 +1,7 @@
 /****************************************************************************
  * BK7258 controller-interface Wi-Fi wire ABI.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
 
 #ifndef __VENDOR_BEKEN_CHIPS_BK7258_HARDWARE_BK7258_WIFI_IPC_H

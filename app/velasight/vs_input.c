@@ -1,3 +1,15 @@
+/****************************************************************************
+ * app/velasight/vs_input.c
+ *
+ * The three board buttons: sampling, debounce, and press versus hold.
+ *
+ * Polled from the UI loop rather than interrupt-driven, because a key only
+ * ever changes a page and the page is owned by that loop.  A hold is reported
+ * as its own event once the threshold passes, so a caller never has to time
+ * anything itself.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 
 #include <nuttx/board.h>

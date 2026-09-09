@@ -1,3 +1,15 @@
+/****************************************************************************
+ * board/beken/chips/bk7258/bk7258_gc2145_i2c_bitbang.c
+ *
+ * Bit-banged I2C1 for the GC2145 sensor.
+ *
+ * The hardware I2C1 block is claimed by the CP, so the AP drives the two pins
+ * directly to reach the sensor's register map.  Timing is generated from
+ * up_udelay() with the delays chosen against a scope rather than from the
+ * datasheet's minimums, which the pin loading on this board does not meet.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
 #include <nuttx/config.h>
 #include <nuttx/arch.h>
 

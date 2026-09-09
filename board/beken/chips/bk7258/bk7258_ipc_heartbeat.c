@@ -1,5 +1,7 @@
 /****************************************************************************
  * BK7258 Armino-compatible HW_CTRL power-up and heartbeat service.
+ *
+ * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
 
 #include <nuttx/config.h>
