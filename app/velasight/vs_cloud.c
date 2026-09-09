@@ -675,12 +675,33 @@ static void cloud_clock_adopt(const char *header, const char *header_end)
 
   g_cloud_clock_adopted = true;
 
-  if (gmtime_r(&epoch, &tm) != NULL)
+  /* Local first, because that is the reading everything else on this device
+   * shows -- the history record's date, and a serial log captured on a host in
+   * the same zone.  Checking one against the other should not need mental
+   * arithmetic; the first time this line appeared it did, and the answer read
+   * as an eight-hour error until the sum was done by hand.
+   *
+   * UTC stays alongside it, because that is what the gateway actually sent and
+   * what every timestamp leaving this device carries.  The two being printed
+   * together is also the cheapest possible check that TZ took: if the offset
+   * between them is zero, velasight_main.c's setenv() did not survive to this
+   * task, and the record dates are about to be wrong in a way nothing else
+   * would report.
+   */
+
+  if (localtime_r(&epoch, &tm) != NULL)
     {
-      printf("%s: clock set from the cloud's Date header to "
-             "%04d-%02d-%02d %02d:%02d:%02d UTC, was reading %llu\n",
-             CLOUD_TAG, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec, (unsigned long long)before);
+      printf("%s: clock set from the cloud to %04d-%02d-%02d %02d:%02d:%02d "
+             "local", CLOUD_TAG, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+      if (gmtime_r(&epoch, &tm) != NULL)
+        {
+          printf(" (%02d:%02d:%02d UTC, from its Date header)",
+                 tm.tm_hour, tm.tm_min, tm.tm_sec);
+        }
+
+      printf(", was reading %llu\n", (unsigned long long)before);
     }
 }
 
