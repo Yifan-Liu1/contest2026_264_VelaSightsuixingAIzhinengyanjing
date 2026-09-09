@@ -285,6 +285,12 @@ static struct
   bool                credentials_reload_pending;
   enum vs_voice_stage_e stage;
   uint32_t            request_id;
+
+  /* When vs_voice_start() accepted this round, for the timing line the worker
+   * prints once it is listening.  See vs_voice_start().
+   */
+
+  uint32_t            start_req_ms;
   struct vs_audio_cap_s *cap;
   struct vs_audio_pb_s  *pb;
   pthread_t            worker;
@@ -1981,16 +1987,35 @@ static int vs_voice_record_and_recognize(bool followup, uint32_t request_id,
   struct vs_audio_level_s level;
   uint32_t start_ms;
   uint32_t window_ms = 0;
+  uint32_t step_ms;
+  uint32_t asr_open_ms;
+  uint32_t mic_open_ms;
   size_t sent_bytes = 0;
   int capture_error = 0;
   int ret;
 
   question[0] = '\0';
+
+  /* Two marks across the two blocking steps between the key press and the
+   * moment the device can hear.
+   *
+   * Nothing measured this before, and the board log of 2026-09-09 is why it
+   * needs measuring: from volc_asr's "session opened" to the listening event was
+   * 9 ms, so the microphone was not the cost, and the rest of the perceived wait
+   * had to be upstream in a stretch with no timestamps in it at all.  volc_asr.c
+   * now breaks its own share down further; these two say how much of the wait
+   * belongs to it in the first place.
+   */
+
+  step_ms = vs_voice_now_ms();
   stream = voice_asr_stream_open();
   if (stream == NULL)
     {
       return -ENOKEY;
     }
+
+  asr_open_ms = vs_voice_now_ms() - step_ms;
+  step_ms = vs_voice_now_ms();
 
   cap = vs_audio_capture_open(AGENT_AUDIO_CAPTURE_DEV,
                               AGENT_VOICE_SAMPLE_RATE,
@@ -2008,6 +2033,8 @@ static int vs_voice_record_and_recognize(bool followup, uint32_t request_id,
       return -EIO;
     }
 
+  mic_open_ms = vs_voice_now_ms() - step_ms;
+
   pthread_mutex_lock(&g_voice.lock);
   g_voice.cap = cap;
   pthread_mutex_unlock(&g_voice.lock);
@@ -2019,6 +2046,23 @@ static int vs_voice_record_and_recognize(bool followup, uint32_t request_id,
   vs_voice_post(VS_APP_EVENT_VOICE_LISTENING_READY, request_id, 0, NULL);
 
   start_ms = vs_voice_now_ms();
+
+  /* The whole wait the user actually experiences, and the two parts of it this
+   * function owns.
+   *
+   * to_listen is measured from vs_voice_start(), so on the first round of a
+   * conversation it covers the worker spawn, three buffer allocations,
+   * vs_voice_conv_start() and -- on the photo path -- a full JPEG capture, none
+   * of which is timed individually.  Whatever it exceeds asr+mic by is that
+   * prefix, and the size of the remainder says whether the connection is worth
+   * optimising at all.  On a follow-up round the request mark is stale and
+   * to_listen covers the previous turn as well, so read it on the first round.
+   */
+
+  printf("vs_voice: listening after %lu ms (asr_open=%lu mic_open=%lu)%s\n",
+         (unsigned long)(start_ms - g_voice.start_req_ms),
+         (unsigned long)asr_open_ms, (unsigned long)mic_open_ms,
+         followup ? " [followup, to_listen spans the previous turn]" : "");
 
   for (;;)
     {
@@ -3053,6 +3097,17 @@ retry_after_reload:
   g_voice.stop_recording = false;
   g_voice.request_id = request->request_id;
   g_voice.stage = VS_VOICE_STAGE_IDLE;
+
+  /* When the round was asked for, so the worker can report how much of the wait
+   * before "请说话" was its own and how much was spent getting to it.
+   *
+   * Taken here rather than passed in the request, because the request struct is
+   * public and this is instrumentation.  Safe as module state: busy is set in
+   * this same critical section and not cleared until the worker finishes, so
+   * there is one round at a time and one writer for this field.
+   */
+
+  g_voice.start_req_ms = vs_voice_now_ms();
   pthread_mutex_unlock(&g_voice.lock);
 
   copy = malloc(sizeof(*copy));

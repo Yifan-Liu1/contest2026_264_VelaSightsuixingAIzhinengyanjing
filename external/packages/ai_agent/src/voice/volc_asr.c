@@ -50,6 +50,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -113,10 +114,56 @@ static int asr_entropy_func(void* data, unsigned char* output, size_t len)
 
 /* ── TLS connect / free ──────────────────────────────────────── */
 
+/* Where the time goes while a session is being opened.
+ *
+ * The open path had no instrumentation, and the two lines it did emit bracket
+ * only its cheap half: "TLS connected" is printed at the end of this function
+ * and "WebSocket upgrade OK" at the end of ws_upgrade(), so a board log can be
+ * read for the upgrade and the first request and for nothing before them.
+ * Measured that way on 2026-09-09 the visible part was 176 ms, and the
+ * credential read, the DRBG seed, the name resolution, the TCP connect and the
+ * whole TLS handshake were all inside the unlit gap ahead of it.
+ *
+ * That gap is exactly what a TLS session cache or a pre-opened connection would
+ * remove, so its size decides which of those is worth building -- and it was the
+ * one number nothing recorded.
+ *
+ * connect_ms covers resolution and the TCP round trip together, because
+ * mbedtls_net_connect() does both and does not say where it spent the time.
+ * Separating them means resolving here and passing the address on as a literal,
+ * which changes how the connection is made rather than what is recorded about
+ * it, and is not worth doing until this figure says the pair is the problem.
+ */
+
+struct asr_open_timing_s {
+    uint32_t seed_ms;      /* mbedtls_ctr_drbg_seed, entropy included */
+    uint32_t connect_ms;   /* name resolution and the TCP connect */
+    uint32_t handshake_ms; /* config, setup and mbedtls_ssl_handshake */
+    bool proxied;          /* went through a CONNECT tunnel instead */
+};
+
+static uint32_t asr_now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000u
+        + (uint64_t)ts.tv_nsec / 1000000u);
+}
+
+/* timing may be NULL, which is what the batch path passes: it has its own
+ * infer/e2e measurements and does not need the breakdown.
+ */
+
 static int asr_tls_connect(asr_tls_ctx_t* ctx,
-    const char* host, const char* port)
+    const char* host, const char* port,
+    struct asr_open_timing_s* timing)
 {
     int ret;
+    uint32_t mark;
 
     mbedtls_ssl_init(&ctx->ssl);
     mbedtls_ssl_config_init(&ctx->cfg);
@@ -125,18 +172,28 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
 
     const char* pers = "volc_asr";
 
+    mark = asr_now_ms();
     ret = mbedtls_ctr_drbg_seed(&ctx->ctr_drbg, asr_entropy_func,
         NULL, (const unsigned char*)pers,
         strlen(pers));
+    if (timing != NULL) {
+        timing->seed_ms = asr_now_ms() - mark;
+    }
+
     if (ret != 0) {
         syslog(LOG_ERR, "[%s] ctr_drbg_seed: -0x%04x\n", TAG, -ret);
         return -EIO;
     }
 
     /* If proxy is enabled, open a CONNECT tunnel first */
+    mark = asr_now_ms();
     if (http_proxy_is_enabled()) {
         int port_num = atoi(port);
         int tunnel_fd = proxy_open_tunnel(host, port_num, 30000);
+
+        if (timing != NULL) {
+            timing->proxied = true;
+        }
 
         if (tunnel_fd < 0) {
             syslog(LOG_ERR, "[%s] proxy tunnel failed\n", TAG);
@@ -156,6 +213,17 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
         }
     }
 
+    /* Recorded whichever branch ran.  A tunnel and a direct connect are not the
+     * same measurement -- the tunnel adds a hop and its own request -- so the
+     * flag says which figure this is rather than leaving the two to be compared
+     * as though they were alike.
+     */
+
+    if (timing != NULL) {
+        timing->connect_ms = asr_now_ms() - mark;
+    }
+
+    mark = asr_now_ms();
     mbedtls_net_set_block(&ctx->net);
     if (ctx->net.fd >= 0) {
         struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
@@ -207,6 +275,16 @@ static int asr_tls_connect(asr_tls_ctx_t* ctx,
             syslog(LOG_ERR, "[%s] handshake: -0x%04x\n", TAG, -ret);
             return -EIO;
         }
+    }
+
+    /* Config, setup and the handshake as one figure.  They are separable but
+     * there is no reason to: the first two are local work with no round trip in
+     * them, so anything large here is the handshake, and the handshake is what a
+     * resumed session would shorten.
+     */
+
+    if (timing != NULL) {
+        timing->handshake_ms = asr_now_ms() - mark;
     }
 
     syslog(LOG_INFO, "[%s] TLS connected to %s:%s\n", TAG, host, port);
@@ -903,7 +981,7 @@ int volc_asr_recognize(const unsigned char* pcm_data,
 
     /* 1. TLS connect */
     ret = asr_tls_connect(&ctx, AGENT_DOUBAO_ASR_HOST,
-        AGENT_DOUBAO_ASR_PORT);
+        AGENT_DOUBAO_ASR_PORT, NULL);
     if (ret != 0) {
         asr_tls_free(&ctx);
         return ret;
@@ -1000,7 +1078,18 @@ struct volc_asr_stream {
 
 volc_asr_stream_t* volc_asr_stream_open(void)
 {
+    struct asr_open_timing_s timing;
+    uint32_t open_t0;
+    uint32_t init_ms;
+    uint32_t upgrade_ms;
+    uint32_t request_ms;
+    uint32_t mark;
+
+    memset(&timing, 0, sizeof(timing));
+    open_t0 = asr_now_ms();
+
     volc_asr_init();
+    init_ms = asr_now_ms() - open_t0;
 
     if (s_app_id[0] == '\0' || s_token[0] == '\0') {
         syslog(LOG_ERR, "[%s] stream: credentials not configured\n",
@@ -1015,23 +1104,27 @@ volc_asr_stream_t* volc_asr_stream_open(void)
     }
 
     int ret = asr_tls_connect(&s->tls, AGENT_DOUBAO_ASR_HOST,
-        AGENT_DOUBAO_ASR_PORT);
+        AGENT_DOUBAO_ASR_PORT, &timing);
     if (ret != 0) {
         asr_tls_free(&s->tls);
         free(s);
         return NULL;
     }
 
+    mark = asr_now_ms();
     ret = ws_upgrade(&s->tls, AGENT_DOUBAO_ASR_HOST,
         AGENT_DOUBAO_ASR_WS_PATH, s_token);
+    upgrade_ms = asr_now_ms() - mark;
     if (ret != 0) {
         asr_tls_free(&s->tls);
         free(s);
         return NULL;
     }
 
+    mark = asr_now_ms();
     ret = send_full_client_request(&s->tls, s_app_id, s_token,
         s_cluster);
+    request_ms = asr_now_ms() - mark;
     if (ret != 0) {
         asr_tls_free(&s->tls);
         free(s);
@@ -1039,7 +1132,31 @@ volc_asr_stream_t* volc_asr_stream_open(void)
     }
 
     s->ready = 1;
-    syslog(LOG_INFO, "[%s] stream: session opened\n", TAG);
+
+    /* One line, every segment, in the order they happen.
+     *
+     * Read it against the question it exists to settle.  A large handshake is
+     * the case for caching the TLS session, which is cheap and carries no
+     * protocol risk.  A large connect is the case for caching the resolved
+     * address, and says to split that figure next.  A small total is the case
+     * for leaving the connection alone and looking upstream instead -- at the
+     * key-press-to-worker path in vs_voice.c, which is measured separately.
+     *
+     * upgrade is one round trip and is therefore the cheapest estimate of the
+     * link's RTT this path produces; the others are worth reading relative to
+     * it.  request should be near zero, since send_full_client_request() writes
+     * a frame and does not wait for an answer.
+     */
+
+    syslog(LOG_INFO,
+        "[%s] stream: session opened in %lums "
+        "(init=%lu seed=%lu %s=%lu handshake=%lu upgrade=%lu request=%lu)\n",
+        TAG, (unsigned long)(asr_now_ms() - open_t0),
+        (unsigned long)init_ms, (unsigned long)timing.seed_ms,
+        timing.proxied ? "tunnel" : "dns+tcp",
+        (unsigned long)timing.connect_ms,
+        (unsigned long)timing.handshake_ms,
+        (unsigned long)upgrade_ms, (unsigned long)request_ms);
     return s;
 }
 
