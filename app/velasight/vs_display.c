@@ -26,6 +26,7 @@
 #include <arch/board/board.h>
 
 #include "include/vs_display.h"
+#include "include/vs_faces.h"
 
 LV_FONT_DECLARE(velasight_font_16_ui);
 
@@ -123,6 +124,36 @@ LV_FONT_DECLARE(velasight_font_16_ui);
 #define VS_STATUS_LONG_WIDTH    136
 #define VS_STATUS_LONG_HEIGHT   61
 
+/* The status screen's middle layer while a session is reporting an emotion:
+ * one row of value with the expression graphic under it.
+ *
+ * It is a third layout rather than a tweak to the short one because the short
+ * layout is not really a box, it is a 48 px tall box holding a 16 px line --
+ * labels align their text to the top, so "观察中" occupies y=44..60 and the
+ * remaining 32 px are empty.  Overlapping a face onto that empty space would
+ * have worked and would have been a trap: the first value long enough to wrap
+ * would have run into the graphic.  So the value is given exactly the row it
+ * uses and the face gets its own.
+ *
+ * y=38..54 for the value and y=60..104 for the face, inside the middle layer's
+ * y=35..106 with a 6 px gap between them, and neither crossing the dividers at
+ * y=32 and y=108.  44 px is the largest square that fits with that gap; the
+ * chord at y=104, the face's lowest and therefore narrowest row, runs
+ * x=3.7..156.3 for a centre of (80,80) and a radius of 80, so a 44 px square
+ * centred at x=58..102 is nowhere near the bezel.
+ *
+ * The arc is free on these two pages, which is what makes any of this
+ * available: VS_PAGE_SOCIAL_RUNNING and VS_PAGE_SOCIAL_ALERT carry no
+ * progress, so vs_render_status() hides the ring and the face has the middle
+ * layer to itself.
+ */
+
+#define VS_STATUS_FACE_VALUE_Y      38
+#define VS_STATUS_FACE_VALUE_HEIGHT 20
+#define VS_FACE_SIZE                44
+#define VS_FACE_X                   ((160 - VS_FACE_SIZE) / 2)
+#define VS_FACE_Y                   60
+
 struct vs_panel_s
 {
   lv_display_t *display;
@@ -143,6 +174,15 @@ struct vs_panel_s
   int32_t ring_end;
   lv_obj_t *divider[2];
   lv_obj_t *key[VS_KEY_COUNT];
+
+  /* The expression graphic.  Built on both panels because vs_panel_init()
+   * builds both panels alike, and left hidden on the content one -- the same
+   * arrangement the key hints already have, and for the same reason: a setter
+   * that has to account for both panels cannot be given a new page without
+   * someone deciding what the other screen does.
+   */
+
+  lv_obj_t *face;
 };
 
 struct vs_display_s
@@ -277,6 +317,22 @@ static int vs_panel_init(struct vs_panel_s *panel, lv_display_t *display)
   lv_obj_set_style_arc_width(panel->progress, 4, LV_PART_INDICATOR);
   lv_obj_set_style_opa(panel->progress, LV_OPA_TRANSP, LV_PART_KNOB);
   lv_obj_add_flag(panel->progress, LV_OBJ_FLAG_HIDDEN);
+
+  /* After the arc, so it draws over it rather than under.  Nothing depends on
+   * that today -- the two are never visible at once, because the pages that
+   * carry a face carry no progress -- but the face is opaque and the arc is
+   * not, so if the two ever did meet this is the order that stays readable.
+   *
+   * No source yet: vs_panel_set_face() sets it from the snapshot, which also
+   * means an unreached page cannot leave a face on screen.
+   */
+
+  panel->face = lv_image_create(screen);
+  if (panel->face == NULL)
+    return -ENOMEM;
+
+  lv_obj_set_pos(panel->face, VS_FACE_X, VS_FACE_Y);
+  lv_obj_add_flag(panel->face, LV_OBJ_FLAG_HIDDEN);
   lv_timer_set_period(lv_display_get_refr_timer(display),
                       VS_FRAME_INTERVAL_MS);
   return 0;
@@ -326,6 +382,18 @@ static void vs_set_arc_color(lv_obj_t *obj, lv_color_t color,
     lv_obj_set_style_arc_color(obj, color, part);
 }
 
+/* Diffed on the pointer, which is the whole identity of the source here: the
+ * four faces are distinct const objects in flash, so equal pointers mean the
+ * same image and lv_image_set_src() would only re-read a header it already has
+ * and invalidate a 44x44 area for nothing.
+ */
+
+static void vs_set_image_src(lv_obj_t *image, const lv_image_dsc_t *src)
+{
+  if (lv_image_get_src(image) != (const void *)src)
+    lv_image_set_src(image, src);
+}
+
 static bool vs_key_changed(const struct vs_softkey_s *current,
                            const struct vs_softkey_s *previous)
 {
@@ -370,11 +438,25 @@ static bool vs_status_changed(const struct vs_ui_snapshot_s *current,
          current->progress != previous->progress ||
          current->progress_kind != previous->progress_kind ||
 
-         /* emotion_color is deliberately absent: this panel no longer draws it.
-          * Leaving it here would repaint the right screen on every colour
-          * change for nothing.  The word that does change with the emotion --
-          * "观察中" against "情绪升高" -- arrives as status_value below.
+         /* The expression graphic, which this panel does draw, so the reading
+          * it reports has to wake it.  Without these two the face would go
+          * stale in the same way the ring opposite would: an emotion moving
+          * calm to tense leaves page, progress and all three strings identical
+          * -- "观察中" only becomes "情绪升高" when the cloud also calls the
+          * moment extreme -- so nothing else here would fire and the face
+          * would keep the previous shape.
+          *
+          * emotion_color is still deliberately absent, and adding the face did
+          * not change that.  Each face carries its bucket's colour baked into
+          * the image (see vs_faces.h), so the emotion alone decides both the
+          * shape and the ink and there is nothing here for a colour to tell
+          * this panel.  Which also means the old failure this comment used to
+          * describe cannot come back: nothing on this screen is painted with
+          * emotion_color, so no page can inherit an alert's tint from it.
           */
+
+         current->emotion != previous->emotion ||
+         current->emotion_ring != previous->emotion_ring ||
 
          strcmp(current->status_title, previous->status_title) != 0 ||
          strcmp(current->status_value, previous->status_value) != 0 ||
@@ -467,6 +549,41 @@ static void vs_panel_set_emotion_ring(struct vs_panel_s *panel,
    */
 
   lv_arc_set_value(panel->progress, 100);
+}
+
+/* The right screen's expression graphic.
+ *
+ * Gated on emotion_ring rather than on a flag of its own, because that field
+ * already answers the only question this needs answered: is this page reporting
+ * an emotion.  Only VS_PAGE_SOCIAL_RUNNING and VS_PAGE_SOCIAL_ALERT set it, so
+ * a paused session shows no face -- it is not observing anyone -- and neither
+ * does the summary, the history or anything after the session, whatever
+ * runtime->emotion happens to still hold.
+ *
+ * The face and the left screen's ring are therefore the same reading in two
+ * channels on two screens: shape here, colour there, and both appear from the
+ * moment a session starts rather than from the first cloud result, because a
+ * graphic that only ever shows up when something is wrong is an alarm and not
+ * an indicator.
+ *
+ * content_panel is the same parameter vs_panel_set_keys() takes and does the
+ * same job: it forces the object hidden on the left screen instead of leaving
+ * it untouched, so this function accounts for both panels and a later page
+ * cannot get a face on the content screen by accident.
+ */
+
+static void vs_panel_set_face(struct vs_panel_s *panel,
+                              const struct vs_ui_snapshot_s *snapshot,
+                              bool content_panel)
+{
+  if (content_panel || !snapshot->emotion_ring)
+    {
+      vs_set_hidden(panel->face, true);
+      return;
+    }
+
+  vs_set_image_src(panel->face, vs_face_for_emotion(snapshot->emotion));
+  vs_set_hidden(panel->face, false);
 }
 
 static void vs_panel_set_keys(struct vs_panel_s *panel,
@@ -669,6 +786,7 @@ static void vs_render_content(struct vs_panel_s *panel,
   vs_set_label(panel->status_line[1], snapshot->status_meta);
   vs_set_hidden(panel->status_line[1], snapshot->status_meta[0] == '\0');
   vs_panel_set_emotion_ring(panel, snapshot);
+  vs_panel_set_face(panel, snapshot, true);
   vs_panel_set_keys(panel, snapshot, true);
 }
 
@@ -682,7 +800,26 @@ static void vs_render_status(struct vs_panel_s *panel,
 
   snprintf(value, sizeof(value), "%s", snapshot->status_value);
   short_value = strlen(value) <= 12;
-  if (short_value)
+
+  /* The expression graphic takes the lower two thirds of the middle layer, so
+   * the value gives up the empty space under it and keeps only its own row.
+   *
+   * Tested before short_value on purpose.  Every value these two pages show is
+   * short -- "观察中" and "情绪升高" are nine and twelve bytes, "提醒" and
+   * "建议" are six -- so the ordinary branch would always have won and the face
+   * would have been drawn over the bottom of a 48 px box.  It fits today
+   * because a 16 px line only uses the top of that box; it would stop fitting
+   * the first time one of these values grew a second line, and it would stop
+   * silently.
+   */
+
+  if (snapshot->emotion_ring)
+    {
+      lv_obj_set_pos(panel->body, VS_STATUS_SHORT_X, VS_STATUS_FACE_VALUE_Y);
+      lv_obj_set_size(panel->body, VS_STATUS_SHORT_WIDTH,
+                      VS_STATUS_FACE_VALUE_HEIGHT);
+    }
+  else if (short_value)
     {
       lv_obj_set_pos(panel->body, VS_STATUS_SHORT_X, VS_STATUS_SHORT_Y);
       lv_obj_set_size(panel->body, VS_STATUS_SHORT_WIDTH,
@@ -704,15 +841,18 @@ static void vs_render_status(struct vs_panel_s *panel,
    * This label used to be painted with snapshot->emotion_color, which is why
    * that field needed a page gate in vs_snapshot() at all: nothing ever put the
    * colour back, so one alert left every later page -- the summary, the history
-   * entries -- drawing its status text in alert red.  The emotion now lives in
-   * the left screen's ring, and setting this explicitly means no future
-   * path can quietly reintroduce a tint here.
+   * entries -- drawing its status text in alert red.  The colour now lives in
+   * the left screen's ring and, on this screen, inside the expression graphic
+   * below -- baked into the image, not applied to a style, so it cannot outlive
+   * the object that carries it.  Setting this explicitly means no future path
+   * can quietly reintroduce a tint on the text either.
    */
 
   vs_set_text_color(panel->body, vs_rgb(235, 242, 246));
   vs_panel_set_progress(panel, snapshot, progress &&
                         (snapshot->progress_kind == VS_PROGRESS_HOLD ||
                          snapshot->progress_kind == VS_PROGRESS_LEVEL));
+  vs_panel_set_face(panel, snapshot, false);
   vs_panel_set_keys(panel, snapshot, false);
 }
 

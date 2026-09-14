@@ -1013,7 +1013,6 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
   snapshot->history_is_blank = runtime->history_blank;
   snapshot->photo_context = runtime->photo_context;
   snapshot->progress = runtime->progress;
-  snapshot->emotion = runtime->emotion;
   snapshot->response_active = runtime->response_until_ms != 0;
   snapshot->response_key = runtime->response_key;
   snapshot->error_retryable = runtime->error_retryable;
@@ -1046,12 +1045,30 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
    * anywhere else.
    */
 
+  /* emotion is gated with the colour, not copied unconditionally above.
+   *
+   * It used to be, which was harmless only for as long as nothing drew it.  The
+   * right screen's expression graphic now does, and runtime->emotion outlives a
+   * session the same way emotion_color did: it is cleared on an alert clear and
+   * at the start of the next session, and a session that ended while an alert
+   * still stood gets neither -- vs_social.c has already dropped alert_active and
+   * bumped the generation, so no clear is coming.  Copying it here without the
+   * gate would have carried that last reading onto the summary and every
+   * history entry after it, which is precisely the failure the comment above
+   * records for the colour.
+   *
+   * VS_EMOTION_NONE off these pages rather than "whatever runtime holds", so a
+   * page that is not about an emotion cannot describe one.
+   */
+
+  snapshot->emotion = VS_EMOTION_NONE;
   snapshot->emotion_color = VS_COLOR_NEUTRAL;
   snapshot->emotion_ring = false;
 
   if (runtime->page == VS_PAGE_SOCIAL_RUNNING ||
       runtime->page == VS_PAGE_SOCIAL_ALERT)
     {
+      snapshot->emotion = runtime->emotion;
       snapshot->emotion_color = runtime->emotion_color != 0 ?
                         runtime->emotion_color :
                         runtime->emotion == VS_EMOTION_TENSE ?
@@ -1290,7 +1307,6 @@ static void vs_snapshot(struct vs_runtime_s *runtime,
         snprintf(snapshot->status_value, sizeof(snapshot->status_value),
                  "%s", runtime->advice_text[0] != '\0' ? "建议" : "提醒");
         snprintf(snapshot->status_meta, sizeof(snapshot->status_meta), "请留意");
-        snapshot->emotion = runtime->emotion;
         vs_key_set(snapshot, VS_KEY_CONFIRM, "暂停");
         vs_key_set(snapshot, VS_KEY_BACK, "按住结束");
         break;

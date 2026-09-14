@@ -144,6 +144,17 @@ done
 grep -q 'velasight_font_16_ui' "$AP_OUT/System.map" || die 'UI font is not linked'
 grep -q '^ \* Bpp: 1$' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not 1bpp'
 grep -q -- '--no-prefilter' "$SCRIPT_DIR/app/velasight/velasight_font_16_ui.c" || die 'UI font is not the pixel-font build'
+# The social session's expression graphics. LV_USE_IMAGE is off by default under
+# CONFIG_LV_CONF_MINIMAL, so without it lv_image_create() returns nothing and
+# the status screen loses the face without losing anything else -- a silent
+# failure the build is the right place to catch.
+grep -q '^CONFIG_LV_USE_IMAGE=y$' "$AP_OUT/.config" || die 'LVGL image widget is disabled; the social expression graphic cannot draw'
+grep -q 'velasight_face_calm_44' "$AP_OUT/System.map" || die 'social expression graphics are not linked'
+# RGB565 with no alpha is what keeps them on lv_draw_sw_img.c's plain-copy path
+# instead of a per-pixel blend. The generator bakes the panel background in to
+# make that possible, so a regenerated asset in any other colour format is a
+# performance regression that would still look correct.
+grep -q '\.header\.cf     = LV_COLOR_FORMAT_RGB565,' "$SCRIPT_DIR/app/velasight/velasight_faces_44.c" || die 'expression graphics are not RGB565'
 grep -q 'vs_voice_start' "$AP_OUT/System.map" || die 'idle voice assistant worker is not linked'
 grep -q 'vs_audio_volume_set' "$AP_OUT/System.map" || die 'volume page control is not linked'
 if grep -q 'voice_vad_process' "$AP_OUT/System.map"; then

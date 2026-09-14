@@ -14,7 +14,10 @@ if(CONFIG_LVX_USE_DEMO_CONTEST2026_264_VELASIGHT)
           # velasight and audio_test are separate applications, so the same
           # translation unit in both links cleanly.
           ${CMAKE_CURRENT_SOURCE_DIR}/../contest2026_264_audio_test/audio_test_ogg.c
-          velasight_font_16_ui.c
+          # Generated assets: the UI font and the social session's expression
+          # graphics.  Both are produced by a script in this directory and
+          # checked in; see generate_font.sh and tools/gen_faces.py.
+          velasight_font_16_ui.c velasight_faces_44.c
      INCLUDE_DIRECTORIES ${NUTTX_APPS_DIR}/packages/ai_agent/include
                           ${NUTTX_APPS_DIR}/packages/ai_agent/src
                           ${NUTTX_APPS_DIR}/packages/demos/contest2026_264_provision_web/include
