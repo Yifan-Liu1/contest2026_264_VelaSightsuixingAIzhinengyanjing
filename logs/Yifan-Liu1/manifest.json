@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_264_VelaSightsuixingAIzhinengyanjing",
+  "github_login": "Yifan-Liu1",
+  "generator": "kiro-manual-export@1.0.0",
+  "updated_at": "2026-09-16T01:34:52.310Z",
+  "sessions": [
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-05T13:16:27.767Z",
+      "last_event_at": "2026-09-16T01:34:51.118Z",
+      "event_count": 11511,
+      "file_path": "logs/Yifan-Liu1/2026-08-05/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::auto",
+      "redacted_count_total": 99
+    }
+  ]
+}
