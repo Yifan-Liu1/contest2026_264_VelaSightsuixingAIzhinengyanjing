@@ -2,20 +2,233 @@
   "schema_version": "1.0",
   "team_id": "contest2026_264_VelaSightsuixingAIzhinengyanjing",
   "github_login": "Yifan-Liu1",
-  "generator": "kiro-manual-export@1.0.0",
-  "updated_at": "2026-09-16T01:34:52.310Z",
+  "generator": "kiro-manual-export-daily@1.0.0",
+  "updated_at": "2026-09-16T02:29:33.731Z",
   "sessions": [
     {
       "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
       "tool": "kiro",
       "started_at": "2026-08-05T13:16:27.767Z",
-      "last_event_at": "2026-09-16T01:34:51.118Z",
-      "event_count": 11511,
+      "last_event_at": "2026-08-05T13:50:25.073Z",
+      "event_count": 255,
       "file_path": "logs/Yifan-Liu1/2026-08-05/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
       "collection_mode": "cli",
       "health": "ok",
-      "model": "qdev::auto",
-      "redacted_count_total": 99
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-06T09:44:13.059Z",
+      "last_event_at": "2026-08-06T13:32:32.954Z",
+      "event_count": 723,
+      "file_path": "logs/Yifan-Liu1/2026-08-06/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-07T02:21:44.697Z",
+      "last_event_at": "2026-08-07T09:58:36.549Z",
+      "event_count": 629,
+      "file_path": "logs/Yifan-Liu1/2026-08-07/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-10T01:33:08.463Z",
+      "last_event_at": "2026-08-10T13:18:10.632Z",
+      "event_count": 901,
+      "file_path": "logs/Yifan-Liu1/2026-08-10/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-11T01:17:38.625Z",
+      "last_event_at": "2026-08-11T13:53:39.118Z",
+      "event_count": 1424,
+      "file_path": "logs/Yifan-Liu1/2026-08-11/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-12T02:44:18.467Z",
+      "last_event_at": "2026-08-12T12:03:43.808Z",
+      "event_count": 234,
+      "file_path": "logs/Yifan-Liu1/2026-08-12/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-13T03:18:44.119Z",
+      "last_event_at": "2026-08-13T11:36:31.386Z",
+      "event_count": 959,
+      "file_path": "logs/Yifan-Liu1/2026-08-13/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-14T01:53:51.407Z",
+      "last_event_at": "2026-08-14T11:08:05.999Z",
+      "event_count": 483,
+      "file_path": "logs/Yifan-Liu1/2026-08-14/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-17T01:46:07.435Z",
+      "last_event_at": "2026-08-17T12:08:34.935Z",
+      "event_count": 1417,
+      "file_path": "logs/Yifan-Liu1/2026-08-17/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-18T03:06:15.312Z",
+      "last_event_at": "2026-08-18T13:26:43.254Z",
+      "event_count": 1374,
+      "file_path": "logs/Yifan-Liu1/2026-08-18/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-19T01:29:27.333Z",
+      "last_event_at": "2026-08-19T12:06:28.647Z",
+      "event_count": 1333,
+      "file_path": "logs/Yifan-Liu1/2026-08-19/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-20T01:36:51.472Z",
+      "last_event_at": "2026-08-20T07:23:14.228Z",
+      "event_count": 201,
+      "file_path": "logs/Yifan-Liu1/2026-08-20/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-08-24T02:09:05.337Z",
+      "last_event_at": "2026-08-24T02:26:02.093Z",
+      "event_count": 131,
+      "file_path": "logs/Yifan-Liu1/2026-08-24/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-01T10:46:30.976Z",
+      "last_event_at": "2026-09-01T11:06:42.026Z",
+      "event_count": 119,
+      "file_path": "logs/Yifan-Liu1/2026-09-01/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::claude-opus-5"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-04T07:31:26.656Z",
+      "last_event_at": "2026-09-04T08:03:50.228Z",
+      "event_count": 322,
+      "file_path": "logs/Yifan-Liu1/2026-09-04/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-08T01:38:39.859Z",
+      "last_event_at": "2026-09-08T01:41:18.527Z",
+      "event_count": 26,
+      "file_path": "logs/Yifan-Liu1/2026-09-08/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-09T08:41:30.616Z",
+      "last_event_at": "2026-09-09T11:23:20.980Z",
+      "event_count": 157,
+      "file_path": "logs/Yifan-Liu1/2026-09-09/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-12T02:14:04.688Z",
+      "last_event_at": "2026-09-12T03:32:10.613Z",
+      "event_count": 392,
+      "file_path": "logs/Yifan-Liu1/2026-09-12/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-14T01:46:44.294Z",
+      "last_event_at": "2026-09-14T05:51:15.674Z",
+      "event_count": 178,
+      "file_path": "logs/Yifan-Liu1/2026-09-14/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-15T03:31:34.429Z",
+      "last_event_at": "2026-09-15T13:42:41.865Z",
+      "event_count": 160,
+      "file_path": "logs/Yifan-Liu1/2026-09-15/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok"
+    },
+    {
+      "session_id": "sess_b511c05d-7162-44af-bc58-f3ba3c6d682d",
+      "tool": "kiro",
+      "started_at": "2026-09-16T01:28:43.916Z",
+      "last_event_at": "2026-09-16T02:29:32.633Z",
+      "event_count": 322,
+      "file_path": "logs/Yifan-Liu1/2026-09-16/kiro__sess_b511c05d-7162-44af-bc58-f3ba3c6d682d.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "qdev::auto"
     }
   ]
 }
